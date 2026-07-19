@@ -29,8 +29,8 @@ different vocabularies:
    in §9).
 
 transformers bridges (1)->(2) via `WeightRenaming`/`WeightConverter` entries
-in `transformers/conversion_mapping.py` (searched under the key
-`"InklingForConditionalGeneration"`). There is **no** `_checkpoint_conversion_mapping`
+in `transformers/conversion_mapping.py` (searched under the model_type key
+`"inkling_mm_model"`). There is **no** `_checkpoint_conversion_mapping`
 class attribute on `InklingPreTrainedModel` — the renaming table lives
 entirely in `conversion_mapping.py`. The C engine reads (1) directly (the
 real `.safetensors` shards or the GGUF), so §9's table is the one that
@@ -567,7 +567,7 @@ this section does, rather than needing the file pre-sliced.
 
 ## 9. Real checkpoint tensor names: full rename table + the two GGUF identifications
 
-Source: `transformers/conversion_mapping.py`, the `"InklingForConditionalGeneration"`
+Source: `transformers/conversion_mapping.py`, the `"inkling_mm_model"`
 entry (the table transformers itself uses to load the real checkpoint into
 the module tree described in §§1-8). All patterns are regexes matched
 against real on-disk safetensors keys (fetched from
