@@ -1,48 +1,106 @@
 <p align="center">
-  <img src="assets/sepia-logo.png" alt="SEPIA" width="380">
+  <img src="assets/sepia-logo.png" alt="SEPIA" width="420">
 </p>
 
-Inference engine for [Inkling](https://huggingface.co/thinkingmachines/Inkling) (975B-parameter MoE, 41B active) on Apple Silicon. One model, one machine class: a Mac with 128GB of unified memory and a fast SSD.
+<p align="center">
+  <a href="https://github.com/rinaldofesta/sepia/actions/workflows/ci.yml"><img src="https://github.com/rinaldofesta/sepia/actions/workflows/ci.yml/badge.svg" alt="ci"></a>
+</p>
 
-Status: Phase 0. Nothing generates tokens yet. This README states the plan and the math before the code, on purpose.
+SEPIA is an inference engine that runs [Inkling](https://huggingface.co/thinkingmachines/Inkling) (Thinking Machines' 975B-parameter MoE, 41B active) on a Mac with 128GB of unified memory, by streaming experts from SSD. One model, one machine class, correctness proven before speed.
 
-## The problem
+Current state: the engine reproduces Inkling's forward pass token-exactly against the transformers reference, on CPU, gated in CI on every push. It does not generate tokens from the real 317GB weights yet; that is Phase 1, and the weight download is running.
 
-The smallest published Inkling quant ([Unsloth UD-IQ1_S](https://huggingface.co/unsloth/inkling-GGUF)) is ~270GB on disk and needs ~280GB of combined memory. A 128GB Mac cannot load it. llama.cpp's Inkling support is a draft PR ([#25731](https://github.com/ggml-org/llama.cpp/pull/25731)) with no MTP speculation. Today this model does not run on the largest MacBook you can buy.
+## Why this exists
 
-## The bet
+The smallest published Inkling quant ([Unsloth UD-IQ1_S](https://huggingface.co/unsloth/inkling-GGUF), ~270GB) needs roughly twice the memory of a 128GB Mac. llama.cpp's Inkling support is a draft PR ([#25731](https://github.com/ggml-org/llama.cpp/pull/25731)) with no MTP speculation, and the transformers reference has no MTP forward path either, even though the checkpoint ships 8 MTP layers built for lossless speculative decoding. The `reasoning_effort` dial is a chat-template mechanism no server exposes per request. Tinker fine-tunes are LoRA-based and have no local Apple Silicon story.
 
-RAM stops being a hard cutoff when experts stream from disk. Inkling routes each token to 6 of 256 experts per layer, plus 2 shared experts that are always active. In the 2-bit quant SEPIA streams, one routed expert averages ~18.5MB (measured: [inventory](docs/gguf-inventory-ud-q2_k_xl.md)): a single pread per tensor. The plan:
+SEPIA's bet, inherited from [colibri](https://github.com/JustVugg/colibri): RAM stops being a hard cutoff when experts stream from disk. Inkling routes each token to 6 of 256 experts per layer plus 2 always-active shared experts. One routed expert averages ~18.5MB in the 2-bit quant ([measured](docs/gguf-inventory-ud-q2_k_xl.md)) and lives at a known offset: streaming it is one pread per tensor.
 
-- Resident in RAM: attention, shared experts, routers, embeddings (~20-25B params, ~20-25GB at 8-bit), plus a pinned set of the experts your own workload routes to most.
-- Streamed from SSD: the rest of the ~16,000 routed experts, with a per-layer LRU, a routing-history cache that persists across sessions, and router-lookahead prefetch.
-- MTP speculation: Inkling ships 8 multi-token-prediction layers in the checkpoint. No local engine uses them yet.
-- Effort dial per request: `reasoning_effort` is a chat-template mechanism, so a server can set it per call (low for tool glue, high for planning).
-- Tinker fine-tunes: Tinker is LoRA-based, so SEPIA plans to apply adapters at runtime on one fixed quantized base. No requantization per checkpoint.
+## Try it now (no downloads)
 
-## Expected numbers, stated before writing kernels
+The tiny oracle fixtures are committed, so the correctness gate runs on a bare clone:
 
-colibri measured 2.24 tok/s on this exact machine class (MacBook Pro M5 Max, 128GB) streaming GLM-5.2 (744B) at int4 with a ~75% expert hit rate ([report](https://github.com/JustVugg/colibri/blob/main/docs/METAL-M5MAX-PERF-REPORT.md)). Inkling's regime math: a cold token reads 6 experts x 64 MoE layers x ~18.5MB (measured average) = ~7.1GB; at a ~75% hit rate that drops to ~1.8GB per token from SSD. Target: 1.5-3 tok/s before prefetch and MTP wins. If the measured numbers land below that, they get published anyway. First measurement in: the SSD does 13.33 GB/s of random expert-size reads ([docs/ssd-bench.md](docs/ssd-bench.md)), putting the pure-I/O ceiling at ~7.5 tok/s warm and ~1.9 cold; I/O is not the expected bottleneck.
+```
+git clone https://github.com/rinaldofesta/sepia
+cd sepia
+make test
+```
 
-Open question I cannot answer yet: colibri found GLM-5.2's next-layer routing 71.6% predictable from the current layer's state, which is what makes prefetch pay. Whether Inkling routes as predictably is unknown. A Phase 2 experiment answers it either way, and a negative result ships too.
+Expected output:
 
-## Phase 0 (current): validate before optimizing
+```
+prefill 32/32
+decode 20/20
+```
 
-- [x] Tiny-random Inkling oracle: token-exact CPU forward vs the transformers reference
-- [x] `sepia.c` CPU engine passing the oracle: prefill 32/32, decode 20/20, max logit diff 1.5e-8 across all positions (CI-gated on every push)
-- [x] SSD microbenchmark at expert-slab sizes: 13.33 GB/s random 15MB reads with F_NOCACHE ([docs/ssd-bench.md](docs/ssd-bench.md))
-- [x] Remote GGUF header inventory of the Unsloth quants: 1512 tensors mapped from 40MB of Range reads against 317GB ([docs](docs/gguf-inventory-ud-q2_k_xl.md))
-- [x] Container tooling, byte-validated on fixtures: expert index sidecar + resident extraction ([docs/container.md](docs/container.md)). The repack died by measurement: 3x~5MB preads match 1x~15MB within 0.13%, so experts stream straight from the GGUF. Full-weights validation runs when the 317GB download completes.
+That is `src/sepia.c` (single file, C11, no dependencies) implementing Inkling's full architecture: banded content-dependent relative position bias (no RoPE), short convolutions on K/V and residual branches, 55 sliding-window plus 11 global attention layers with per-type GQA, sigmoid router with selection-only bias, shared-expert sink. Every position matches a seeded transformers 5.14.1 reference; max logit difference 1.5e-8. Tested on macOS arm64 (CI runs it too); Linux is unverified.
 
-## Lineage
+Tools that run without the weights:
 
-SEPIA fuses two projects, with attribution in [NOTICE](NOTICE):
+```
+# inventory a remote GGUF from its headers alone (~40MB of Range reads against 317GB)
+python3 tools/gguf_inspect.py --repo unsloth/inkling-GGUF \
+  --file "UD-Q2_K_XL/inkling-UD-Q2_K_XL-00001-of-00008.gguf" --all-parts
 
-- [ds4](https://github.com/antirez/ds4) (antirez): vertical single-model engine, surgical asymmetric quantization, validation against official-API logprobs, KV cache as "a first-class disk citizen".
-- [colibri](https://github.com/JustVugg/colibri) (JustVugg): experts streamed from disk, the learning cache, router-lookahead prefetch, the tiny-oracle discipline.
+# measure your SSD at expert-slab sizes
+make iobench && ./iobench <big-file> 15 800 4 1
 
-Like ds4, this project is strictly opportunistic about its model: if a better open-weights model for this machine class appears, SEPIA follows it. Inkling-Small (276B/12B active, weights not yet released) fits 128GB in RAM at 2-4 bit; the container format is designed so it drops in with the streaming tier reduced to a no-op.
+# regenerate the oracle (needs the torch venv, see tools/make_oracle.py)
+.venv/bin/python tools/make_oracle.py
+```
 
-Design doc: [docs/DESIGN.md](docs/DESIGN.md). Built with heavy AI assistance (Claude), with a human leading design, testing and debugging, in the ds4 tradition.
+## Measured, not estimated
+
+Numbers from this machine class (MacBook Pro M5 Max, 128GB), commands and full tables in the linked docs:
+
+| quantity | value | source |
+|---|---|---|
+| SSD random reads, 15MB blocks, F_NOCACHE | 13.33 GB/s | [ssd-bench](docs/ssd-bench.md) |
+| 3x5MB preads vs 1x15MB pread | 0.13% apart | [ssd-bench](docs/ssd-bench.md) |
+| average expert slab (gate+up+down) | 18,498,816 B | [inventory](docs/gguf-inventory-ud-q2_k_xl.md) |
+| cold decode read volume | ~7.1GB/token | 6 experts x 64 MoE layers |
+| pure-I/O ceiling, 75% expert hit rate | ~7.5 tok/s | [ssd-bench](docs/ssd-bench.md) |
+| pure-I/O ceiling, fully cold | ~1.9 tok/s | [ssd-bench](docs/ssd-bench.md) |
+
+The measurements have already overruled the plan twice. The repack died: a per-expert container copy was the design until the benchmark showed three small preads cost the same as one large one, so SEPIA streams experts straight from the GGUF through an [index sidecar](docs/container.md). And the target stayed honest: 1.5-3 tok/s for first real decode, under a ceiling that says I/O will not be the bottleneck.
+
+## Roadmap
+
+Phase 0 (done): oracle, token-exact CPU engine, SSD ground truth, GGUF inventory, container tooling. Everything above.
+
+- P1: CPU dequant (IQ2_XS, IQ3_XXS, IQ4_XS), first real-weight tokens, cross-check vs a llama.cpp build on the same GGUF, C tokenizer
+- P2: Metal kernels, expert LRU + pinned store, first real tok/s; the routing-predictability experiment (colibri measured 71.6% one-layer-ahead predictability on GLM-5.2; whether Inkling routes as predictably is open, and a negative result gets published too)
+- P3: learning cache: routing history persisted across sessions, confidence-ramped auto-pin, prefetch if P2 says yes
+- P4: MTP speculation from the dedicated 10.5GB `mtp.safetensors` shard, quantized in-house at 8-bit or better
+- P5: OpenAI + Anthropic compatible server, per-request effort dial, agent integrations
+- P6: own imatrix quantizer, NLL validation against hosted-API continuations, published containers
+- P7: runtime LoRA for Tinker checkpoints; Inkling-Small as a drop-in when its weights release
+
+Full design with the reasoning behind each phase: [docs/DESIGN.md](docs/DESIGN.md).
+
+## Docs
+
+- [DESIGN.md](docs/DESIGN.md): the whole design, verified model facts, memory regime
+- [architecture-notes.md](docs/architecture-notes.md): Inkling's forward pass specified to the formula level, cited to transformers source; the C engine was written from this doc alone
+- [ssd-bench.md](docs/ssd-bench.md): the benchmark, including the macOS F_NOCACHE trap it caught
+- [container.md](docs/container.md): GGUF-direct streaming layout, index sidecar, resident extraction
+- [gguf-inventory-ud-q2_k_xl.md](docs/gguf-inventory-ud-q2_k_xl.md): all 1512 tensors of the weight source
+
+## Known limits
+
+- No real-weight generation yet (P1); the 317GB download and its dependent validations are in progress
+- Attention log-scaling past 128K positions is implemented per spec but untestable at oracle scale
+- The 15MiB unaligned-read margin (93.9% of aligned) gets a clean re-measurement once the disk is quiet
+- Multimodal input and MTP are out of scope until P4+; text in, text out
+
+## Contributing
+
+Read [AGENTS.md](AGENTS.md) first; it binds humans and AI agents equally. The two rules that matter most: the oracle is the gate (no forward-pass change merges without `./sepia` passing token-exact) and no C++ in the engine. Performance claims come with the command, the machine, and the numbers.
+
+## Lineage and license
+
+SEPIA fuses two projects, with attribution in [NOTICE](NOTICE): [ds4](https://github.com/antirez/ds4) (antirez: vertical single-model engine, quantization validated against official-API logprobs, KV cache as "a first-class disk citizen") and [colibri](https://github.com/JustVugg/colibri) (JustVugg: expert streaming, the learning cache, the tiny-oracle discipline). Like ds4, SEPIA is strictly opportunistic about its model: if a better open-weights model for this machine class appears, the engine follows it.
+
+Built with heavy AI assistance (Claude), with a human leading design, testing and debugging, in the ds4 tradition.
 
 License: Apache-2.0.
