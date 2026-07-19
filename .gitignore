@@ -1,0 +1,24 @@
+# weights and containers: never in git (exception: tiny oracle fixtures)
+*.gguf
+*.safetensors
+!tools/oracle/**/*.safetensors
+*.inkwell/
+weights/
+models/
+*.dat
+
+# build artifacts
+build/
+*.o
+*.dSYM/
+/sepia
+/iobench
+
+# python
+.venv/
+__pycache__/
+*.pyc
+
+# session scratch
+.superpowers/
+.DS_Store

@@ -1,0 +1,17 @@
+SEPIA
+Copyright 2026 Rinaldo Festa
+
+Licensed under the Apache License, Version 2.0.
+
+SEPIA's design, and portions of its implementation where noted in source
+files, derive from:
+
+- ds4 / DwarfStar (https://github.com/antirez/ds4)
+  MIT License, Copyright (c) 2026 The ds4.c authors.
+  ds4 itself retains GGUF quantization block layouts, tables, and certain
+  kernel logic from ggml (https://github.com/ggml-org/ggml),
+  MIT License, Copyright (c) 2023-2026 The ggml authors. Where SEPIA ports
+  those pieces, both notices apply.
+
+- colibri (https://github.com/JustVugg/colibri)
+  Apache License 2.0, Copyright the colibri authors.
