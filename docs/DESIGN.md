@@ -99,9 +99,18 @@ inventory (docs/gguf-inventory-ud-q2_k_xl.md): routed experts are 95.5%
 of tensor bytes; one expert's gate+up+down averages ~17.7MiB
 (17.3-23.3 depending on layer); expert quant types are IQ2_XS (gate/up),
 IQ3_XXS and IQ4_XS (down), so those are the dequant kernels SEPIA ports
-first. A fallback stays open: if the SSD
-benchmark shows three smaller preads match one slab pread, stream
-directly from the GGUF and skip the repack.
+first. The SSD benchmark (docs/ssd-bench.md, measured 2026-07-19)
+settled the repack question: this machine reads 13.33 GB/s of random
+15MB blocks with F_NOCACHE, and three ~5MB preads match one ~15MB pread
+within 0.13%. So the plan of record is now: no repack, stream each
+expert's three tensors directly from the GGUF parts via an index
+sidecar; `resident.bin` extraction (small, ~14GB) stays, for mlock and
+for adding the MTP sidecar later. One caveat before this is final: GGUF
+tensor data is 32-byte aligned, not page-aligned, and the benchmark read
+at block-aligned offsets; task 0.7 must verify F_NOCACHE throughput at
+GGUF-realistic unaligned offsets before dropping the repack path for
+good. The measured I/O ceilings: 8.88 tok/s warm (~1.5GB/token) and
+2.22 tok/s cold (~6GB/token), pure I/O, before any compute overlap.
 
 ## Phase 0 (current milestone): validate before optimizing
 
