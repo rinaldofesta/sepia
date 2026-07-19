@@ -27,6 +27,28 @@ def _pack_metadata_kv(key: str, value_type: int, value_bytes: bytes) -> bytes:
     return _pack_string(key) + struct.pack("<I", value_type) + value_bytes
 
 
+def _pack_tensor_info(name: str, dims: list, ggml_type: int, offset: int) -> bytes:
+    out = _pack_string(name)
+    out += struct.pack("<I", len(dims))
+    for d in dims:
+        out += struct.pack("<Q", d)
+    out += struct.pack("<I", ggml_type)
+    out += struct.pack("<Q", offset)
+    return out
+
+
+def _pack_gguf(metadata_entries: list, tensor_entries: list) -> bytes:
+    header = b"GGUF"
+    header += struct.pack("<I", 3)  # version
+    header += struct.pack("<Q", len(tensor_entries))  # tensor_count
+    header += struct.pack("<Q", len(metadata_entries))  # metadata_kv_count
+    for entry in metadata_entries:
+        header += entry
+    for entry in tensor_entries:
+        header += entry
+    return header
+
+
 def build_synthetic_gguf() -> bytes:
     """Assembles a valid GGUF v3 header (magic..tensor-infos), no data
     section: the parser must never need bytes past the last tensor info,
@@ -40,15 +62,6 @@ def build_synthetic_gguf() -> bytes:
         _pack_metadata_kv("test.flag", gi.GGUF_TYPE_BOOL, struct.pack("<?", True)),
     ]
 
-    def _pack_tensor_info(name: str, dims: list, ggml_type: int, offset: int) -> bytes:
-        out = _pack_string(name)
-        out += struct.pack("<I", len(dims))
-        for d in dims:
-            out += struct.pack("<Q", d)
-        out += struct.pack("<I", ggml_type)
-        out += struct.pack("<Q", offset)
-        return out
-
     tensor_entries = [
         # F32, 8x4 -> 32 elements, block_size 1, type_size 4 -> 128 bytes
         _pack_tensor_info("token_embd.weight", [8, 4], gi.GGML_TYPE_F32, 0),
@@ -59,15 +72,7 @@ def build_synthetic_gguf() -> bytes:
         _pack_tensor_info("blk.0.ffn_gate_exps.weight", [4, 8, 2], gi.GGML_TYPE_Q4_0, 256),
     ]
 
-    header = b"GGUF"
-    header += struct.pack("<I", 3)  # version
-    header += struct.pack("<Q", len(tensor_entries))  # tensor_count
-    header += struct.pack("<Q", len(metadata_entries))  # metadata_kv_count
-    for entry in metadata_entries:
-        header += entry
-    for entry in tensor_entries:
-        header += entry
-    return header
+    return _pack_gguf(metadata_entries, tensor_entries)
 
 
 class ParseGGUFHeaderTests(unittest.TestCase):
@@ -254,6 +259,183 @@ class RemoteSourceRobustnessTests(unittest.TestCase):
             src = gi.RemoteSource("https://example.invalid/f.gguf", chunk_size=8, retries=1)
             with self.assertRaises(RuntimeError):
                 src.read(16)  # needs a second chunk starting at offset 8
+
+
+class CountBoundTests(unittest.TestCase):
+    """Task 0.6 review Minor (a): a declared string/array/tensor/metadata_kv
+    count read off the wire drives a loop next; on a corrupted or truncated
+    file that count can be enormous. These must fail fast (ValueError)
+    rather than loop/read for a very long time before hitting a real EOF."""
+
+    def _write_temp(self, raw: bytes) -> str:
+        with tempfile.NamedTemporaryFile(suffix=".gguf", delete=False) as f:
+            f.write(raw)
+            self.addCleanup(os.unlink, f.name)
+            return f.name
+
+    def test_huge_metadata_kv_count_fails_fast_not_hangs(self):
+        raw = b"GGUF" + struct.pack("<I", 3)
+        raw += struct.pack("<Q", 0)  # tensor_count
+        raw += struct.pack("<Q", 10**15)  # metadata_kv_count: absurd, no bytes follow
+        path = self._write_temp(raw)
+        with gi.LocalSource(path) as src:
+            with self.assertRaises(ValueError):
+                gi.parse_gguf_header(src)
+
+    def test_huge_tensor_count_fails_fast_not_hangs(self):
+        raw = b"GGUF" + struct.pack("<I", 3)
+        raw += struct.pack("<Q", 10**15)  # tensor_count: absurd
+        raw += struct.pack("<Q", 0)  # metadata_kv_count
+        path = self._write_temp(raw)
+        with gi.LocalSource(path) as src:
+            with self.assertRaises(ValueError):
+                gi.parse_gguf_header(src)
+
+    def test_huge_string_length_fails_fast(self):
+        metadata_entries = [
+            _pack_metadata_kv("k", gi.GGUF_TYPE_STRING, struct.pack("<Q", 10**15)),
+        ]
+        raw = _pack_gguf(metadata_entries, [])
+        path = self._write_temp(raw)
+        with gi.LocalSource(path) as src:
+            with self.assertRaises(ValueError):
+                gi.parse_gguf_header(src)
+
+    def test_huge_array_count_fails_fast(self):
+        # array of uint8 (elem_type=0... actually GGUF_TYPE_UINT8=0), count huge
+        value_bytes = struct.pack("<I", gi.GGUF_TYPE_UINT8) + struct.pack("<Q", 10**15)
+        metadata_entries = [_pack_metadata_kv("k", gi.GGUF_TYPE_ARRAY, value_bytes)]
+        raw = _pack_gguf(metadata_entries, [])
+        path = self._write_temp(raw)
+        with gi.LocalSource(path) as src:
+            with self.assertRaises(ValueError):
+                gi.parse_gguf_header(src)
+
+    def test_huge_n_dims_fails_fast(self):
+        tensor_entries = [
+            # n_dims itself is absurd; no dims data follows
+            _pack_string("t") + struct.pack("<I", 2**31),
+        ]
+        raw = _pack_gguf([], tensor_entries)
+        path = self._write_temp(raw)
+        with gi.LocalSource(path) as src:
+            with self.assertRaises(ValueError):
+                gi.parse_gguf_header(src)
+
+    def test_valid_small_counts_still_parse_fine(self):
+        # a bound check that's too aggressive would break legitimate files;
+        # the existing synthetic fixture (3 tensors, 5 metadata kvs) must
+        # still parse cleanly through the same bound-checked code paths.
+        header = gi.parse_gguf_header(io.BytesIO(build_synthetic_gguf()))
+        self.assertEqual(header.tensor_count, 3)
+        self.assertEqual(header.metadata_kv_count, 5)
+
+
+class UnknownTypeCleanExitTests(unittest.TestCase):
+    """Task 0.6 review Minor (b): an unrecognized ggml_type must exit
+    through the same clean 'error: ...' path as any other CLI error
+    (widened main() try/except), not an uncaught traceback."""
+
+    def _write_unknown_type_file(self) -> str:
+        # ggml_type 99 is not in GGML_TYPE_SIZES: TensorInfo.nbytes() raises
+        # ValueError for it, but only when nbytes() is actually called --
+        # i.e. during output generation, not during parsing itself.
+        tensor_entries = [_pack_tensor_info("weird.weight", [4], 99, 0)]
+        raw = _pack_gguf([], tensor_entries)
+        with tempfile.NamedTemporaryFile(suffix=".gguf", delete=False) as f:
+            f.write(raw)
+            self.addCleanup(os.unlink, f.name)
+            return f.name
+
+    def test_json_mode_reports_clean_error_and_exit_1(self):
+        path = self._write_unknown_type_file()
+        stderr = io.StringIO()
+        with mock.patch("sys.stderr", stderr):
+            rc = gi.main(["--file", path, "--local", "--json"])
+        self.assertEqual(rc, 1)
+        self.assertIn("error:", stderr.getvalue())
+        self.assertIn("unknown ggml_type", stderr.getvalue())
+
+    def test_human_summary_mode_reports_clean_error_and_exit_1(self):
+        path = self._write_unknown_type_file()
+        stderr = io.StringIO()
+        with mock.patch("sys.stdout", io.StringIO()), mock.patch("sys.stderr", stderr):
+            rc = gi.main(["--file", path, "--local"])
+        self.assertEqual(rc, 1)
+        self.assertIn("error:", stderr.getvalue())
+
+
+class InspectAllPartsAndJsonDocTests(unittest.TestCase):
+    """Task 0.6 review Minor (c): synthetic two-part fixture (no network)
+    covering inspect_all_parts, _to_json_doc, and _summarize_metadata."""
+
+    def setUp(self):
+        self.tmpdir = tempfile.mkdtemp()
+        self.addCleanup(lambda: __import__("shutil").rmtree(self.tmpdir, ignore_errors=True))
+
+        part1_tensors = [_pack_tensor_info("token_embd.weight", [4, 2], gi.GGML_TYPE_F32, 0)]
+        part1_meta = [
+            _pack_metadata_kv("general.architecture", gi.GGUF_TYPE_STRING, _pack_string("test-arch")),
+            _pack_metadata_kv("general.alignment", gi.GGUF_TYPE_UINT32, struct.pack("<I", 32)),
+        ]
+        part2_tensors = [_pack_tensor_info("blk.0.attn_q.weight", [4, 4], gi.GGML_TYPE_F16, 0)]
+        part2_meta = [
+            _pack_metadata_kv("general.architecture", gi.GGUF_TYPE_STRING, _pack_string("test-arch")),
+            _pack_metadata_kv("general.alignment", gi.GGUF_TYPE_UINT32, struct.pack("<I", 32)),
+        ]
+
+        self.part1_path = os.path.join(self.tmpdir, "model-00001-of-00002.gguf")
+        self.part2_path = os.path.join(self.tmpdir, "model-00002-of-00002.gguf")
+        with open(self.part1_path, "wb") as f:
+            f.write(_pack_gguf(part1_meta, part1_tensors))
+        with open(self.part2_path, "wb") as f:
+            f.write(_pack_gguf(part2_meta, part2_tensors))
+
+    def test_inspect_all_parts_discovers_and_orders_both_parts(self):
+        results = gi.inspect_all_parts(gi._open_local, self.part1_path)
+        self.assertEqual(len(results), 2)
+        paths = [r[0] for r in results]
+        self.assertEqual(paths, sorted(paths))
+        self.assertTrue(paths[0].endswith("00001-of-00002.gguf"))
+        self.assertTrue(paths[1].endswith("00002-of-00002.gguf"))
+        names_by_part = {r[0]: [t.name for t in r[1].tensors] for r in results}
+        self.assertEqual(names_by_part[self.part1_path], ["token_embd.weight"])
+        self.assertEqual(names_by_part[self.part2_path], ["blk.0.attn_q.weight"])
+
+    def test_to_json_doc_shape(self):
+        results = gi.inspect_all_parts(gi._open_local, self.part1_path)
+        doc = gi._to_json_doc(results, repo=None, quant_hint="TESTQUANT")
+        self.assertEqual(doc["quant_hint"], "TESTQUANT")
+        self.assertEqual(len(doc["parts"]), 2)
+        self.assertEqual(len(doc["tensors"]), 2)
+        by_name = {t["name"]: t for t in doc["tensors"]}
+        self.assertEqual(by_name["token_embd.weight"]["ggml_type_name"], "F32")
+        self.assertEqual(by_name["token_embd.weight"]["n_bytes"], 32)  # 8 elems * 4 bytes
+        self.assertEqual(by_name["blk.0.attn_q.weight"]["ggml_type_name"], "F16")
+        self.assertEqual(by_name["blk.0.attn_q.weight"]["part_file"], self.part2_path)
+        # every part in the doc carries its own tensor_count/alignment
+        part_tensor_counts = {p["part_file"]: p["tensor_count"] for p in doc["parts"]}
+        self.assertEqual(part_tensor_counts[self.part1_path], 1)
+        self.assertEqual(part_tensor_counts[self.part2_path], 1)
+
+    def test_summarize_metadata_truncates_large_arrays_only(self):
+        big_array = list(range(20))
+        small_array = [1, 2, 3]
+        metadata = {
+            "general.architecture": "test-arch",
+            "tokenizer.ggml.tokens": big_array,
+            "small.list": small_array,
+            "scalar.value": 42,
+        }
+        summary = gi._summarize_metadata(metadata)
+        self.assertEqual(summary["general.architecture"], "test-arch")
+        self.assertEqual(summary["small.list"], small_array)
+        self.assertEqual(summary["scalar.value"], 42)
+        self.assertEqual(summary["tokenizer.ggml.tokens"], {
+            "truncated": True,
+            "count": 20,
+            "sample": big_array[:gi._METADATA_ARRAY_SAMPLE],
+        })
 
 
 if __name__ == "__main__":

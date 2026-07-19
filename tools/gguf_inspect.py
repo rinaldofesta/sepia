@@ -278,10 +278,44 @@ def _read_u64(src):
     return struct.unpack("<Q", _read_exact(src, 8))[0]
 
 
+def _check_count_bound(src, count, min_bytes_per_item, what):
+    """A declared count/length read straight off the wire (string length,
+    array/tensor/metadata-kv count, dim count) drives a Python loop or a
+    single big read next. On a corrupted or truncated file that count can
+    be an enormous garbage value; looping or reading that many times before
+    hitting a real EOF is a hang, not a fast failure. Bounds `count`
+    against what the source's own known total size could possibly still
+    hold (every item needs at least `min_bytes_per_item` bytes), and fails
+    loudly instead. A no-op if the source doesn't know its total size yet
+    (some RemoteSource calls before the first successful fetch)."""
+    total_size = getattr(src, "total_size", None)
+    if total_size is None:
+        return
+    remaining = max(total_size - src.tell(), 0)
+    max_possible = remaining // min_bytes_per_item if min_bytes_per_item else remaining
+    if count > max_possible:
+        raise ValueError(
+            f"declared {what}={count} would need at least "
+            f"{count * min_bytes_per_item:,} bytes but only {remaining:,} remain in "
+            f"the {total_size:,}-byte source -- refusing to loop that many times "
+            "(likely a corrupted or truncated file)"
+        )
+
+
 def read_gguf_string(src):
     length = _read_u64(src)
+    _check_count_bound(src, length, 1, "string length")
     raw = _read_exact(src, length)
     return raw.decode("utf-8")
+
+
+def _min_bytes_for_value_type(value_type):
+    if value_type == GGUF_TYPE_STRING:
+        return 8  # at least the string's own length prefix
+    if value_type == GGUF_TYPE_ARRAY:
+        return 12  # at least elem_type(4) + count(8)
+    fmt_size = _SCALAR_FORMATS.get(value_type)
+    return fmt_size[1] if fmt_size else 1
 
 
 def read_metadata_value(src, value_type):
@@ -290,6 +324,7 @@ def read_metadata_value(src, value_type):
     if value_type == GGUF_TYPE_ARRAY:
         elem_type = _read_u32(src)
         count = _read_u64(src)
+        _check_count_bound(src, count, _min_bytes_for_value_type(elem_type), "array count")
         return [read_metadata_value(src, elem_type) for _ in range(count)]
     fmt_size = _SCALAR_FORMATS.get(value_type)
     if fmt_size is None:
@@ -361,6 +396,11 @@ def parse_gguf_header(src):
         raise ValueError(f"unsupported GGUF version {version} (this tool only reads v3)")
     tensor_count = _read_u64(src)
     metadata_kv_count = _read_u64(src)
+    # A metadata kv needs at least an 8-byte key-length prefix + 4-byte value
+    # type id; a tensor info needs at least an 8-byte name-length prefix +
+    # 4-byte n_dims + 4-byte ggml_type + 8-byte offset (dims may be empty).
+    _check_count_bound(src, metadata_kv_count, 12, "metadata_kv_count")
+    _check_count_bound(src, tensor_count, 24, "tensor_count")
 
     metadata = {}
     for _ in range(metadata_kv_count):
@@ -372,6 +412,7 @@ def parse_gguf_header(src):
     for _ in range(tensor_count):
         name = read_gguf_string(src)
         n_dims = _read_u32(src)
+        _check_count_bound(src, n_dims, 8, "tensor n_dims")
         dims = [_read_u64(src) for _ in range(n_dims)]
         ggml_type = _read_u32(src)
         offset = _read_u64(src)
@@ -551,28 +592,33 @@ def main(argv=None):
         opener = lambda path: _open_remote(args.repo, path, args.chunk_size, args.timeout, args.retries)  # noqa: E731
         source_label = f"{args.repo}:{args.file}"
 
+    # One try/except covers both parsing (inspect_*) and output generation
+    # (_to_json_doc / _print_human_summary): both call tensor.nbytes(),
+    # which raises ValueError for an unrecognized ggml_type, and that error
+    # deserves the same clean "error: ..." exit as a parse failure, not an
+    # uncaught traceback.
     try:
         if args.all_parts:
             results = inspect_all_parts(opener, args.file)
         else:
             results = [inspect_one(opener, args.file)]
+
+        if args.json or args.out:
+            quant_hint = args.file.split("/")[0] if "/" in args.file else None
+            doc = _to_json_doc(results, args.repo if not args.local else None, quant_hint)
+            text = json.dumps(doc, indent=2)
+            if args.out:
+                with open(args.out, "w") as f:
+                    f.write(text)
+                    f.write("\n")
+                print(f"wrote {args.out}", file=sys.stderr)
+            else:
+                print(text)
+        else:
+            _print_human_summary(results, source_label)
     except (ValueError, RuntimeError) as exc:
         print(f"error: {exc}", file=sys.stderr)
         return 1
-
-    if args.json or args.out:
-        quant_hint = args.file.split("/")[0] if "/" in args.file else None
-        doc = _to_json_doc(results, args.repo if not args.local else None, quant_hint)
-        text = json.dumps(doc, indent=2)
-        if args.out:
-            with open(args.out, "w") as f:
-                f.write(text)
-                f.write("\n")
-            print(f"wrote {args.out}", file=sys.stderr)
-        else:
-            print(text)
-    else:
-        _print_human_summary(results, source_label)
 
     return 0
 

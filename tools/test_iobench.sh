@@ -17,23 +17,35 @@ dd if=/dev/urandom of="$small_file" bs=1m count=64 >/dev/null 2>&1
 
 check_bytes() {
     local direct=$1
+    local align_bytes=${2:-}
     local block_mb=4 n_reads=40 threads=4
     local out
-    out=$("$BIN" "$small_file" "$block_mb" "$n_reads" "$threads" "$direct")
+    if [ -n "$align_bytes" ]; then
+        out=$("$BIN" "$small_file" "$block_mb" "$n_reads" "$threads" "$direct" "$align_bytes")
+    else
+        out=$("$BIN" "$small_file" "$block_mb" "$n_reads" "$threads" "$direct")
+    fi
     echo "$out"
     local expect_gb
     expect_gb=$(python3 -c "print(f'{$n_reads*$block_mb*1024*1024/1e9:.4f}')")
     local got_gb
     got_gb=$(echo "$out" | sed -n 's/.*total_gb=\([0-9.]*\).*/\1/p')
     if [ "$got_gb" != "$expect_gb" ]; then
-        echo "FAIL: direct=$direct expected total_gb=$expect_gb got $got_gb"
+        echo "FAIL: direct=$direct align_bytes=$align_bytes expected total_gb=$expect_gb got $got_gb"
         exit 1
     fi
-    echo "ok: direct=$direct total_gb=$got_gb matches $n_reads x ${block_mb}MiB"
+    echo "ok: direct=$direct align_bytes=${align_bytes:-0 (default)} total_gb=$got_gb matches $n_reads x ${block_mb}MiB"
 }
 
 check_bytes 0
 check_bytes 1
+
+# align_bytes: task 0.7's unaligned-offset mode. Omitted (tested above) must
+# behave exactly like align_bytes=0 (block-aligned, the original behavior);
+# a positive value must still read exactly n_reads * block_mb total bytes,
+# just from GGUF-realistic unaligned starting offsets.
+check_bytes 1 0
+check_bytes 1 32
 
 # Expected-failure: block bigger than the whole file must abort loudly
 # (nonzero exit, message on stderr), not silently short-read.
