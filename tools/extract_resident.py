@@ -27,7 +27,15 @@ part, then the just-written region of resident.bin is re-read and
 re-hashed; the two digests must match before the tensor is added to the
 manifest, or the tool aborts loudly and truncates resident.bin back to
 its state before that tensor (so a re-run always finds a clean, fully
-verified file to resume from).
+verified file to resume from). The manifest itself is persisted
+(atomically: written to a temp file, then renamed into place) right after
+*each* tensor is successfully verified, not just once at the end -- so a
+crash or failure partway through a run (e.g. tensor 3 of 3) still leaves a
+durable, accurate manifest for everything extracted before it. Without
+this, a mid-run failure would leave already-verified bytes physically in
+resident.bin with no manifest entry pointing at them; a rerun would
+re-extract those tensors from scratch, appending fresh copies and
+permanently orphaning the originals.
 
 Python 3 stdlib only.
 
@@ -42,6 +50,7 @@ import json
 import os
 import shutil
 import sys
+import tempfile
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import make_index as mi  # noqa: E402
@@ -81,6 +90,26 @@ def _load_manifest(path):
         return {"tensors": []}
     with open(path) as f:
         return json.load(f)
+
+
+def _write_manifest_atomic(manifest_path, manifest):
+    """Writes manifest_path atomically (temp file + os.replace) so a crash
+    mid-write never leaves a corrupt/partial JSON file -- and so repeated
+    calls, one per successfully extracted tensor, are each a durable
+    checkpoint an interrupted run can resume from."""
+    directory = os.path.dirname(os.path.abspath(manifest_path)) or "."
+    fd, tmp_path = tempfile.mkstemp(prefix=".resident-manifest-", suffix=".json.tmp", dir=directory)
+    try:
+        with os.fdopen(fd, "w") as f:
+            json.dump(manifest, f, indent=2)
+            f.write("\n")
+        os.replace(tmp_path, manifest_path)
+    except BaseException:
+        try:
+            os.unlink(tmp_path)
+        except OSError:
+            pass
+        raise
 
 
 def _hash_range(path, offset, nbytes):
@@ -158,7 +187,8 @@ def run_extract(weights_dir, inventory_path, bin_path, manifest_path, min_free_g
     _check_free_space(os.path.dirname(os.path.abspath(bin_path)) or ".", min_free_gb)
 
     manifest = _load_manifest(manifest_path)
-    done_by_name = {t["name"]: t for t in manifest.get("tensors", [])}
+    done_tensors = list(manifest.get("tensors", []))
+    done_by_name = {t["name"]: t for t in done_tensors}
 
     current_by_name = {t["name"]: t for t in resident}
     for name, prior in done_by_name.items():
@@ -175,6 +205,20 @@ def run_extract(weights_dir, inventory_path, bin_path, manifest_path, min_free_g
 
     newly_extracted = []
     pending_parts = set()
+
+    def _current_manifest_doc():
+        all_tensors = done_tensors + newly_extracted
+        return {
+            "generated_at": datetime.datetime.now(datetime.timezone.utc).isoformat(),
+            "resident_bin_path": bin_path,
+            "resident_bin_size": os.path.getsize(bin_path) if os.path.exists(bin_path) else 0,
+            "alignment": RESIDENT_ALIGNMENT,
+            "n_resident_tensors_total": len(resident),
+            "n_tensors_extracted": len(all_tensors),
+            "tensors": all_tensors,
+            "pending_parts": sorted(pending_parts),
+        }
+
     for tensor in resident:
         if tensor["name"] in done_by_name:
             continue
@@ -184,25 +228,17 @@ def run_extract(weights_dir, inventory_path, bin_path, manifest_path, min_free_g
         _check_free_space(os.path.dirname(os.path.abspath(bin_path)) or ".", min_free_gb)
         entry = _extract_one(tensor, weights_dir, bin_path)
         newly_extracted.append(entry)
+        # Persisted right after this one tensor is durably verified on disk,
+        # not just once at the end -- see the module docstring for why.
+        _write_manifest_atomic(manifest_path, _current_manifest_doc())
 
-    all_tensors = manifest.get("tensors", []) + newly_extracted
-    resident_bin_size = os.path.getsize(bin_path) if os.path.exists(bin_path) else 0
+    # Final write: covers the 0-new-tensors case (pending_parts/generated_at
+    # still need refreshing) and is otherwise a cheap, idempotent re-write
+    # of what the last incremental write already persisted.
+    final_manifest = _current_manifest_doc()
+    _write_manifest_atomic(manifest_path, final_manifest)
 
-    new_manifest = {
-        "generated_at": datetime.datetime.now(datetime.timezone.utc).isoformat(),
-        "resident_bin_path": bin_path,
-        "resident_bin_size": resident_bin_size,
-        "alignment": RESIDENT_ALIGNMENT,
-        "n_resident_tensors_total": len(resident),
-        "n_tensors_extracted": len(all_tensors),
-        "tensors": all_tensors,
-        "pending_parts": sorted(pending_parts),
-    }
-    with open(manifest_path, "w") as f:
-        json.dump(new_manifest, f, indent=2)
-        f.write("\n")
-
-    return new_manifest, newly_extracted
+    return final_manifest, newly_extracted
 
 
 def _print_summary(manifest, newly_extracted):

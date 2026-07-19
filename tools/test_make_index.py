@@ -11,9 +11,11 @@ byte-compare all get exercised against actual bytes on disk.
 Runnable directly: python3 tools/test_make_index.py
 """
 import copy
+import io
 import json
 import os
 import random
+import shutil
 import struct
 import sys
 import tempfile
@@ -125,7 +127,6 @@ def _inventory_from_fixture(fixture):
     docs/gguf-inventory-ud-q2_k_xl.json."""
     parts, tensors = [], []
     for part_file, (file_bytes, _data_start, _offsets, _specs) in fixture.items():
-        import io
         header = gi.parse_gguf_header(io.BytesIO(file_bytes))
         parts.append({
             "part_file": part_file,
@@ -256,6 +257,78 @@ class MakeIndexFixtureTests(unittest.TestCase):
         expected = data_start_b + offsets_b["output_norm.weight"]
         self.assertEqual(resident_by_name["output_norm.weight"]["abs_offset"], expected)
         self.assertEqual(resident_by_name["output_norm.weight"]["nbytes"], 16)
+
+
+PARTIAL_LAYER_PART_NAME = "PARTIAL_SPLIT/test-00001-of-00001.gguf"
+
+
+class PartialMoeLayerTests(unittest.TestCase):
+    """A MoE layer must have all three of gate/up/down or none -- build_index
+    must die loudly on a partial layer instead of silently emitting an
+    incomplete entry the C loader would misinterpret."""
+
+    def _build(self, kinds):
+        """kinds: subset of {"gate", "up", "down"} to include for layer 0.
+        Inventory is derived from the same bytes, so this exercises the
+        partial-layer check in isolation from the local/inventory
+        cross-check (both sides agree on whatever kinds are present)."""
+        name_by_kind = {
+            "gate": "blk.0.ffn_gate_exps.weight",
+            "up": "blk.0.ffn_up_exps.weight",
+            "down": "blk.0.ffn_down_exps.weight",
+        }
+        specs = [
+            (name_by_kind[kind], [32, 1, N_EXPERTS], gi.GGML_TYPE_Q4_0,
+             _expert_tagged_bytes(N_EXPERTS, BPE, tag_base=i))
+            for i, kind in enumerate(sorted(kinds))
+        ]
+        file_bytes, _data_start, _offsets = build_gguf_part(specs)
+
+        header = gi.parse_gguf_header(io.BytesIO(file_bytes))
+        inventory = {
+            "repo": "test/repo",
+            "quant_hint": "PARTIAL",
+            "parts": [{
+                "part_file": PARTIAL_LAYER_PART_NAME,
+                "file_size_bytes": len(file_bytes),
+                "alignment": header.alignment,
+                "data_offset": header.data_offset,
+            }],
+            "tensors": [gi._tensor_to_dict(t, PARTIAL_LAYER_PART_NAME) for t in header.tensors],
+        }
+
+        tmpdir = tempfile.mkdtemp()
+        self.addCleanup(lambda: shutil.rmtree(tmpdir, ignore_errors=True))
+        weights_dir = os.path.join(tmpdir, "weights")
+        inventory_path = os.path.join(tmpdir, "inventory.json")
+        with open(inventory_path, "w") as f:
+            json.dump(inventory, f)
+        local_path = os.path.join(weights_dir, PARTIAL_LAYER_PART_NAME)
+        os.makedirs(os.path.dirname(local_path), exist_ok=True)
+        with open(local_path, "wb") as f:
+            f.write(file_bytes)
+        return weights_dir, inventory_path
+
+    def test_layer_missing_down_fails_loudly(self):
+        weights_dir, inventory_path = self._build({"gate", "up"})
+        with self.assertRaises(mi.IndexBuildError) as ctx:
+            mi.build_index(weights_dir, inventory_path)
+        self.assertIn("down", str(ctx.exception))
+        self.assertIn("layer 0", str(ctx.exception))
+
+    def test_layer_missing_gate_and_down_fails_loudly(self):
+        weights_dir, inventory_path = self._build({"up"})
+        with self.assertRaises(mi.IndexBuildError) as ctx:
+            mi.build_index(weights_dir, inventory_path)
+        msg = str(ctx.exception)
+        self.assertIn("gate", msg)
+        self.assertIn("down", msg)
+
+    def test_layer_with_all_three_kinds_succeeds(self):
+        weights_dir, inventory_path = self._build({"gate", "up", "down"})
+        doc, _parts = mi.build_index(weights_dir, inventory_path)
+        self.assertEqual(doc["n_moe_layers_indexed"], 1)
+        self.assertEqual(set(doc["moe_layers"]["0"].keys()), {"gate", "up", "down"})
 
 
 class VerifyTests(unittest.TestCase):

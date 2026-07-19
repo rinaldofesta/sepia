@@ -164,12 +164,22 @@ against the inventory (tensor names, types, offsets) and any divergence is
 a loud failure (`IndexBuildError`), not a silent fallback.
 
 **Validation: `--verify N`.** Byte-verifies N random experts whose parts
-are fully downloaded, via two independent code paths -- the cached
-`abs_offset` from the index doc, and a fresh re-parse of the part's header
-right then, walking its tensor list from scratch to recompute the offset
-independently -- then byte-compares the two reads and checks the slice
-doesn't cross the part's EOF. Prints `OK n/N` with a
-skipped-not-yet-downloaded count.
+are fully downloaded. "Two independent code paths" means independent
+*traversal and caching*, not two different offset formulas: both paths
+compute `abs_offset = data_start + tensor.offset + e * bytes_per_expert`
+identically, but one reads the already-computed value cached in the index
+doc, and the other re-parses the part's header fresh from disk right then
+and walks its tensor list from scratch to find the tensor and recompute
+the offset. That catches index/cache corruption, staleness, and drift
+between the committed doc and the actual on-disk part -- it does *not*
+independently verify that the offset formula itself is correct, since
+both paths share it. The formula's correctness is ground-truthed
+separately, by `tools/test_make_index.py`'s byte-tagged fixture (each
+synthetic expert's bytes are tagged with its own index, so the test
+confirms the computed `abs_offset` actually points at the right expert's
+bytes, not just that two computations of the same formula agree with each
+other). `--verify` then also checks the slice doesn't cross the part's
+EOF, and prints `OK n/N` with a skipped-not-yet-downloaded count.
 
 The index JSON itself is derived data and stays untracked; `tools/make_index.py`
 is what's committed.
@@ -187,14 +197,30 @@ the MTP sidecar.
 Each tensor's bytes are SHA256'd while streaming from the source, then
 `resident.bin`'s just-written range is re-read and re-hashed; a mismatch
 truncates the file back to its pre-tensor length and aborts loudly, so a
-rerun always finds a fully-verified file to resume from. `resident.bin` is
-**append-only**: an already-extracted tensor's offset never changes across
-reruns, so `--min-free-gb`-gated (default 50GB) reruns are idempotent --
-already-done tensors (tracked by name in the manifest) are skipped, and
-only tensors from parts that have since finished downloading get appended.
-If some parts with resident tensors aren't fully downloaded yet, the tool
-extracts what's available, records the rest under `pending_parts` in the
-manifest, and **exits 0** (an expected, not an error, state).
+rerun always finds a fully-verified file to resume from. The manifest is
+written (atomically: temp file + rename) right after *each* tensor is
+successfully verified, not just once at the end -- so a failure partway
+through a run (say, tensor 3 of 5) still leaves a durable, accurate
+manifest for the first 2, instead of orphaning their already-verified
+bytes in `resident.bin` with nothing pointing at them.
+
+`resident.bin` is **append-only**: an already-extracted tensor's offset
+never changes across reruns. "Idempotent" here specifically means *won't
+redo already-recorded work* -- a rerun trusts the manifest's existing
+entries (matched by tensor name, with a shape/type/nbytes sanity check
+against the current index) and skips straight to whatever's still
+missing; it does **not** re-hash or re-verify every previously-extracted
+tensor's bytes against `resident.bin` on every run. That's a deliberate
+accepted tradeoff (full re-verification on every rerun would mean
+re-reading the whole growing file every time), not an oversight -- if
+`resident.bin` were ever corrupted out-of-band after extraction, this
+tool would not detect it; that would need a separate, explicit
+`--verify`-style pass, which doesn't exist yet. `--min-free-gb`-gated
+(default 50GB) reruns only append tensors from parts that have since
+finished downloading. If some parts with resident tensors aren't fully
+downloaded yet, the tool extracts what's available, records the rest
+under `pending_parts` in the manifest, and **exits 0** (an expected, not
+an error, state).
 
 Both derived artifacts (`resident.bin`, `resident-manifest.json`) stay
 untracked.
@@ -285,15 +311,18 @@ holding all 1512 tensors) are still in flight. Real runs today therefore:
   fallback for parts 2-8, local parse for part 1's zero tensors). 1 part
   local, 7 inventory-fallback. `--verify 20`: `OK 0/20 (skipped 20
   not-yet-downloaded, 0 failed)` -- correct, expected behavior; the actual
-  verify *logic* (two-path byte-compare, corruption detection) is
-  exercised by `tools/test_make_index.py`'s synthetic fixture instead
-  (9/9 passing).
+  verify *logic* (two-path byte-compare, corruption detection) and the
+  partial-MoE-layer guard (a layer must have all of gate/up/down or none)
+  are exercised by `tools/test_make_index.py`'s synthetic fixtures instead
+  (12/12 passing).
 - `tools/extract_resident.py`: `0/1320` tensors extracted (part 1 has no
   resident tensors of its own), all 7 other parts listed under
   `pending_parts`, `resident.bin` not created (nothing to write yet),
-  exits 0. The actual copy/SHA256/alignment/idempotent-rerun logic is
-  exercised by `tools/test_extract_resident.py`'s synthetic fixture
-  (5/5 passing).
+  exits 0. The actual copy/SHA256/alignment/idempotent-rerun logic,
+  including a reproduction of a mid-run failure (tensor 3 of 3) that
+  proves the incremental manifest write leaves no orphaned bytes on
+  rerun, is exercised by `tools/test_extract_resident.py`'s synthetic
+  fixtures (6/6 passing).
 - No mismatch between the inventory JSON and any locally-parsed part was
   found (part 1 trivially matches, having zero tensors); the cross-check
   mechanism itself is independently verified to catch real mismatches by

@@ -7,6 +7,7 @@ offsets and metadata correctly. Runnable directly: python3 tools/test_gguf_inspe
 """
 import io
 import os
+import shutil
 import struct
 import sys
 import tempfile
@@ -371,7 +372,7 @@ class InspectAllPartsAndJsonDocTests(unittest.TestCase):
 
     def setUp(self):
         self.tmpdir = tempfile.mkdtemp()
-        self.addCleanup(lambda: __import__("shutil").rmtree(self.tmpdir, ignore_errors=True))
+        self.addCleanup(lambda: shutil.rmtree(self.tmpdir, ignore_errors=True))
 
         part1_tensors = [_pack_tensor_info("token_embd.weight", [4, 2], gi.GGML_TYPE_F32, 0)]
         part1_meta = [

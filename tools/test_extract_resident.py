@@ -10,6 +10,7 @@ alignment, idempotent rerun, and free-space guard all get exercised.
 Runnable directly: python3 tools/test_extract_resident.py
 """
 import hashlib
+import io
 import json
 import os
 import struct
@@ -206,6 +207,114 @@ class ExtractResidentTests(unittest.TestCase):
         self.assertTrue(os.path.exists(self.bin_path))
         self.assertEqual(os.path.getsize(self.bin_path), 0)
         self.assertFalse(os.path.exists(self.manifest_path))
+
+
+THREE_TENSOR_PART_NAME = "TEST_SPLIT3/test-00001-of-00001.gguf"
+
+
+def _build_three_tensor_fixture():
+    specs = [
+        ("tensor_a.weight", [4], gi.GGML_TYPE_F32, struct.pack("<4f", 1.0, 2.0, 3.0, 4.0)),
+        ("tensor_b.weight", [4], gi.GGML_TYPE_F32, struct.pack("<4f", 5.0, 6.0, 7.0, 8.0)),
+        ("tensor_c.weight", [4], gi.GGML_TYPE_F32, struct.pack("<4f", 9.0, 10.0, 11.0, 12.0)),
+    ]
+    return build_gguf_part(specs)
+
+
+class ManifestDurabilityTests(unittest.TestCase):
+    """Reproduces the reviewer's exact scenario for the Important finding:
+    a mid-run failure on the last of several tensors must not orphan the
+    bytes of tensors that already succeeded and were verified before it.
+    Before the fix, the manifest was only written once at the very end of
+    run_extract, so failing on tensor 3 of 3 left 2 tensors' worth of
+    already-verified bytes in resident.bin with no manifest entry -- a
+    rerun would re-extract all 3 from scratch and permanently orphan the
+    first attempt's bytes."""
+
+    def setUp(self):
+        self.file_bytes = _build_three_tensor_fixture()
+        header = gi.parse_gguf_header(io.BytesIO(self.file_bytes))
+        inventory = {
+            "repo": "test/repo",
+            "quant_hint": "TEST3",
+            "parts": [{
+                "part_file": THREE_TENSOR_PART_NAME,
+                "file_size_bytes": len(self.file_bytes),
+                "alignment": header.alignment,
+                "data_offset": header.data_offset,
+            }],
+            "tensors": [gi._tensor_to_dict(t, THREE_TENSOR_PART_NAME) for t in header.tensors],
+        }
+        self.tmpdir = tempfile.mkdtemp()
+        self.weights_dir = os.path.join(self.tmpdir, "weights")
+        self.inventory_path = os.path.join(self.tmpdir, "inventory.json")
+        self.bin_path = os.path.join(self.tmpdir, "resident.bin")
+        self.manifest_path = os.path.join(self.tmpdir, "resident-manifest.json")
+        with open(self.inventory_path, "w") as f:
+            json.dump(inventory, f)
+        local_path = os.path.join(self.weights_dir, THREE_TENSOR_PART_NAME)
+        os.makedirs(os.path.dirname(local_path), exist_ok=True)
+        with open(local_path, "wb") as f:
+            f.write(self.file_bytes)
+
+    def _run(self, min_free_gb=0):
+        return er.run_extract(self.weights_dir, self.inventory_path, self.bin_path,
+                               self.manifest_path, min_free_gb)
+
+    def test_mid_run_failure_persists_prior_tensors_and_rerun_resumes_without_orphaning(self):
+        real_hash_range = er._hash_range
+        calls = {"n": 0}
+
+        def fake_hash_range(path, offset, nbytes):
+            calls["n"] += 1
+            if calls["n"] == 3:
+                return "0" * 64  # force a write/re-read mismatch on tensor 3 of 3
+            return real_hash_range(path, offset, nbytes)  # tensors 1 and 2 verify for real
+
+        with mock.patch.object(er, "_hash_range", side_effect=fake_hash_range):
+            with self.assertRaises(er.ExtractError):
+                self._run()
+
+        # After the failure: the manifest must already durably reflect the
+        # 2 tensors that succeeded before tensor 3 failed -- this is the
+        # fix under test. Previously this file wouldn't exist yet here.
+        self.assertTrue(os.path.exists(self.manifest_path))
+        with open(self.manifest_path) as f:
+            manifest_after_failure = json.load(f)
+        self.assertEqual(len(manifest_after_failure["tensors"]), 2)
+        self.assertEqual(
+            {t["name"] for t in manifest_after_failure["tensors"]},
+            {"tensor_a.weight", "tensor_b.weight"},
+        )
+        last = manifest_after_failure["tensors"][-1]
+        self.assertEqual(os.path.getsize(self.bin_path), last["offset"] + last["nbytes"])
+
+        # Rerun (fault no longer injected): must resume, extracting only
+        # the missing 3rd tensor -- not re-extracting, and not orphaning,
+        # the first two.
+        manifest2, newly2 = self._run()
+        self.assertEqual([t["name"] for t in newly2], ["tensor_c.weight"])
+        self.assertEqual(len(manifest2["tensors"]), 3)
+
+        by_name_before = {t["name"]: t["offset"] for t in manifest_after_failure["tensors"]}
+        by_name_after = {t["name"]: t["offset"] for t in manifest2["tensors"]}
+        self.assertEqual(by_name_before["tensor_a.weight"], by_name_after["tensor_a.weight"])
+        self.assertEqual(by_name_before["tensor_b.weight"], by_name_after["tensor_b.weight"])
+
+        # Final resident.bin size equals the sum of manifest entries plus
+        # alignment padding: walking the entries in offset order, each
+        # one's offset must be the RESIDENT_ALIGNMENT-aligned end of the
+        # previous one (no gaps beyond alignment padding, no overlaps),
+        # and the file's total size must be exactly the last entry's end
+        # -- i.e. no orphaned bytes anywhere in the file.
+        ordered = sorted(manifest2["tensors"], key=lambda t: t["offset"])
+        expected_pos = 0
+        for entry in ordered:
+            expected_pos = er._align_up(expected_pos, er.RESIDENT_ALIGNMENT)
+            self.assertEqual(entry["offset"], expected_pos)
+            expected_pos += entry["nbytes"]
+        self.assertEqual(os.path.getsize(self.bin_path), expected_pos)
+        self.assertEqual(os.path.getsize(self.bin_path), manifest2["resident_bin_size"])
 
 
 if __name__ == "__main__":

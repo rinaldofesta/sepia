@@ -198,6 +198,9 @@ def _bytes_per_expert(tensor_dict):
     return n_bytes // N_EXPERTS
 
 
+_REQUIRED_EXPERT_KINDS = {"gate", "up", "down"}
+
+
 def _build_moe_layers(parts):
     """Returns {layer: {"gate"|"up"|"down": tensor_block}}, where each
     tensor_block carries the per-tensor arithmetic (bytes_per_expert etc.)
@@ -233,6 +236,17 @@ def _build_moe_layers(parts):
                 "bytes_per_expert": bpe,
                 "experts": experts,
             }
+
+    # A MoE layer must have all three of gate/up/down or none at all -- a
+    # layer with only 1 or 2 of them is a corrupted inventory/local part,
+    # not something a partial index entry should paper over silently.
+    for layer, kinds in layers.items():
+        missing = _REQUIRED_EXPERT_KINDS - kinds.keys()
+        if missing:
+            raise IndexBuildError(
+                f"MoE layer {layer} is missing expert tensor kind(s) {sorted(missing)} "
+                f"(found {sorted(kinds.keys())}) -- refusing to emit a partial layer"
+            )
     return layers
 
 
