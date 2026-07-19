@@ -1,4 +1,6 @@
-# SEPIA
+<p align="center">
+  <img src="assets/sepia-logo.png" alt="SEPIA" width="380">
+</p>
 
 Inference engine for [Inkling](https://huggingface.co/thinkingmachines/Inkling) (975B-parameter MoE, 41B active) on Apple Silicon. One model, one machine class: a Mac with 128GB of unified memory and a fast SSD.
 
