@@ -14,6 +14,12 @@ build/
 /sepia
 /iobench
 
+# activation-dump debugging artifacts (tools/dump_activations.py, sepia
+# --dump-acts): the script is tracked, its output is not
+*.npz
+dump.npz
+sepia_dump*.bin
+
 # python
 .venv/
 __pycache__/
