@@ -472,20 +472,41 @@ gate/up, same interleave-then-**also**-chunk pattern as above, since
 target is two separate tensors — see §9) and
 `mlp.shared_experts.shared_w2_weight` (plain rename to `down_proj`).
 
-### Chosen layout for the oracle's `model.safetensors`
+### Actual layout of the oracle's `model.safetensors` (corrected, task 0.4)
 
-The oracle saves `InklingExperts.gate_up_proj` / `.down_proj` and
-`InklingSharedExperts.gate_proj/up_proj/down_proj` **exactly as
-transformers stores them in memory** (fused 3D for routed, unfused for
-shared) — i.e. the same layout described above, not re-unfused into
-per-expert 2D tensors. Rationale: this *is* what `model.save_pretrained()`
-naturally produces (no extra postprocessing step to introduce bugs), it
-matches how the C engine will eventually need to slice the *real*
+**Correction to an earlier draft of this section**, which claimed the
+oracle saves `InklingExperts.gate_up_proj`/`.down_proj` and
+`InklingSharedExperts.gate_proj`/`up_proj`/`down_proj` "exactly as
+transformers stores them in memory" — i.e. the transformers-side names and
+the in-memory (deinterleaved, three-separate-tensors-for-shared) layout.
+That is wrong; verified empirically by dumping the committed
+`tools/oracle/tiny/model.safetensors`'s safetensors header while building
+the task 0.4 C engine. The oracle's tensor names and layout are the **real
+on-disk (SGLang-native) ones from §9's rename table**, the same names used
+throughout the rest of this section and never the in-memory transformers
+names: `model.llm.layers.N.mlp.experts.w13_weight` /
+`...w2_weight` for routed experts (fused 3D, `w13_weight` interleaved
+gate/up along dim 1, exactly the "real on-disk layout" paragraph above
+describes) and `model.llm.layers.N.mlp.shared_experts.shared_w13_weight` /
+`...shared_w2_weight` for shared experts (**also fused and interleaved**,
+`[n_shared_experts, 2*moe_intermediate_size, hidden_size]` — on disk the
+shared experts' gate/up are combined into one tensor exactly like the
+routed experts', not the three-separate-parameters layout that section
+correctly describes for the in-memory `InklingSharedExperts` module after
+loading). `model.save_pretrained()` evidently runs the rename+`Interleave`
+conversion ops from §9 in reverse when writing the checkpoint back out,
+rather than serializing the in-memory module tree's own attribute
+names/layout as-is.
+
+Practical upshot: the C engine's tensor lookups and the
+deinterleave-by-row-index approach documented above and in §9 apply
+identically to the toy oracle and the real checkpoint — there is no
+toy-fixture-specific layout to special-case anywhere in the loader, which
+is a stronger and simpler guarantee than the incorrect claim it replaces.
+This also matches how the C engine will eventually need to slice the real
 checkpoint's already-3D `ffn_{gate,up,down}_exps` GGUF tensors (per-expert
 byte ranges, confirmed contiguous in `docs/gguf-inventory-ud-q2_k_xl.md`
-§"Per-expert contiguity"), and the exact slicing formula is fully specified
-above and in §9 — a C loader needs the layout documented precisely, which
-this section does, rather than needing the file pre-sliced.
+§"Per-expert contiguity").
 
 ## 8. Norms, embedding, output head
 
@@ -917,3 +938,40 @@ Per the team lead's instruction to flag rather than silently work around:
   e.g. `sliding_window_size`/`n_routed_experts` — both work, and the toy
   config matches whichever the real checkpoint actually uses, field by
   field).
+
+## 15. C engine numerical policy (task 0.4, controller-approved)
+
+Applies to every reduction and matmul-shaped computation in `src/sepia.c`,
+stated here so later kernel work (Metal, quantization) knows the reference
+bar it needs to stay within:
+
+- **Storage**: float32 throughout — weights, activations, KV cache, sconv
+  state. No bf16/f16 casting boundaries exist in this engine (the toy
+  oracle and the real checkpoint's eventual dequantized activations are
+  both float32 at this layer).
+- **Accumulation**: every reduction (RMSNorm's mean-of-squares, every
+  matmul/Linear row as a dot product, softmax's max-subtracted exp-sum, the
+  MoE router's `logsumexp`, and the attention-weights-times-V weighted sum)
+  accumulates in `double` and rounds to `float32` only on write. This is a
+  deliberate choice, not an oversight: ATen's actual CPU reduction kernels
+  for float32 tensors accumulate in `double` internally
+  (`acc_type<float, DeviceType::CPU> = double`, the standard ATen
+  convention for `sum`/`mean`/`norm`-shaped ops), so double accumulation in
+  the C engine is the *more* faithful match to real "torch CPU float32
+  semantics," not a departure from it. Matmul-shaped ops specifically
+  (`nn.Linear`) run through BLAS on the torch side, which stays natively
+  float32 — the C engine's double accumulation there is strictly *more*
+  precise than BLAS's own summation order, not an attempt to replicate it
+  bit-for-bit. What's under test against the oracle is the forward pass's
+  linear-algebra *structure* (which tensor multiplies which, residual
+  placement, masking, the router's selection-vs-weighting split) — not one
+  specific kernel's floating-point summation order, which is exactly the
+  numerical-precision-strategy latitude task 0.4's brief left to the
+  implementer.
+- **Validated, not just argued**: this policy was checked against a fresh
+  Python forward pass over the same 32-token sequence
+  (`tools/dump_activations.py --compare`), giving a max absolute logit
+  difference of ~1.1e-8 at the final position (~1.5e-8 across all 32
+  positions) — float32 machine-epsilon-scale noise, with prefill 32/32 and
+  decode 20/20 token-exact and no argmax near-ties encountered. Approved by
+  the controller reviewing task 0.4 on that evidence.

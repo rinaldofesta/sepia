@@ -68,6 +68,15 @@ static void *xcalloc(size_t n, size_t sz) {
     return p;
 }
 
+/* Environment override for a default path, e.g. SEPIA_WEIGHTS_PATH to point
+ * at a different fixture directory without a build-system change --
+ * exercised by tools/test_sepia_malformed.sh, which needs to run sepia
+ * against a deliberately corrupted checkpoint copy. */
+static const char *env_or(const char *env_name, const char *defval) {
+    const char *v = getenv(env_name);
+    return (v && v[0]) ? v : defval;
+}
+
 /* Whole-file read, NUL-terminated (used for the small JSON inputs; weight
  * tensors are mmap'd separately in the safetensors loader below). */
 static char *read_file(const char *path, size_t *out_len) {
@@ -294,6 +303,7 @@ typedef struct {
     size_t filesize;
     JsonValue *header;
     const char *data_base;
+    size_t data_size; /* filesize - (8 + header_len): bytes actually available past data_base */
 } SafeTensors;
 
 static SafeTensors st_open(const char *path) {
@@ -322,13 +332,22 @@ static SafeTensors st_open(const char *path) {
     st_.filesize = filesize;
     st_.header = header;
     st_.data_base = (const char *)base + 8 + header_len;
+    st_.data_size = filesize - 8 - (size_t)header_len;
     return st_;
 }
 
 /* Looks up a tensor by its exact on-disk name; dies loudly if missing, of
- * the wrong dtype, or whose byte length disagrees with its declared shape
- * (a cheap but effective shape sanity check without storing full shapes). */
-static const float *st_find(const SafeTensors *st, const char *name) {
+ * the wrong dtype, whose byte length disagrees with its declared shape (a
+ * cheap but effective shape sanity check without storing full shapes), or
+ * -- the bounds check a reviewer found missing -- whose data_offsets fall
+ * outside the bytes the mmap actually covers. A hand-crafted header can have
+ * offsets that are internally self-consistent (o1-o0 matches the declared
+ * shape) but still point past EOF; without this check that silently reads
+ * (or, one page later, segfaults on) whatever memory happens to follow the
+ * mapping instead of failing loudly. Covered by tools/test_sepia_malformed.sh.
+ * `out_numel`, if non-NULL, receives the element count for the caller's own
+ * cross-checks (e.g. embedding row count vs config vocab_size). */
+static const float *st_find(const SafeTensors *st, const char *name, int64_t *out_numel) {
     const JsonValue *entry = json_get(st->header, name);
     if (!entry) die("safetensors: missing tensor '%s'", name);
     const char *dtype = json_str(json_get(entry, "dtype"), "");
@@ -344,6 +363,10 @@ static const float *st_find(const SafeTensors *st, const char *name) {
     int64_t o1 = (int64_t)json_num(offs->arr_items[1], 0);
     if (o1 - o0 != numel * (int64_t)sizeof(float))
         die("safetensors: tensor '%s' byte length disagrees with its shape", name);
+    if (o0 < 0 || o1 < o0 || (uint64_t)o1 > (uint64_t)st->data_size)
+        die("safetensors: tensor '%s' data_offsets [%lld,%lld) fall outside the %zu-byte data region",
+            name, (long long)o0, (long long)o1, st->data_size);
+    if (out_numel) *out_numel = numel;
     return (const float *)(st->data_base + o0);
 }
 
@@ -373,9 +396,10 @@ static const float *st_find(const SafeTensors *st, const char *name) {
 typedef struct {
     int hidden_size;
     int num_hidden_layers;
-    int unpadded_vocab_size; /* lm_head output width; the padded vocab_size itself is never
-                               * needed -- embed/unembed tensor shapes are validated directly
-                               * by st_find (sec.8) */
+    int vocab_size;           /* embed/unembed row count; cross-checked against the safetensors
+                                * tensor shapes at load time, not otherwise used for buffer
+                                * sizing (sec.8) */
+    int unpadded_vocab_size;  /* lm_head output width */
 
     int num_attention_heads, num_key_value_heads, head_dim;             /* global (hybrid) layers */
     int swa_num_attention_heads, swa_num_key_value_heads, swa_head_dim; /* local (hybrid_sliding) layers */
@@ -427,6 +451,7 @@ static Config config_load(const char *path) {
     Config cfg = {0};
     cfg.hidden_size = json_get_int(tc, "hidden_size");
     cfg.num_hidden_layers = json_get_int(tc, "num_hidden_layers");
+    cfg.vocab_size = json_get_int(tc, "vocab_size");
     cfg.unpadded_vocab_size = json_get_int(tc, "unpadded_vocab_size");
 
     cfg.num_attention_heads = json_get_int(tc, "num_attention_heads");
@@ -441,7 +466,12 @@ static Config config_load(const char *path) {
     int n = cfg.num_hidden_layers;
     cfg.layer_is_sliding = xmalloc(sizeof(int) * (size_t)n);
     const JsonValue *lt = json_get(tc, "layer_types");
-    if (lt && lt->type == JSON_ARR && lt->arr_count == (size_t)n) {
+    if (lt && lt->type == JSON_ARR) {
+        /* Present but the wrong length is a malformed/mismatched config,
+         * not a "not present" -- fall through to a weaker fallback would
+         * silently paper over that instead of catching it. */
+        if (lt->arr_count != (size_t)n)
+            die("config.json: layer_types has %zu entries, expected num_hidden_layers=%d", lt->arr_count, n);
         for (int i = 0; i < n; i++) cfg.layer_is_sliding[i] = strcmp(json_str(lt->arr_items[i], ""), "hybrid_sliding") == 0;
     } else {
         const JsonValue *lli = json_get(tc, "local_layer_ids");
@@ -461,7 +491,9 @@ static Config config_load(const char *path) {
 
     cfg.layer_is_sparse = xmalloc(sizeof(int) * (size_t)n);
     const JsonValue *mlt = json_get(tc, "mlp_layer_types");
-    if (mlt && mlt->type == JSON_ARR && mlt->arr_count == (size_t)n) {
+    if (mlt && mlt->type == JSON_ARR) {
+        if (mlt->arr_count != (size_t)n)
+            die("config.json: mlp_layer_types has %zu entries, expected num_hidden_layers=%d", mlt->arr_count, n);
         for (int i = 0; i < n; i++) cfg.layer_is_sparse[i] = strcmp(json_str(mlt->arr_items[i], ""), "sparse") == 0;
     } else {
         const JsonValue *dmi = json_get(tc, "dense_mlp_idx");
@@ -563,7 +595,7 @@ static const float *find_layer_tensor(const SafeTensors *st, int layer, const ch
     char name[160];
     int n = snprintf(name, sizeof name, "model.llm.layers.%d.%s", layer, suffix);
     if (n < 0 || (size_t)n >= sizeof name) die("tensor name too long for layer %d suffix %s", layer, suffix);
-    return st_find(st, name);
+    return st_find(st, name, NULL);
 }
 
 static Model model_load(const char *config_path, const char *safetensors_path) {
@@ -615,10 +647,23 @@ static Model model_load(const char *config_path, const char *safetensors_path) {
         }
     }
 
-    m.embed = st_find(&m.st, "model.llm.embed.weight");
-    m.embed_norm = st_find(&m.st, "model.llm.embed_norm.weight");
-    m.final_norm = st_find(&m.st, "model.llm.norm.weight");
-    m.unembed = st_find(&m.st, "model.llm.unembed.weight");
+    int64_t embed_numel = 0, unembed_numel = 0;
+    m.embed = st_find(&m.st, "model.llm.embed.weight", &embed_numel);
+    m.embed_norm = st_find(&m.st, "model.llm.embed_norm.weight", NULL);
+    m.final_norm = st_find(&m.st, "model.llm.norm.weight", NULL);
+    m.unembed = st_find(&m.st, "model.llm.unembed.weight", &unembed_numel);
+
+    /* Cheap sanity cross-check (reviewer-requested): the embedding table's
+     * row count must match config.json's vocab_size, catching a config and
+     * checkpoint that were never meant to go together (wrong tensor for
+     * this config, or vice versa) before it turns into silently-wrong
+     * embedding lookups downstream. */
+    if (embed_numel % cfg->hidden_size != 0 || embed_numel / cfg->hidden_size != cfg->vocab_size)
+        die("model.llm.embed.weight has %lld elements, expected vocab_size(%d) x hidden_size(%d)",
+            (long long)embed_numel, cfg->vocab_size, cfg->hidden_size);
+    if (unembed_numel % cfg->hidden_size != 0 || unembed_numel / cfg->hidden_size != cfg->vocab_size)
+        die("model.llm.unembed.weight has %lld elements, expected vocab_size(%d) x hidden_size(%d)",
+            (long long)unembed_numel, cfg->vocab_size, cfg->hidden_size);
 
     return m;
 }
@@ -1003,7 +1048,13 @@ static void mlp_moe_forward(const Config *cfg, const LayerWeights *lw, const flo
         for (int i = 0; i < moe_inter; i++) {
             float g = dotf(w13_row(lw->shared_w13, s, two_inter, hidden, 0, i), x, hidden);
             float u = dotf(w13_row(lw->shared_w13, s, two_inter, hidden, 1, i), x, hidden);
-            h[i] = silu_f(g) * u * gamma; /* shared: gamma applied to the activation, BEFORE down_proj (sec.7) */
+            h[i] = silu_f(g) * u * gamma; /* shared: gamma multiplies the activation, here, matching
+                                            * InklingSharedExperts.forward's literal placement -- down_proj
+                                            * is linear, so this is mathematically equivalent to scaling its
+                                            * output by gamma instead (as the routed path above does with
+                                            * its per-expert weight); not a semantic difference from routed,
+                                            * just matching the reference's order of operations exactly
+                                            * (sec.7) */
         }
         for (int d = 0; d < hidden; d++) {
             const float *row = lw->shared_w2 + ((size_t)s * hidden + (size_t)d) * moe_inter;
@@ -1205,8 +1256,8 @@ static void report_mismatch(const char *phase, int pos, int expected, int got, c
  * every position) and decode (true autoregressive greedy generation from
  * prompt_ids, KV cache + sconv state updated incrementally) each reported
  * separately, per the brief. Returns 1 iff both hit a perfect score. */
-static int run_self_test(const Model *m) {
-    OracleRef ref = load_oracle_ref(REF_PATH);
+static int run_self_test(const Model *m, const char *ref_path) {
+    OracleRef ref = load_oracle_ref(ref_path);
     int unpadded = m->cfg.unpadded_vocab_size;
     int full_len = ref.full_ids.len;
     int prompt_len = ref.prompt_ids.len;
@@ -1273,10 +1324,17 @@ int main(int argc, char **argv) {
         }
     }
 
-    Model m = model_load(CONFIG_PATH, WEIGHTS_PATH);
+    /* SEPIA_{CONFIG,WEIGHTS,REF}_PATH override the committed toy fixture
+     * paths; unset by default, so the plain `./sepia` self-test is
+     * unaffected. */
+    const char *config_path = env_or("SEPIA_CONFIG_PATH", CONFIG_PATH);
+    const char *weights_path = env_or("SEPIA_WEIGHTS_PATH", WEIGHTS_PATH);
+    const char *ref_path = env_or("SEPIA_REF_PATH", REF_PATH);
+
+    Model m = model_load(config_path, weights_path);
 
     if (dump_path) {
-        OracleRef ref = load_oracle_ref(REF_PATH);
+        OracleRef ref = load_oracle_ref(ref_path);
         int full_len = ref.full_ids.len;
         int unpadded = m.cfg.unpadded_vocab_size;
         Cache *c = cache_create(&m, full_len);
@@ -1290,6 +1348,6 @@ int main(int argc, char **argv) {
         return 0;
     }
 
-    int ok = run_self_test(&m);
+    int ok = run_self_test(&m, ref_path);
     return ok ? 0 : 1;
 }
