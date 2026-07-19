@@ -36,6 +36,7 @@ how it should be."
 ## Repository hygiene
 
 - Weights, containers, imatrix data: never in git. The tiny oracle model
-  (a few MB, needed by CI) is the one exception.
+  (a few MB, needed by CI, lives under `tools/oracle/`) is the one
+  exception, and `.gitignore`'s negation rule names that exact path.
 - Measured results go in `docs/` as dated markdown with the commands to
   reproduce them.

@@ -88,7 +88,8 @@ per layer (256 slabs; each expert is gate, up, down plus scales,
 contiguous and 4KB-aligned so one expert is one aligned pread), and
 `index.json`. Quant blocks are byte-identical to the source GGUF: no
 requantization, so ported ds4/ggml kernels apply unchanged. First weight
-source: Unsloth UD-Q2_K_XL (~317GB). A fallback stays open: if the SSD
+source: Unsloth UD-Q2_K_XL (~317GB; not the smallest available quant,
+chosen over the ~270GB 1-bit for output quality). A fallback stays open: if the SSD
 benchmark shows three smaller preads match one slab pread, stream
 directly from the GGUF and skip the repack.
 
@@ -98,8 +99,9 @@ directly from the GGUF and skip the repack.
 2. Kick off the ~317GB download in the background.
 3. Tiny-random oracle: instantiate the real architecture at toy dims
    (seeded), greedy-generate plus one teacher-forcing pass, save tiny
-   weights and `ref_inkling.json`. Forces early answers on
-   `dense_mlp_idx`, MTP packaging, sconv placement.
+   weights under `tools/oracle/` (the one weights path git tracks) and
+   `ref_inkling.json`. Forces early answers on `dense_mlp_idx`, MTP
+   packaging, sconv placement.
 4. `sepia.c`: single-file C11 CPU engine, f32 math, no quant, no
    streaming. Default no-args run is the self-test: token-exact against
    the oracle, prefill and decode reported separately. The hardest Phase
