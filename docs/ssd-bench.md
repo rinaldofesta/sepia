@@ -156,30 +156,34 @@ for the conclusions below.
 ## Conclusions
 
 **1. Achievable random-read GB/s at 15MB blocks (the expert-slab case), best config.**
-Best is threads=4, F_NOCACHE: **13.33 GB/s** (13.32-13.36 GB/s across
-threads=4/8/16 -- effectively flat; the device is bandwidth-saturated
-already at 4 concurrent requests, so more threads buys nothing and only
-adds latency).
+Best is threads=4, F_NOCACHE: **13.33 GB/s** (raw `gbps=13.3267` from the
+15MiB/threads=4/direct=1 cell; 13.25-13.36 GB/s across all three block
+sizes at threads=4/8/16 -- effectively flat; the device is
+bandwidth-saturated already at 4 concurrent requests, so more threads
+buys nothing and only adds latency).
 
 **2. The repack decision input.** Same total bytes (12.58GB), best thread
-count each, F_NOCACHE: 5MiB blocks (threads=4) reach **13.34 GB/s**;
-15MiB blocks (threads=4) reach **13.33 GB/s**. Difference: 0.13%. Plainly:
-**3 preads of ~5MB reach 13.34 GB/s vs 1 pread of ~15MB at 13.33 GB/s --
-not a material difference** (well under the 15% threshold; within
-measurement noise). This SSD's random-read bandwidth is saturated by
-request count/size well before the gate/up/down split matters. Per
-`docs/DESIGN.md`'s own stated fallback ("if the SSD benchmark shows three
-smaller preads match one slab pread, stream directly from the GGUF and
-skip the repack"): they match, so the repack step is not justified by
-throughput -- stream directly from the GGUF's three tensors per expert
-and skip building `experts-NN.bin` slabs, unless a future non-throughput
-reason (e.g. one syscall vs three, alignment, or a slower SSD on
-different hardware) reopens the question.
+count each, F_NOCACHE: 5MiB blocks (threads=4) reach **13.34 GB/s** (raw
+`gbps=13.3442`); 15MiB blocks (threads=4) reach **13.33 GB/s** (raw
+`gbps=13.3267`, the same cell as conclusion 1). Difference:
+`(13.3442 - 13.3267) / 13.3267 = 0.13%`. Plainly: **3 preads of ~5MB
+reach 13.34 GB/s vs 1 pread of ~15MB at 13.33 GB/s -- not a material
+difference** (well under the 15% threshold; within measurement noise).
+This SSD's random-read bandwidth is saturated by request count/size well
+before the gate/up/down split matters. Per `docs/DESIGN.md`'s own stated
+fallback ("if the SSD benchmark shows three smaller preads match one slab
+pread, stream directly from the GGUF and skip the repack"): they match,
+so the repack step is not justified by throughput -- stream directly
+from the GGUF's three tensors per expert and skip building
+`experts-NN.bin` slabs, unless a future non-throughput reason (e.g. one
+syscall vs three, alignment, or a slower SSD on different hardware)
+reopens the question.
 
-**3. Decode ceiling estimate.** Best 15MiB F_NOCACHE throughput (13.33
-GB/s) divided by the two decode regimes from `docs/DESIGN.md`:
-- Warm (~1.5GB/token): 13.33 / 1.5 = **8.88 tok/s** I/O ceiling.
-- Cold (~6GB/token): 13.33 / 6 = **2.22 tok/s** I/O ceiling.
+**3. Decode ceiling estimate.** Best 15MiB F_NOCACHE throughput (raw
+`gbps=13.3267`, same cell as conclusion 1) divided by the two decode
+regimes from `docs/DESIGN.md`:
+- Warm (~1.5GB/token): `13.3267 / 1.5 = 8.88` tok/s I/O ceiling.
+- Cold (~6GB/token): `13.3267 / 6 = 2.22` tok/s I/O ceiling.
 
 These are pure I/O bounds assuming perfect overlap of every other cost;
 real decode overlaps compute (dequant, attention, MoE routing) with these
