@@ -1,5 +1,6 @@
 CC      ?= cc
 CFLAGS  ?= -O2 -std=c11 -Wall -Wextra
+LDFLAGS ?= -pthread
 
 # Targets grow with the phases:
 #   sepia    (0.4)  CPU reference engine
@@ -15,4 +16,9 @@ pycheck:
 		echo "pycheck: no python tools yet"; \
 	fi
 
-.PHONY: ci pycheck
+# iobench needs a large local test file (weights/iobench.bin); ci does not
+# run it, only compiles it via this target on demand.
+iobench: tools/iobench.c
+	$(CC) $(CFLAGS) -o iobench tools/iobench.c $(LDFLAGS)
+
+.PHONY: ci pycheck iobench
