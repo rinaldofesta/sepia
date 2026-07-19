@@ -158,14 +158,22 @@ disk, repo public with CI green.
 
 ## Open questions
 
-- `dense_mlp_idx` semantics and MTP layer internals (resolved in Phase 0
-  step 3 by reading modeling code).
-- Two GGUF tensors with no documented mapping yet: `blk.N.attn_r.weight`
-  (6144x1024, Q8_0, every layer; hypothesis: the content projection of
-  the banded relative position bias, since d_rel 16 x 64 heads = 1024,
-  and the safetensors naming has `attn.rel_logits_proj.proj` per layer)
-  and `blk.N.ffn_gscale.weight` (scalar, every layer). Phase 0 step 3
-  identifies both from modeling code.
+- ~~`dense_mlp_idx` semantics and MTP layer internals~~ resolved in Phase 0
+  step 3: `dense_mlp_idx` is the count of leading dense layers (layers
+  `[0, dense_mlp_idx)` are dense MLP, the rest MoE); MTP layer internals
+  (checkpoint structure) documented, but transformers 5.14.1 has no MTP
+  *forward-path* implementation at all for Inkling to read. Full detail in
+  `docs/architecture-notes.md`.
+- ~~Two GGUF tensors with no documented mapping yet~~ resolved in Phase 0
+  step 3, from the actual modeling code (not the hypothesis below, which
+  the code reading corrected): `blk.N.attn_r.weight` (6144x1024, Q8_0,
+  every layer) is `self_attn.r_proj.weight` (real checkpoint name
+  `attn.wr_du.weight`), the content projection feeding the banded relative
+  position bias -- not `attn.rel_logits_proj.proj`, which is a real but
+  separate, much smaller (`[16, rel_extent]`) tensor. `blk.N.ffn_gscale.weight`
+  (scalar, every layer) is `mlp.global_scale` (dense layers) or
+  `mlp.gate.global_scale` (MoE layers), gated by the real config's
+  `use_global_scale` field name. Full detail in `docs/architecture-notes.md`.
 - Inkling routing predictability (resolved by the P2 experiment).
 - Hosted-API logprob availability for P6 validation.
 - SSD endurance: sustained ~1.5GB per token is real write-free read load,
