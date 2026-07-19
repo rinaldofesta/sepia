@@ -20,17 +20,17 @@ RAM stops being a hard cutoff when experts stream from disk. Inkling routes each
 
 ## Expected numbers, stated before writing kernels
 
-colibri measured 2.24 tok/s on this exact machine class (MacBook Pro M5 Max, 128GB) streaming GLM-5.2 (744B) at int4 with a ~75% expert hit rate ([report](https://github.com/JustVugg/colibri/blob/main/docs/METAL-M5MAX-PERF-REPORT.md)). Inkling's regime math: a cold token reads 6 experts x ~64 MoE layers x ~16MB = ~6GB; at a ~75% hit rate that drops to ~1.5GB per token from SSD. Target: 1.5-3 tok/s before prefetch and MTP wins. If the measured numbers land below that, they get published anyway.
+colibri measured 2.24 tok/s on this exact machine class (MacBook Pro M5 Max, 128GB) streaming GLM-5.2 (744B) at int4 with a ~75% expert hit rate ([report](https://github.com/JustVugg/colibri/blob/main/docs/METAL-M5MAX-PERF-REPORT.md)). Inkling's regime math: a cold token reads 6 experts x ~64 MoE layers x ~16MB = ~6GB; at a ~75% hit rate that drops to ~1.5GB per token from SSD. Target: 1.5-3 tok/s before prefetch and MTP wins. If the measured numbers land below that, they get published anyway. First measurement in: the SSD does 13.33 GB/s of random expert-size reads ([docs/ssd-bench.md](docs/ssd-bench.md)), putting the pure-I/O ceiling at 8.88 tok/s warm and 2.22 cold; I/O is not the expected bottleneck.
 
 Open question I cannot answer yet: colibri found GLM-5.2's next-layer routing 71.6% predictable from the current layer's state, which is what makes prefetch pay. Whether Inkling routes as predictably is unknown. A Phase 2 experiment answers it either way, and a negative result ships too.
 
 ## Phase 0 (current): validate before optimizing
 
-- [ ] Tiny-random Inkling oracle: token-exact CPU forward vs the transformers reference
-- [ ] `sepia.c` CPU engine passing the oracle 32/32
-- [ ] SSD microbenchmark at expert-slab sizes (buffered vs F_NOCACHE)
-- [ ] Remote GGUF header inventory of the Unsloth quants (HTTP Range reads, no download)
-- [ ] Converter: GGUF to per-expert streaming container, byte-validated against the source
+- [x] Tiny-random Inkling oracle: token-exact CPU forward vs the transformers reference
+- [x] `sepia.c` CPU engine passing the oracle: prefill 32/32, decode 20/20, max logit diff 1.12e-8 (CI-gated on every push)
+- [x] SSD microbenchmark at expert-slab sizes: 13.33 GB/s random 15MB reads with F_NOCACHE ([docs/ssd-bench.md](docs/ssd-bench.md))
+- [x] Remote GGUF header inventory of the Unsloth quants: 1512 tensors mapped from 40MB of Range reads against 317GB ([docs](docs/gguf-inventory-ud-q2_k_xl.md))
+- [x] Container tooling, byte-validated on fixtures: expert index sidecar + resident extraction ([docs/container.md](docs/container.md)). The repack died by measurement: 3x~5MB preads match 1x~15MB within 0.13%, so experts stream straight from the GGUF. Full-weights validation runs when the 317GB download completes.
 
 ## Lineage
 
