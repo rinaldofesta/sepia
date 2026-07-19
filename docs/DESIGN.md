@@ -52,8 +52,13 @@ From the raw `config.json` of `thinkingmachines/Inkling` (2026-07-19):
 - Router: sigmoid plus bias (aux-loss-free), `norm_after_topk`,
   `route_scale` 8.0. `dense_mlp_idx: 2` marks early dense layers; exact
   semantics to be confirmed from modeling code during oracle work.
-- 8 MTP layers in `mtp_config` (6 local, 2 global), likely bundled in the
-  main 108-shard checkpoint (unconfirmed).
+- 8 MTP layers in `mtp_config` (6 local, 2 global). Verified 2026-07-19
+  from the checkpoint's weight map: all 160 MTP tensors live in a
+  dedicated `mtp.safetensors` shard (`model.mtp.layers.0-7`, full
+  transformer blocks with their own attention and sconv), separate from
+  the 108 main shards. The Unsloth GGUFs do not include them at all, so
+  Phase 4 sources MTP from that one shard and quantizes it in-house
+  (8-bit or better, per colibri's acceptance-collapse lesson).
 - Vocab 201024 (tiktoken), context 1M. Multimodal input (vision, audio),
   text output. SEPIA is text-only until further notice: a scope decision.
 - BF16 checkpoint: 1.9TB, 108 shards, transformers 5.14.
@@ -89,7 +94,12 @@ contiguous and 4KB-aligned so one expert is one aligned pread), and
 `index.json`. Quant blocks are byte-identical to the source GGUF: no
 requantization, so ported ds4/ggml kernels apply unchanged. First weight
 source: Unsloth UD-Q2_K_XL (~317GB; not the smallest available quant,
-chosen over the ~270GB 1-bit for output quality). A fallback stays open: if the SSD
+chosen over the ~270GB 1-bit for output quality). Measured by the
+inventory (docs/gguf-inventory-ud-q2_k_xl.md): routed experts are 95.5%
+of tensor bytes; one expert's gate+up+down averages ~17.7MiB
+(17.3-23.3 depending on layer); expert quant types are IQ2_XS (gate/up),
+IQ3_XXS and IQ4_XS (down), so those are the dequant kernels SEPIA ports
+first. A fallback stays open: if the SSD
 benchmark shows three smaller preads match one slab pread, stream
 directly from the GGUF and skip the repack.
 
@@ -150,7 +160,12 @@ disk, repo public with CI green.
 
 - `dense_mlp_idx` semantics and MTP layer internals (resolved in Phase 0
   step 3 by reading modeling code).
-- Exact Unsloth GGUF tensor types and layout (resolved by the inventory).
+- Two GGUF tensors with no documented mapping yet: `blk.N.attn_r.weight`
+  (6144x1024, Q8_0, every layer; hypothesis: the content projection of
+  the banded relative position bias, since d_rel 16 x 64 heads = 1024,
+  and the safetensors naming has `attn.rel_logits_proj.proj` per layer)
+  and `blk.N.ffn_gscale.weight` (scalar, every layer). Phase 0 step 3
+  identifies both from modeling code.
 - Inkling routing predictability (resolved by the P2 experiment).
 - Hosted-API logprob availability for P6 validation.
 - SSD endurance: sustained ~1.5GB per token is real write-free read load,

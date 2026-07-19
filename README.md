@@ -6,7 +6,7 @@ Status: Phase 0. Nothing generates tokens yet. This README states the plan and t
 
 ## The problem
 
-The smallest published Inkling quant ([Unsloth UD-IQ1_S](https://huggingface.co/unsloth/Inkling-GGUF)) is ~270GB on disk and needs ~280GB of combined memory. A 128GB Mac cannot load it. llama.cpp's Inkling support is a draft PR ([#25731](https://github.com/ggml-org/llama.cpp/pull/25731)) with no MTP speculation. Today this model does not run on the largest MacBook you can buy.
+The smallest published Inkling quant ([Unsloth UD-IQ1_S](https://huggingface.co/unsloth/inkling-GGUF)) is ~270GB on disk and needs ~280GB of combined memory. A 128GB Mac cannot load it. llama.cpp's Inkling support is a draft PR ([#25731](https://github.com/ggml-org/llama.cpp/pull/25731)) with no MTP speculation. Today this model does not run on the largest MacBook you can buy.
 
 ## The bet
 
