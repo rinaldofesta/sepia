@@ -598,6 +598,7 @@ against real on-disk safetensors keys (fetched from
 | real checkpoint (on disk) | transformers module name | notes |
 |---|---|---|
 | `model.llm.embed.weight` | `model.language_model.embed_tokens.weight` | input embedding, `[vocab_size, hidden_size]` |
+| `model.llm.embed_norm.weight` | `model.language_model.embed_norm.weight` | embedding RMSNorm (`[hidden_size]`); GGUF `token_embd_norm.weight` |
 | `model.llm.norm.weight` | `model.language_model.norm.weight` | final norm |
 | `model.llm.unembed.weight` | `lm_head.weight` | output head, NOT tied to embed |
 | `attn.wq_du.weight` | `self_attn.q_proj.weight` | |

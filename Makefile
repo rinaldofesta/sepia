@@ -6,9 +6,20 @@ LDFLAGS ?= -pthread -lm
 #   sepia    (0.4)  CPU reference engine
 #   iobench  (0.5)  SSD microbenchmark
 #   test     (0.4)  oracle self-test
-ci: pycheck sepia
+ci: pycheck tooltests sepia
 	./sepia
 	@echo "ci ok"
+
+# Tool test suites. Excluded on purpose: tools/test_oracle_determinism.sh
+# (needs the torch venv, absent in CI; re-proven locally whenever the
+# oracle regenerates).
+tooltests: iobench
+	python3 tools/test_gguf_inspect.py
+	python3 tools/test_make_index.py
+	python3 tools/test_extract_resident.py
+	bash tools/test_iobench.sh
+	bash tools/test_sepia_malformed.sh
+	@echo "tooltests ok"
 
 pycheck:
 	@if ls tools/*.py >/dev/null 2>&1; then \
@@ -28,4 +39,4 @@ test: sepia
 iobench: tools/iobench.c
 	$(CC) $(CFLAGS) -o iobench tools/iobench.c $(LDFLAGS)
 
-.PHONY: ci pycheck sepia test iobench
+.PHONY: ci pycheck tooltests sepia test iobench

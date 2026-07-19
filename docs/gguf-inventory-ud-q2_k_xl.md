@@ -234,8 +234,9 @@ passes for the IQ3_XXS and IQ4_XS down-projection cases.
 **Per-expert total (gate + up + down), one MoE layer:**
 - 57 layers (IQ2_XS/IQ2_XS/IQ3_XXS): `5,455,872 x 2 + 7,225,344 =
   18,137,088 bytes = 17.30 MiB`
-- 7 layers (IQ2_XS/IQ2_XS/IQ4_XS): `5,455,872 x 2 + 10,027,008 =
-  20,938,752 bytes = 19.97 MiB`
+- 6 layers (IQ2_XS/IQ2_XS/IQ4_XS): `5,455,872 x 2 + 10,027,008 =
+  20,938,752 bytes = 19.97 MiB` (layer 65, the 7th IQ4_XS-down layer,
+  is listed separately below because its gate/up differ too)
 - layer 65 (IQ3_XXS/IQ3_XXS/IQ4_XS): `7,225,344 x 2 + 10,027,008 =
   24,477,696 bytes = 23.34 MiB`
 

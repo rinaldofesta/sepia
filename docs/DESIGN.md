@@ -39,7 +39,9 @@ From the raw `config.json` of `thinkingmachines/Inkling` (2026-07-19):
 
 - 66 layers, hidden 6144. MoE: 256 routed experts per layer, top-6,
   2 shared experts (`shared_expert_sink: true`), per-expert intermediate
-  3072. One routed expert is ~56.6M params (~16MB at 2-bit).
+  3072. One routed expert is ~56.6M params (~16MB at pure 2-bit;
+  measured 17.3-23.3MiB in the mixed UD-Q2_K_XL quant, average
+  ~17.7MiB).
 - Hybrid attention: 55 local layers (sliding window 512, 16 KV heads) and
   11 global layers (indices 5, 11, ..., 65; 8 KV heads). 64 query heads,
   head_dim 128.
@@ -79,10 +81,13 @@ GLM-5.2 (744B, int4) at 2.24 tok/s with a ~75% expert hit rate, RSS
   streaming workload.
 
 Inkling budget: resident slice (attention, shared experts, routers,
-embeddings: roughly 20-25B params at 8-bit) is ~20-25GB. The rest of RAM
-holds the pinned expert set, the per-layer LRU, and KV. Cold decode reads
-~6GB per token (6 experts x ~64 MoE layers x ~16MB); at colibri-class hit
-rates, ~1.5GB per token. Honest target: 1.5-3 tok/s before MTP and
+embeddings: roughly 20-25B params) would be ~20-25GB at 8-bit; the
+UD-Q2_K_XL source actually keeps most of it at Q5_K/Q6_K, which is why
+the extracted resident.bin comes out at ~14GB (container section below).
+The rest of RAM holds the pinned expert set, the per-layer LRU, and KV.
+Cold decode reads ~7.1GB per token (6 experts x 64 MoE layers x
+18,498,816 bytes, the measured average slab); at colibri-class hit
+rates, ~1.8GB per token. Honest target: 1.5-3 tok/s before MTP and
 prefetch wins.
 
 ## Container ("inkwell")
@@ -99,7 +104,8 @@ inventory (docs/gguf-inventory-ud-q2_k_xl.md): routed experts are 95.5%
 of tensor bytes; one expert's gate+up+down averages ~17.7MiB
 (17.3-23.3 depending on layer); expert quant types are IQ2_XS (gate/up),
 IQ3_XXS and IQ4_XS (down), so those are the dequant kernels SEPIA ports
-first. The SSD benchmark (docs/ssd-bench.md, measured 2026-07-19)
+first (gate/up on layer 65 alone are IQ3_XXS, the one exception). The
+SSD benchmark (docs/ssd-bench.md, measured 2026-07-19)
 settled the repack question: this machine reads 13.33 GB/s of random
 15MB blocks with F_NOCACHE, and three ~5MB preads match one ~15MB pread
 within 0.13%. So the plan of record is now: no repack, stream each
@@ -109,8 +115,11 @@ for adding the MTP sidecar later. One caveat before this is final: GGUF
 tensor data is 32-byte aligned, not page-aligned, and the benchmark read
 at block-aligned offsets; task 0.7 must verify F_NOCACHE throughput at
 GGUF-realistic unaligned offsets before dropping the repack path for
-good. The measured I/O ceilings: 8.88 tok/s warm (~1.5GB/token) and
-2.22 tok/s cold (~6GB/token), pure I/O, before any compute overlap.
+good. The I/O ceilings at the measured average slab (18,498,816 bytes):
+~7.5 tok/s warm (~1.8GB/token at 75% hit) and ~1.9 tok/s cold
+(~7.1GB/token), pure I/O, before any compute overlap. docs/ssd-bench.md
+quotes 8.88/2.22 for the round pre-measurement 1.5GB/6GB
+parameterization: same bandwidth, different per-token estimate.
 
 ## Phase 0 (current milestone): validate before optimizing
 
@@ -135,7 +144,8 @@ good. The measured I/O ceilings: 8.88 tok/s warm (~1.5GB/token) and
 
 Exit criteria: oracle self-test token-exact (32/32), iobench table
 published, inventory published, converter byte-validated, container on
-disk, repo public with CI green.
+disk, repo public with CI green. Live status per criterion: README's
+Phase 0 checklist and docs/container.md section 6.
 
 ## Roadmap (each phase gets its own plan)
 
