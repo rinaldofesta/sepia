@@ -41,7 +41,7 @@ CASES = [
     "\n",
     "",
     "word" * 50,
-    " nbsp and  line sep",
+    "\xa0nbsp and \u2028line sep",
 ]
 
 def gpt2_byte_alphabet():
@@ -99,7 +99,6 @@ def make_mini():
     """Tiny self-contained SPTK + cases: 256 byte tokens + a few merges."""
     b2u = gpt2_byte_alphabet()
     toks = [b2u[b] for b in range(256)]
-    words = ["he", "hel", "hell", "hello", "lo", " t", " th", " the", "in", "ing"]
     # explicit merge list building "hello" and " the" and "ing" chains:
     merges = [
         (b2u[ord("h")], b2u[ord("e")]),                     # he
