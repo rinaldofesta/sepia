@@ -1008,6 +1008,55 @@ static void cap_push_sconv(const float *w, const float *hist, const float *in, i
     it->y = fdup(y, (size_t)T * (size_t)C);
 }
 
+/* Task 7 Gate B (--gpu-compare-tiny's attention-swap mode): one instance per
+ * attn_forward_chunk call (restricted to layer 0 / last layer by
+ * g_opcap_selected_layer, same as every other Cap* site). Captures exactly
+ * what's needed to replay the WHOLE attention block (projections -> sconv ->
+ * per-head norm -> cache assembly -> rel-project -> banded attention -> wo)
+ * via GPU dispatches and compare against attn_forward_chunk's own real
+ * output: the pre-call cache history (k_pre/v_pre -- the cache slice BEFORE
+ * this call's writes -- and k_hist_pre/v_hist_pre -- the sconv history
+ * before sconv_apply mutates it in place, mirroring CapSconv's own "hist
+ * before" convention), the block's input (x_normed) and final output (out).
+ * `cfg`/`lw` are stored as plain pointers (both outlive the harness's
+ * comparison pass -- they point into the still-live Model this call came
+ * from), not duplicated: only the per-call activation/cache tensors need
+ * their own copies since those are mutated or freed as the forward pass
+ * continues. */
+typedef struct {
+    const Config *cfg;
+    const LayerWeights *lw;
+    int T, start_pos;
+    float *x_normed;   /* [T,hidden] */
+    float *k_pre;      /* [start_pos,kv_dim] (start_pos may be 0) */
+    float *v_pre;      /* [start_pos,kv_dim] */
+    float *k_hist_pre; /* [K-1,kv_dim] */
+    float *v_hist_pre; /* [K-1,kv_dim] */
+    float *out;        /* [T,hidden] -- attn_forward_chunk's real (post-wo) output */
+} CapAttn;
+typedef struct { CapAttn *items; int count, cap; } CapAttnList;
+static CapAttnList g_cap_attn;
+
+static void cap_push_attn(const Config *cfg, const LayerWeights *lw, int T, int start_pos,
+                           const float *x_normed, const float *k_pre, const float *v_pre,
+                           const float *k_hist_pre, const float *v_hist_pre, const float *out) {
+    opcap_ensure((void **)&g_cap_attn.items, &g_cap_attn.count, &g_cap_attn.cap, sizeof(CapAttn));
+    CapAttn *it = &g_cap_attn.items[g_cap_attn.count++];
+    int hidden = cfg->hidden_size;
+    int kv_dim = lw->kv_dim;
+    int K = cfg->conv_kernel_size;
+    it->cfg = cfg;
+    it->lw = lw;
+    it->T = T;
+    it->start_pos = start_pos;
+    it->x_normed = fdup(x_normed, (size_t)T * (size_t)hidden);
+    it->k_pre = fdup(k_pre, (size_t)start_pos * (size_t)kv_dim);
+    it->v_pre = fdup(v_pre, (size_t)start_pos * (size_t)kv_dim);
+    it->k_hist_pre = fdup(k_hist_pre, (size_t)(K - 1) * (size_t)kv_dim);
+    it->v_hist_pre = fdup(v_hist_pre, (size_t)(K - 1) * (size_t)kv_dim);
+    it->out = fdup(out, (size_t)T * (size_t)hidden);
+}
+
 /* =============================== attention =============================== */
 /* Computes one decoder layer's self-attention block for T new positions
  * starting at absolute position start_pos, appending to the layer's KV
@@ -1027,6 +1076,19 @@ static void attn_forward_chunk(const Config *cfg, const LayerWeights *lw, LayerC
     int group = H / Hkv;
     int K = cfg->conv_kernel_size;
     int d_rel = cfg->d_rel;
+
+    /* Task 7 Gate B capture only: snapshot the cache slice BEFORE this
+     * call's writes (the memcpy below at start_pos..start_pos+T overwrites
+     * lc->k/lc->v, so this must happen before that point) -- see CapAttn's
+     * doc comment, above. Pure side-effect capture, freed after
+     * cap_push_attn near the end of this function; no effect on the math
+     * below when g_opcap_selected_layer is 0. */
+    float *gpu_cap_k_pre = NULL, *gpu_cap_v_pre = NULL;
+    float *gpu_cap_k_hist_pre = NULL, *gpu_cap_v_hist_pre = NULL;
+    if (g_opcap_selected_layer) {
+        gpu_cap_k_pre = fdup(lc->k, (size_t)start_pos * (size_t)kv_dim);
+        gpu_cap_v_pre = fdup(lc->v, (size_t)start_pos * (size_t)kv_dim);
+    }
 
     float *q_raw = xmalloc(sizeof(float) * (size_t)T * (size_t)q_dim);
     float *k_raw = xmalloc(sizeof(float) * (size_t)T * (size_t)kv_dim);
@@ -1049,14 +1111,16 @@ static void attn_forward_chunk(const Config *cfg, const LayerWeights *lw, LayerC
     float *k_sconv = xmalloc(sizeof(float) * (size_t)T * (size_t)kv_dim);
     float *v_sconv = xmalloc(sizeof(float) * (size_t)T * (size_t)kv_dim);
     if (g_opcap_selected_layer) {
-        float *k_hist_before = fdup(lc->k_hist, (size_t)(K - 1) * (size_t)kv_dim);
-        float *v_hist_before = fdup(lc->v_hist, (size_t)(K - 1) * (size_t)kv_dim);
+        /* Task 7 Gate B: these survive to cap_push_attn near the end of this
+         * function (freed there, alongside gpu_cap_k_pre/v_pre above) rather
+         * than immediately here -- everything else about this branch is
+         * unchanged from before Task 7. */
+        gpu_cap_k_hist_pre = fdup(lc->k_hist, (size_t)(K - 1) * (size_t)kv_dim);
+        gpu_cap_v_hist_pre = fdup(lc->v_hist, (size_t)(K - 1) * (size_t)kv_dim);
         sconv_apply(lw->k_sconv_w, kv_dim, K, lc->k_hist, k_raw, T, k_sconv);
         sconv_apply(lw->v_sconv_w, kv_dim, K, lc->v_hist, v_raw, T, v_sconv);
-        cap_push_sconv(lw->k_sconv_w, k_hist_before, k_raw, kv_dim, K, T, k_sconv);
-        cap_push_sconv(lw->v_sconv_w, v_hist_before, v_raw, kv_dim, K, T, v_sconv);
-        free(k_hist_before);
-        free(v_hist_before);
+        cap_push_sconv(lw->k_sconv_w, gpu_cap_k_hist_pre, k_raw, kv_dim, K, T, k_sconv);
+        cap_push_sconv(lw->v_sconv_w, gpu_cap_v_hist_pre, v_raw, kv_dim, K, T, v_sconv);
     } else {
         sconv_apply(lw->k_sconv_w, kv_dim, K, lc->k_hist, k_raw, T, k_sconv);
         sconv_apply(lw->v_sconv_w, kv_dim, K, lc->v_hist, v_raw, T, v_sconv);
@@ -1187,6 +1251,15 @@ static void attn_forward_chunk(const Config *cfg, const LayerWeights *lw, LayerC
             cap_push_matvec(lw->wo, attn_concat + (size_t)t * q_dim, hidden, q_dim, out + (size_t)t * hidden);
     }
     free(attn_concat);
+
+    if (g_opcap_selected_layer) {
+        cap_push_attn(cfg, lw, T, start_pos, x_normed, gpu_cap_k_pre, gpu_cap_v_pre,
+                      gpu_cap_k_hist_pre, gpu_cap_v_hist_pre, out);
+    }
+    free(gpu_cap_k_pre);
+    free(gpu_cap_v_pre);
+    free(gpu_cap_k_hist_pre);
+    free(gpu_cap_v_hist_pre);
 }
 
 /* ================================== MLP ================================= */
@@ -3111,6 +3184,452 @@ static void gpu_compare_sconv(void) {
     gpu_compare_report("sconv", max_rel, n_inst);
 }
 
+/* ==================== Task 7: banded attention comparison ================= */
+/* Shared GPU-replay-and-compare helper for BOTH Task 7 gates:
+ *   Gate A (--gpu-compare-attn, run_gpu_compare_attn below): synthetic
+ *     geometries, the REAL attn_forward_chunk as oracle.
+ *   Gate B (folded into --gpu-compare-tiny via g_cap_attn, see cap_push_attn
+ *     and CapAttn's doc comment): real tiny-oracle forward-pass instances.
+ * Both need the exact same thing: given everything attn_forward_chunk
+ * consumed for ONE call (weights via cfg/lw, the block's input x_normed,
+ * the pre-call cache/history state, and its real output), replay the WHOLE
+ * attention block via GPU dispatches -- wq/wk/wv/wr/wo matvec and k/v sconv
+ * and q/k per-head rmsnorm (Task 3's already-gated kernels) plus rel-project
+ * and banded attention (Task 7's new kernels) -- and report the max
+ * relative error against the real output. This function contains ZERO
+ * attention math of its own (no dot products, no softmax, no rel-logits
+ * formula) -- every numeric step here is a dispatch into an existing
+ * sepia_gpu_* kernel; the only host-side arithmetic is index/offset
+ * bookkeeping (buffer sizes, cache concatenation) and the tau/kv_lo/kv_hi
+ * per-token scalars, which the Task 7 plan explicitly assigns to the host
+ * (see src/sepia_gpu.h's banded-attention doc). Buffers are uploaded fully
+ * before any dispatch and read back only after sepia_gpu_end() -- never
+ * reused across a write in between -- because Metal's batched encoder does
+ * not wait between dispatches; overwriting a Shared buffer's host-side
+ * contents while a prior dispatch that reads it is still just-encoded (not
+ * yet executed) would be a race. */
+
+static SepiaGpuBuf *gpu_upload_f32(const float *host, int64_t n) {
+    SepiaGpuBuf *b = sepia_gpu_alloc(sizeof(float) * (size_t)(n > 0 ? n : 1), 0);
+    if (!b) die("gpu-attn: alloc failed (n=%lld)", (long long)n);
+    if (n > 0) memcpy(sepia_gpu_host_ptr(b), host, sizeof(float) * (size_t)n);
+    return b;
+}
+
+/* Prints one per-case error-table row and returns this instance's
+ * max-relative-error (per-instance-scaled against out_cpu's own dynamic
+ * range, same convention as every other --gpu-compare-* gate in this file).
+ * Does not itself gate/die -- callers accumulate the worst case and decide. */
+static double gpu_attn_verify(const char *label, const Config *cfg, const LayerWeights *lw,
+                               int T, int start_pos,
+                               const float *x_normed,
+                               const float *k_pre, const float *v_pre,
+                               const float *k_hist_pre, const float *v_hist_pre,
+                               const float *out_cpu) {
+    int hidden = cfg->hidden_size;
+    int H = lw->num_heads, Hkv = lw->num_kv_heads, Dh = lw->head_dim;
+    int q_dim = lw->q_dim, kv_dim = lw->kv_dim, r_dim = lw->r_dim;
+    int d_rel = cfg->d_rel, rel_extent = lw->rel_extent;
+    int K = cfg->conv_kernel_size;
+    int64_t cap = (int64_t)start_pos + (int64_t)T;
+
+    /* ---- 1. projections: wq/wk/wv/wr matvec, one dispatch per (weight,t) --
+     * every input buffer is uploaded before any dispatch, every output read
+     * back only after sepia_gpu_end() (see the header note above). */
+    float *q_raw = xmalloc(sizeof(float) * (size_t)T * (size_t)q_dim);
+    float *k_raw = xmalloc(sizeof(float) * (size_t)T * (size_t)kv_dim);
+    float *v_raw = xmalloc(sizeof(float) * (size_t)T * (size_t)kv_dim);
+    float *r_raw = xmalloc(sizeof(float) * (size_t)T * (size_t)r_dim);
+    {
+        SepiaGpuBuf *wq_buf = gpu_upload_f32(lw->wq, (int64_t)q_dim * hidden);
+        SepiaGpuBuf *wk_buf = gpu_upload_f32(lw->wk, (int64_t)kv_dim * hidden);
+        SepiaGpuBuf *wv_buf = gpu_upload_f32(lw->wv, (int64_t)kv_dim * hidden);
+        SepiaGpuBuf *wr_buf = gpu_upload_f32(lw->wr, (int64_t)r_dim * hidden);
+        SepiaGpuBuf **xb = xcalloc((size_t)T, sizeof(SepiaGpuBuf *));
+        SepiaGpuBuf **yqb = xcalloc((size_t)T, sizeof(SepiaGpuBuf *));
+        SepiaGpuBuf **ykb = xcalloc((size_t)T, sizeof(SepiaGpuBuf *));
+        SepiaGpuBuf **yvb = xcalloc((size_t)T, sizeof(SepiaGpuBuf *));
+        SepiaGpuBuf **yrb = xcalloc((size_t)T, sizeof(SepiaGpuBuf *));
+
+        if (!sepia_gpu_begin()) die("gpu-attn: %s: begin failed (projections)", label);
+        for (int t = 0; t < T; t++) {
+            xb[t] = gpu_upload_f32(x_normed + (size_t)t * hidden, hidden);
+            yqb[t] = sepia_gpu_alloc(sizeof(float) * (size_t)q_dim, 0);
+            ykb[t] = sepia_gpu_alloc(sizeof(float) * (size_t)kv_dim, 0);
+            yvb[t] = sepia_gpu_alloc(sizeof(float) * (size_t)kv_dim, 0);
+            yrb[t] = sepia_gpu_alloc(sizeof(float) * (size_t)r_dim, 0);
+            if (!yqb[t] || !ykb[t] || !yvb[t] || !yrb[t]) die("gpu-attn: %s: alloc failed (projections)", label);
+            if (!sepia_gpu_matvec(wq_buf, xb[t], yqb[t], q_dim, hidden)) die("gpu-attn: %s: wq dispatch failed", label);
+            if (!sepia_gpu_matvec(wk_buf, xb[t], ykb[t], kv_dim, hidden)) die("gpu-attn: %s: wk dispatch failed", label);
+            if (!sepia_gpu_matvec(wv_buf, xb[t], yvb[t], kv_dim, hidden)) die("gpu-attn: %s: wv dispatch failed", label);
+            if (!sepia_gpu_matvec(wr_buf, xb[t], yrb[t], r_dim, hidden)) die("gpu-attn: %s: wr dispatch failed", label);
+        }
+        if (!sepia_gpu_end()) die("gpu-attn: %s: end failed (projections)", label);
+
+        for (int t = 0; t < T; t++) {
+            memcpy(q_raw + (size_t)t * q_dim, sepia_gpu_host_ptr(yqb[t]), sizeof(float) * (size_t)q_dim);
+            memcpy(k_raw + (size_t)t * kv_dim, sepia_gpu_host_ptr(ykb[t]), sizeof(float) * (size_t)kv_dim);
+            memcpy(v_raw + (size_t)t * kv_dim, sepia_gpu_host_ptr(yvb[t]), sizeof(float) * (size_t)kv_dim);
+            memcpy(r_raw + (size_t)t * r_dim, sepia_gpu_host_ptr(yrb[t]), sizeof(float) * (size_t)r_dim);
+            sepia_gpu_free(xb[t]);
+            sepia_gpu_free(yqb[t]);
+            sepia_gpu_free(ykb[t]);
+            sepia_gpu_free(yvb[t]);
+            sepia_gpu_free(yrb[t]);
+        }
+        free(xb);
+        free(yqb);
+        free(ykb);
+        free(yvb);
+        free(yrb);
+        sepia_gpu_free(wq_buf);
+        sepia_gpu_free(wk_buf);
+        sepia_gpu_free(wv_buf);
+        sepia_gpu_free(wr_buf);
+    }
+
+    /* ---- 2. sconv: k_raw/v_raw + pre-call history -> k_sconv/v_sconv ---- */
+    float *k_sconv = xmalloc(sizeof(float) * (size_t)T * (size_t)kv_dim);
+    float *v_sconv = xmalloc(sizeof(float) * (size_t)T * (size_t)kv_dim);
+    {
+        SepiaGpuBuf *kw_buf = gpu_upload_f32(lw->k_sconv_w, (int64_t)kv_dim * K);
+        SepiaGpuBuf *vw_buf = gpu_upload_f32(lw->v_sconv_w, (int64_t)kv_dim * K);
+        SepiaGpuBuf *kh_buf = gpu_upload_f32(k_hist_pre, (int64_t)(K - 1) * kv_dim);
+        SepiaGpuBuf *vh_buf = gpu_upload_f32(v_hist_pre, (int64_t)(K - 1) * kv_dim);
+        SepiaGpuBuf *ki_buf = gpu_upload_f32(k_raw, (int64_t)T * kv_dim);
+        SepiaGpuBuf *vi_buf = gpu_upload_f32(v_raw, (int64_t)T * kv_dim);
+        SepiaGpuBuf *ko_buf = sepia_gpu_alloc(sizeof(float) * (size_t)T * (size_t)kv_dim, 0);
+        SepiaGpuBuf *vo_buf = sepia_gpu_alloc(sizeof(float) * (size_t)T * (size_t)kv_dim, 0);
+        if (!ko_buf || !vo_buf) die("gpu-attn: %s: alloc failed (sconv)", label);
+
+        if (!sepia_gpu_begin()) die("gpu-attn: %s: begin failed (sconv)", label);
+        if (!sepia_gpu_sconv(kw_buf, kh_buf, ki_buf, ko_buf, kv_dim, K, T)) die("gpu-attn: %s: k sconv dispatch failed", label);
+        if (!sepia_gpu_sconv(vw_buf, vh_buf, vi_buf, vo_buf, kv_dim, K, T)) die("gpu-attn: %s: v sconv dispatch failed", label);
+        if (!sepia_gpu_end()) die("gpu-attn: %s: end failed (sconv)", label);
+
+        memcpy(k_sconv, sepia_gpu_host_ptr(ko_buf), sizeof(float) * (size_t)T * (size_t)kv_dim);
+        memcpy(v_sconv, sepia_gpu_host_ptr(vo_buf), sizeof(float) * (size_t)T * (size_t)kv_dim);
+        sepia_gpu_free(kw_buf);
+        sepia_gpu_free(vw_buf);
+        sepia_gpu_free(kh_buf);
+        sepia_gpu_free(vh_buf);
+        sepia_gpu_free(ki_buf);
+        sepia_gpu_free(vi_buf);
+        sepia_gpu_free(ko_buf);
+        sepia_gpu_free(vo_buf);
+    }
+
+    /* ---- 3. per-head rmsnorm: q_norm/k_norm broadcast across every (t,h)
+     * slice -- q_raw's [T,q_dim] layout is already exactly [T*H,Dh] rows
+     * (q_dim=H*Dh), so ONE sepia_gpu_rmsnorm call covers the whole tensor
+     * (same trick for k_sconv's [T*Hkv,Dh] rows). No norm on v (sec.2). ---- */
+    float *q_normed = xmalloc(sizeof(float) * (size_t)T * (size_t)q_dim);
+    float *k_normed = xmalloc(sizeof(float) * (size_t)T * (size_t)kv_dim);
+    {
+        SepiaGpuBuf *qn_buf = gpu_upload_f32(lw->q_norm, Dh);
+        SepiaGpuBuf *qx_buf = gpu_upload_f32(q_raw, (int64_t)T * q_dim);
+        SepiaGpuBuf *qy_buf = sepia_gpu_alloc(sizeof(float) * (size_t)T * (size_t)q_dim, 0);
+        SepiaGpuBuf *kn_buf = gpu_upload_f32(lw->k_norm, Dh);
+        SepiaGpuBuf *kx_buf = gpu_upload_f32(k_sconv, (int64_t)T * kv_dim);
+        SepiaGpuBuf *ky_buf = sepia_gpu_alloc(sizeof(float) * (size_t)T * (size_t)kv_dim, 0);
+        if (!qy_buf || !ky_buf) die("gpu-attn: %s: alloc failed (rmsnorm)", label);
+
+        if (!sepia_gpu_begin()) die("gpu-attn: %s: begin failed (rmsnorm)", label);
+        if (!sepia_gpu_rmsnorm(qn_buf, qx_buf, qy_buf, (int64_t)T * H, Dh, (float)cfg->rms_norm_eps))
+            die("gpu-attn: %s: q_norm dispatch failed", label);
+        if (!sepia_gpu_rmsnorm(kn_buf, kx_buf, ky_buf, (int64_t)T * Hkv, Dh, (float)cfg->rms_norm_eps))
+            die("gpu-attn: %s: k_norm dispatch failed", label);
+        if (!sepia_gpu_end()) die("gpu-attn: %s: end failed (rmsnorm)", label);
+
+        memcpy(q_normed, sepia_gpu_host_ptr(qy_buf), sizeof(float) * (size_t)T * (size_t)q_dim);
+        memcpy(k_normed, sepia_gpu_host_ptr(ky_buf), sizeof(float) * (size_t)T * (size_t)kv_dim);
+        sepia_gpu_free(qn_buf);
+        sepia_gpu_free(qx_buf);
+        sepia_gpu_free(qy_buf);
+        sepia_gpu_free(kn_buf);
+        sepia_gpu_free(kx_buf);
+        sepia_gpu_free(ky_buf);
+    }
+
+    /* ---- 4. assemble the full cache (pre-call history ++ this call's new
+     * rows) -- plain memcpy, no math; mirrors what attn_forward_chunk's own
+     * lc->k/lc->v memcpy-write-back produces before its attention loop
+     * reads them. ---- */
+    float *k_full = xmalloc(sizeof(float) * (size_t)cap * (size_t)kv_dim);
+    float *v_full = xmalloc(sizeof(float) * (size_t)cap * (size_t)kv_dim);
+    memcpy(k_full, k_pre, sizeof(float) * (size_t)start_pos * (size_t)kv_dim);
+    memcpy(k_full + (size_t)start_pos * (size_t)kv_dim, k_normed, sizeof(float) * (size_t)T * (size_t)kv_dim);
+    memcpy(v_full, v_pre, sizeof(float) * (size_t)start_pos * (size_t)kv_dim);
+    memcpy(v_full + (size_t)start_pos * (size_t)kv_dim, v_sconv, sizeof(float) * (size_t)T * (size_t)kv_dim);
+
+    /* ---- 5. tau / kv_lo / kv_hi (host-computed per-token scalars, exactly
+     * as the Task 7 plan assigns -- "kv_lo/hi per token computed host-
+     * side") and q_scaled = q_normed * tau (the "host pre-applies tau to q"
+     * design choice, src/sepia_gpu.h). This mirrors attn_forward_chunk's
+     * own tau/kv_lo/kv_hi formula (src/sepia.c) -- a trivial, orthogonal
+     * scalar computation, not the attention math this gate targets. ---- */
+    int64_t *kv_lo = xmalloc(sizeof(int64_t) * (size_t)T);
+    int64_t *kv_hi = xmalloc(sizeof(int64_t) * (size_t)T);
+    float *tau = xmalloc(sizeof(float) * (size_t)T);
+    int have_log_scaling = (!lw->is_sliding) && cfg->has_log_scaling_floor;
+    for (int t = 0; t < T; t++) {
+        int q_pos = start_pos + t;
+        double tv = 1.0;
+        if (have_log_scaling) {
+            double effective_n = (double)(q_pos + 1);
+            double ratio = effective_n / (double)cfg->log_scaling_n_floor;
+            if (ratio < 1.0) ratio = 1.0;
+            tv = 1.0 + cfg->log_scaling_alpha * log(ratio);
+        }
+        tau[t] = (float)tv;
+        int64_t kvlo = lw->is_sliding ? (int64_t)q_pos - (int64_t)cfg->sliding_window_size + 1 : 0;
+        if (kvlo < 0) kvlo = 0;
+        kv_lo[t] = kvlo;
+        kv_hi[t] = q_pos;
+    }
+    float *q_scaled = xmalloc(sizeof(float) * (size_t)T * (size_t)q_dim);
+    for (int t = 0; t < T; t++)
+        for (int i = 0; i < q_dim; i++)
+            q_scaled[(size_t)t * q_dim + i] = q_normed[(size_t)t * q_dim + i] * tau[t];
+
+    /* ---- 6. rel-project (Task 7 kernel 1) ---- */
+    float *rel_logits = xmalloc(sizeof(float) * (size_t)T * (size_t)H * (size_t)rel_extent);
+    {
+        SepiaGpuBuf *rv_buf = gpu_upload_f32(r_raw, (int64_t)T * r_dim);
+        SepiaGpuBuf *rp_buf = gpu_upload_f32(lw->rel_proj, (int64_t)d_rel * rel_extent);
+        SepiaGpuBuf *rl_buf = sepia_gpu_alloc(sizeof(float) * (size_t)T * (size_t)H * (size_t)rel_extent, 0);
+        if (!rl_buf) die("gpu-attn: %s: alloc failed (rel_project)", label);
+
+        if (!sepia_gpu_begin()) die("gpu-attn: %s: begin failed (rel_project)", label);
+        if (!sepia_gpu_rel_project(rv_buf, rp_buf, rl_buf, T, H, d_rel, rel_extent))
+            die("gpu-attn: %s: rel_project dispatch failed", label);
+        if (!sepia_gpu_end()) die("gpu-attn: %s: end failed (rel_project)", label);
+
+        memcpy(rel_logits, sepia_gpu_host_ptr(rl_buf), sizeof(float) * (size_t)T * (size_t)H * (size_t)rel_extent);
+        sepia_gpu_free(rv_buf);
+        sepia_gpu_free(rp_buf);
+        sepia_gpu_free(rl_buf);
+    }
+
+    /* ---- 7. banded attention (Task 7 kernel 2) ---- */
+    float *attn_concat = xmalloc(sizeof(float) * (size_t)T * (size_t)q_dim);
+    {
+        SepiaGpuBuf *q_buf = gpu_upload_f32(q_scaled, (int64_t)T * q_dim);
+        SepiaGpuBuf *k_buf = gpu_upload_f32(k_full, cap * kv_dim);
+        SepiaGpuBuf *v_buf = gpu_upload_f32(v_full, cap * kv_dim);
+        SepiaGpuBuf *rl_buf = gpu_upload_f32(rel_logits, (int64_t)T * H * rel_extent);
+        SepiaGpuBuf *out_buf = sepia_gpu_alloc(sizeof(float) * (size_t)T * (size_t)q_dim, 0);
+        if (!out_buf) die("gpu-attn: %s: alloc failed (banded_attn)", label);
+
+        if (!sepia_gpu_begin()) die("gpu-attn: %s: begin failed (banded_attn)", label);
+        if (!sepia_gpu_banded_attn(q_buf, k_buf, v_buf, rl_buf, out_buf, kv_lo, kv_hi, tau,
+                                    T, H, Hkv, Dh, rel_extent, start_pos, kv_dim, 1.0f / (float)Dh))
+            die("gpu-attn: %s: banded_attn dispatch failed", label);
+        if (!sepia_gpu_end()) die("gpu-attn: %s: end failed (banded_attn)", label);
+
+        memcpy(attn_concat, sepia_gpu_host_ptr(out_buf), sizeof(float) * (size_t)T * (size_t)q_dim);
+        sepia_gpu_free(q_buf);
+        sepia_gpu_free(k_buf);
+        sepia_gpu_free(v_buf);
+        sepia_gpu_free(rl_buf);
+        sepia_gpu_free(out_buf);
+    }
+
+    /* ---- 8. wo matvec (Task 3's kernel, one dispatch per t) ---- */
+    float *out_gpu = xmalloc(sizeof(float) * (size_t)T * (size_t)hidden);
+    {
+        SepiaGpuBuf *wo_buf = gpu_upload_f32(lw->wo, (int64_t)hidden * q_dim);
+        SepiaGpuBuf **xb = xcalloc((size_t)T, sizeof(SepiaGpuBuf *));
+        SepiaGpuBuf **yb = xcalloc((size_t)T, sizeof(SepiaGpuBuf *));
+
+        if (!sepia_gpu_begin()) die("gpu-attn: %s: begin failed (wo)", label);
+        for (int t = 0; t < T; t++) {
+            xb[t] = gpu_upload_f32(attn_concat + (size_t)t * q_dim, q_dim);
+            yb[t] = sepia_gpu_alloc(sizeof(float) * (size_t)hidden, 0);
+            if (!yb[t]) die("gpu-attn: %s: alloc failed (wo)", label);
+            if (!sepia_gpu_matvec(wo_buf, xb[t], yb[t], hidden, q_dim)) die("gpu-attn: %s: wo dispatch failed", label);
+        }
+        if (!sepia_gpu_end()) die("gpu-attn: %s: end failed (wo)", label);
+
+        for (int t = 0; t < T; t++) {
+            memcpy(out_gpu + (size_t)t * hidden, sepia_gpu_host_ptr(yb[t]), sizeof(float) * (size_t)hidden);
+            sepia_gpu_free(xb[t]);
+            sepia_gpu_free(yb[t]);
+        }
+        free(xb);
+        free(yb);
+        sepia_gpu_free(wo_buf);
+    }
+
+    /* ---- 9. compare against the real CPU output, per-instance-scaled ---- */
+    size_t total = (size_t)T * (size_t)hidden;
+    double scale = 0.0;
+    for (size_t i = 0; i < total; i++) scale = fmax(scale, fabs((double)out_cpu[i]));
+    double max_rel = 0.0;
+    for (size_t i = 0; i < total; i++) {
+        double rel = gpu_compare_rel_err(out_gpu[i], out_cpu[i], scale);
+        if (rel > max_rel) max_rel = rel;
+    }
+
+    printf("gpu-compare-attn: %-40s T=%-3d n_kv[0..T-1]=%lld..%lld max_rel_err %.3e  %s\n",
+           label, T, (long long)(kv_hi[0] - kv_lo[0] + 1), (long long)(kv_hi[T - 1] - kv_lo[T - 1] + 1),
+           max_rel, max_rel <= SEPIA_GPU_COMPARE_TOL ? "ok" : "FAIL");
+
+    free(q_raw);
+    free(k_raw);
+    free(v_raw);
+    free(r_raw);
+    free(k_sconv);
+    free(v_sconv);
+    free(q_normed);
+    free(k_normed);
+    free(k_full);
+    free(v_full);
+    free(kv_lo);
+    free(kv_hi);
+    free(tau);
+    free(q_scaled);
+    free(rel_logits);
+    free(attn_concat);
+    free(out_gpu);
+
+    return max_rel;
+}
+
+/* --gpu-compare-attn (local-only, needs --metal): Task 7 Gate A. Builds a
+ * standalone Config/LayerWeights/LayerCache at the two REAL per-layer-type
+ * geometries (docs/inkling-config.json: sliding H64/Hkv16/Dh128/window512/
+ * rel512=window; global H64/Hkv8/Dh128/rel1024, d_rel=16 both,
+ * log_scaling_alpha=0.1/log_scaling_n_floor=128000 for the global case)
+ * with randomized weights and cache history -- hidden_size is deliberately
+ * shrunk to 64 here (vs the real 6144) since it only sizes the wq/wk/wv/wr/
+ * wo *projection* matvecs, already Task 3's gated kernel and orthogonal to
+ * the rel-project/banded-attention math this gate targets; every dimension
+ * that DOES matter for that math (H, Hkv, Dh, rel_extent, d_rel, window,
+ * log-scaling params) is the exact real value. For each (label, is_sliding,
+ * q_pos, T) case, calls the REAL attn_forward_chunk (unmodified CPU oracle)
+ * then gpu_attn_verify above; never reimplements attn_forward_chunk's math,
+ * only constructs the synthetic structs it consumes (the Task 7 plan's
+ * explicit requirement). */
+
+static float *gpu_attn_randbuf(unsigned *seed, size_t n, float scale) {
+    float *b = xmalloc(sizeof(float) * (n ? n : 1));
+    for (size_t i = 0; i < n; i++)
+        b[i] = (((float)rand_r(seed) / (float)RAND_MAX) * 2.0f - 1.0f) * scale;
+    return b;
+}
+
+typedef struct {
+    const char *label;
+    int is_sliding;
+    int q_pos;
+    int T;
+} AttnGateCase;
+
+static void run_gpu_compare_attn(void) {
+    if (!sepia_gpu_available()) die("gpu-compare-attn: requires --metal to have initialized the GPU runtime");
+
+    enum { HIDDEN = 64, H = 64, HKV_SLIDING = 16, HKV_GLOBAL = 8, DH = 128, D_REL = 16,
+           WINDOW = 512, REL_EXTENT_GLOBAL = 1024, K = 4 };
+
+    Config cfg = {0};
+    cfg.hidden_size = HIDDEN;
+    cfg.d_rel = D_REL;
+    cfg.conv_kernel_size = K;
+    cfg.rms_norm_eps = 1e-6;
+    cfg.sliding_window_size = WINDOW;
+    cfg.rel_extent = REL_EXTENT_GLOBAL;
+    cfg.has_log_scaling_floor = 1;
+    cfg.log_scaling_n_floor = 128000;
+    cfg.log_scaling_alpha = 0.1;
+
+    /* n_kv > rel_extent only ever happens for global layers (sliding's
+     * kv_lo grows with q_pos, so n_kv never exceeds window==rel_extent
+     * there) -- so the ">" and "q_pos>log_floor" cases are global-only,
+     * matching the plan's own parenthetical ("global long-context:
+     * positions beyond the band get content-only scores"). */
+    AttnGateCase cases[] = {
+        { "sliding n_kv < rel_extent",                  1, 100,               1 },
+        { "sliding n_kv == rel_extent",                 1, WINDOW - 1,        1 },
+        { "global  n_kv < rel_extent",                  0, 100,               1 },
+        { "global  n_kv == rel_extent",                 0, REL_EXTENT_GLOBAL - 1, 1 },
+        { "global  n_kv > rel_extent (band cutoff live)", 0, 5000,            1 },
+        { "global  q_pos > log_scaling_n_floor (tau!=1)", 0, 130000,          1 },
+        { "global  multi-token chunk (band edge mid-chunk)", 0, 1020,         8 },
+    };
+    int n_cases = (int)(sizeof(cases) / sizeof(cases[0]));
+
+    double worst = 0.0;
+    const char *worst_label = NULL;
+    for (int c = 0; c < n_cases; c++) {
+        AttnGateCase *tc = &cases[c];
+        int T = tc->T;
+        int start_pos = tc->q_pos - T + 1;
+        if (start_pos < 0) die("gpu-compare-attn: case '%s': q_pos-T+1 < 0", tc->label);
+
+        LayerWeights lw = {0};
+        lw.is_sliding = tc->is_sliding;
+        lw.num_heads = H;
+        lw.num_kv_heads = tc->is_sliding ? HKV_SLIDING : HKV_GLOBAL;
+        lw.head_dim = DH;
+        lw.rel_extent = tc->is_sliding ? WINDOW : REL_EXTENT_GLOBAL;
+        lw.q_dim = lw.num_heads * lw.head_dim;
+        lw.kv_dim = lw.num_kv_heads * lw.head_dim;
+        lw.r_dim = lw.num_heads * D_REL;
+
+        unsigned seed = 20260720u ^ (unsigned)c;
+        float *wq = gpu_attn_randbuf(&seed, (size_t)lw.q_dim * HIDDEN, 0.05f);
+        float *wk = gpu_attn_randbuf(&seed, (size_t)lw.kv_dim * HIDDEN, 0.05f);
+        float *wv = gpu_attn_randbuf(&seed, (size_t)lw.kv_dim * HIDDEN, 0.05f);
+        float *wr = gpu_attn_randbuf(&seed, (size_t)lw.r_dim * HIDDEN, 0.05f);
+        float *wo = gpu_attn_randbuf(&seed, (size_t)HIDDEN * lw.q_dim, 0.05f);
+        float *q_norm = gpu_attn_randbuf(&seed, (size_t)DH, 1.0f);
+        float *k_norm = gpu_attn_randbuf(&seed, (size_t)DH, 1.0f);
+        float *rel_proj = gpu_attn_randbuf(&seed, (size_t)D_REL * lw.rel_extent, 0.05f);
+        float *k_sconv_w = gpu_attn_randbuf(&seed, (size_t)lw.kv_dim * K, 0.1f);
+        float *v_sconv_w = gpu_attn_randbuf(&seed, (size_t)lw.kv_dim * K, 0.1f);
+        lw.wq = wq; lw.wk = wk; lw.wv = wv; lw.wr = wr; lw.wo = wo;
+        lw.q_norm = q_norm; lw.k_norm = k_norm; lw.rel_proj = rel_proj;
+        lw.k_sconv_w = k_sconv_w; lw.v_sconv_w = v_sconv_w;
+
+        float *x_normed = gpu_attn_randbuf(&seed, (size_t)T * HIDDEN, 0.2f);
+
+        LayerCache lc = {0};
+        lc.k = gpu_attn_randbuf(&seed, (size_t)(start_pos + T) * (size_t)lw.kv_dim, 0.2f);
+        lc.v = gpu_attn_randbuf(&seed, (size_t)(start_pos + T) * (size_t)lw.kv_dim, 0.2f);
+        lc.k_hist = gpu_attn_randbuf(&seed, (size_t)(K - 1) * (size_t)lw.kv_dim, 0.2f);
+        lc.v_hist = gpu_attn_randbuf(&seed, (size_t)(K - 1) * (size_t)lw.kv_dim, 0.2f);
+        lc.len = start_pos;
+
+        /* Snapshot BEFORE calling attn_forward_chunk, which mutates lc->k/
+         * lc->v/lc->k_hist/lc->v_hist in place. */
+        float *k_pre = fdup(lc.k, (size_t)start_pos * (size_t)lw.kv_dim);
+        float *v_pre = fdup(lc.v, (size_t)start_pos * (size_t)lw.kv_dim);
+        float *k_hist_pre = fdup(lc.k_hist, (size_t)(K - 1) * (size_t)lw.kv_dim);
+        float *v_hist_pre = fdup(lc.v_hist, (size_t)(K - 1) * (size_t)lw.kv_dim);
+
+        float *out_cpu = xmalloc(sizeof(float) * (size_t)T * HIDDEN);
+        attn_forward_chunk(&cfg, &lw, &lc, x_normed, T, start_pos, out_cpu);
+
+        double max_rel = gpu_attn_verify(tc->label, &cfg, &lw, T, start_pos, x_normed,
+                                          k_pre, v_pre, k_hist_pre, v_hist_pre, out_cpu);
+        if (max_rel > worst) { worst = max_rel; worst_label = tc->label; }
+
+        free(wq); free(wk); free(wv); free(wr); free(wo);
+        free(q_norm); free(k_norm); free(rel_proj); free(k_sconv_w); free(v_sconv_w);
+        free(x_normed);
+        free(lc.k); free(lc.v); free(lc.k_hist); free(lc.v_hist);
+        free(k_pre); free(v_pre); free(k_hist_pre); free(v_hist_pre);
+        free(out_cpu);
+    }
+
+    printf("gpu-compare-attn: worst case '%s' max_rel_err %.3e (tolerance %.0e)\n",
+           worst_label ? worst_label : "(none)", worst, SEPIA_GPU_COMPARE_TOL);
+    if (worst > SEPIA_GPU_COMPARE_TOL)
+        die("gpu-compare-attn: at least one case exceeded the %.0e relative-error tolerance", SEPIA_GPU_COMPARE_TOL);
+    printf("gpu compare attn ok\n");
+}
+
 static void run_gpu_compare_tiny(void) {
     if (!sepia_gpu_available()) die("gpu-compare-tiny: requires --metal to have initialized the GPU runtime");
 
@@ -3151,9 +3670,9 @@ static void run_gpu_compare_tiny(void) {
     cache_free(c);
 
     fprintf(stderr, "gpu-compare-tiny: captured %d rmsnorm, %d matvec, %d silu_mul, %d add, "
-                     "%d softmax, %d sconv instances from a %d-token prefill + 1-token decode step\n",
+                     "%d softmax, %d sconv, %d attn instances from a %d-token prefill + 1-token decode step\n",
             g_cap_rmsnorm.count, g_cap_matvec.count, g_cap_silu.count, g_cap_add.count,
-            g_cap_softmax.count, g_cap_sconv.count, full_len);
+            g_cap_softmax.count, g_cap_sconv.count, g_cap_attn.count, full_len);
 
     /* Regression guard for the history coverage this fix adds: if every
      * captured sconv instance ever went back to all-zero hist (e.g. a
@@ -3177,6 +3696,23 @@ static void run_gpu_compare_tiny(void) {
     gpu_compare_add();
     gpu_compare_softmax();
     gpu_compare_sconv();
+
+    /* Task 7 Gate B: attention-swap comparison -- for each captured
+     * attn_forward_chunk instance (layer 0 / last layer, from the prefill
+     * and the decode step, restricted by g_opcap_selected_layer same as
+     * every other Cap* site), replay the whole attention block via GPU
+     * dispatches (gpu_attn_verify, shared with Gate A above) and compare
+     * against the real per-layer output at SEPIA_GPU_COMPARE_TOL. */
+    double attn_worst = 0.0;
+    for (int i = 0; i < g_cap_attn.count; i++) {
+        CapAttn *it = &g_cap_attn.items[i];
+        char label[64];
+        snprintf(label, sizeof label, "tiny instance %d (T=%d start_pos=%d)", i, it->T, it->start_pos);
+        double rel = gpu_attn_verify(label, it->cfg, it->lw, it->T, it->start_pos, it->x_normed,
+                                      it->k_pre, it->v_pre, it->k_hist_pre, it->v_hist_pre, it->out);
+        if (rel > attn_worst) attn_worst = rel;
+    }
+    gpu_compare_report("attn (Gate B attention-swap)", attn_worst, g_cap_attn.count);
 
     if (g_gpu_compare_failed)
         die("gpu-compare-tiny: at least one op exceeded the %.0e relative-error tolerance", SEPIA_GPU_COMPARE_TOL);
@@ -3349,7 +3885,7 @@ int main(int argc, char **argv) {
     const char *prompt = "The capital of France is";
     int n_gen = 32;
     int do_real = 0, do_mlock = 0, logits_only = 0, do_metal = 0, do_gpu_selftest = 0, do_gpu_compare_tiny = 0;
-    int do_gpu_quants = 0;
+    int do_gpu_quants = 0, do_gpu_compare_attn = 0;
     char **gpu_quants_paths = NULL;
     int gpu_quants_n = 0;
 
@@ -3374,6 +3910,8 @@ int main(int argc, char **argv) {
             do_gpu_selftest = 1;
         } else if (strcmp(argv[i], "--gpu-compare-tiny") == 0) {
             do_gpu_compare_tiny = 1;
+        } else if (strcmp(argv[i], "--gpu-compare-attn") == 0) {
+            do_gpu_compare_attn = 1;
         } else if (strcmp(argv[i], "--gpu-quants") == 0) {
             do_gpu_quants = 1;
             gpu_quants_paths = &argv[i + 1];
@@ -3386,6 +3924,7 @@ int main(int argc, char **argv) {
                 "       %s --real [--prompt TEXT] [--n-gen N] [--mlock] [--logits-only] [--metal]\n"
                 "       %s --metal --gpu-selftest\n"
                 "       %s --metal --gpu-compare-tiny\n"
+                "       %s --metal --gpu-compare-attn\n"
                 "       %s --metal --gpu-quants FIXTURE.bin [FIXTURE.bin ...]\n"
                 "\n"
                 "--real paths default to docs/inkling-config.json, weights/resident-manifest.json,\n"
@@ -3402,10 +3941,14 @@ int main(int argc, char **argv) {
                 "--gpu-compare-tiny runs a real tiny-oracle prefill on the CPU, replays each captured\n"
                 "rmsnorm/matvec/silu_mul/add/softmax/sconv instance on the GPU, and reports max relative\n"
                 "error per op kind; requires --metal, local-only (needs a Metal GPU).\n"
+                "--gpu-compare-attn (Task 7 Gate A) builds synthetic attention geometries at the two\n"
+                "real per-layer-type shapes (sliding/global), runs the real attn_forward_chunk as the\n"
+                "CPU oracle, and compares the banded-attention Metal kernels against it per (q_pos,n_kv)\n"
+                "edge case; requires --metal, local-only (needs a Metal GPU).\n"
                 "--gpu-quants runs each SQFX fixture's dequant kernel bitwise against its expected f32\n"
                 "payload, plus a tolerance-checked matvec vs CPU qlinear; requires --metal, local-only\n"
                 "(needs a Metal GPU).\n",
-                argv[0], argv[0], argv[0], argv[0], argv[0], argv[0]);
+                argv[0], argv[0], argv[0], argv[0], argv[0], argv[0], argv[0]);
             return 2;
         }
     }
@@ -3424,6 +3967,11 @@ int main(int argc, char **argv) {
 
     if (do_gpu_compare_tiny) {
         run_gpu_compare_tiny();
+        return 0;
+    }
+
+    if (do_gpu_compare_attn) {
+        run_gpu_compare_attn();
         return 0;
     }
 

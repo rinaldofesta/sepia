@@ -145,4 +145,17 @@ gpucompare: sepia
 gpuquants: sepia
 	./sepia --metal --gpu-quants tools/fixtures/quants/q8_0.bin tools/fixtures/quants/q4_k.bin tools/fixtures/quants/q5_k.bin tools/fixtures/quants/q6_k.bin tools/fixtures/quants/iq2_xs.bin tools/fixtures/quants/iq3_xxs.bin tools/fixtures/quants/iq4_xs.bin
 
-.PHONY: ci pycheck tooltests sepia test iobench test_quants test_tokenizer tokreal configcheck shadercheck gputest gpucompare gpuquants
+# local-only: needs a live Metal device; Task 7 Gate A for the banded
+# flash-attention kernels (sepia_gpu_rel_project + sepia_gpu_banded_attn) --
+# synthetic randomized tensors at both real per-layer-type geometries
+# (sliding H64/Hkv16/Dh128/window512/rel512; global H64/Hkv8/Dh128/rel1024)
+# compared against the REAL attn_forward_chunk CPU oracle across the
+# n_kv/tau edge cases (band cutoff live, log-scaling floor). Gate B (the
+# tiny-model attention-swap comparison) folds into gpucompare instead, since
+# it reuses --gpu-compare-tiny's captured tiny-oracle forward pass. Not in
+# ci for the same reason gputest/gpucompare/gpuquants aren't (needs a live
+# device).
+gpuattn: sepia
+	./sepia --metal --gpu-compare-attn
+
+.PHONY: ci pycheck tooltests sepia test iobench test_quants test_tokenizer tokreal configcheck shadercheck gputest gpucompare gpuquants gpuattn
