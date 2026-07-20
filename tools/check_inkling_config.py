@@ -46,6 +46,7 @@ CHECKS = [
     ("log_scaling_n_floor", "inkling.log_scaling_n_floor", int),
     ("max_position_embeddings", "inkling.context_length", int),
     ("bos_token_id", "tokenizer.ggml.bos_token_id", int),
+    ("eos_token_id", "tokenizer.ggml.eos_token_id", int),
 ]
 
 # text_config fields with no GGUF metadata key at all -- the real transformers

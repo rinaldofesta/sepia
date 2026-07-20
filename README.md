@@ -59,8 +59,8 @@ Numbers from this machine class (MacBook Pro M5 Max, 128GB), commands and full t
 | 3x5MB preads vs 1x15MB pread | 0.13% apart | [ssd-bench](docs/ssd-bench.md) |
 | average expert slab (gate+up+down) | 18,498,816 B | [inventory](docs/gguf-inventory-ud-q2_k_xl.md) |
 | cold decode read volume | ~7.1GB/token | 6 experts x 64 MoE layers |
-| pure-I/O ceiling, 75% expert hit rate | ~7.5 tok/s | [ssd-bench](docs/ssd-bench.md) |
-| pure-I/O ceiling, fully cold | ~1.9 tok/s | [ssd-bench](docs/ssd-bench.md) |
+| pure-I/O ceiling, 75% expert hit rate | ~7.5 tok/s | [DESIGN.md](docs/DESIGN.md) (bandwidth: [ssd-bench](docs/ssd-bench.md)) |
+| pure-I/O ceiling, fully cold | ~1.9 tok/s | [DESIGN.md](docs/DESIGN.md) (bandwidth: [ssd-bench](docs/ssd-bench.md)) |
 
 The measurements have already overruled the plan twice. The repack died: a per-expert container copy was the design until the benchmark showed three small preads cost the same as one large one, so SEPIA streams experts straight from the GGUF through an [index sidecar](docs/container.md). And the target stayed honest: 1.5-3 tok/s for first real decode, under a ceiling that says I/O will not be the bottleneck.
 
@@ -90,7 +90,7 @@ Full design with the reasoning behind each phase: [docs/DESIGN.md](docs/DESIGN.m
 
 - Real-weight decode is correctness-only and slow: ~29-31s/token on the scalar CPU path (P1, [docs/p1-first-tokens.md](docs/p1-first-tokens.md)); P2's Metal path is where speed gets addressed
 - Attention log-scaling past 128K positions is implemented per spec but untestable at oracle scale
-- The 15MiB unaligned-read margin (93.9% of aligned) gets a clean re-measurement once the disk is quiet
+- The 15MiB unaligned-read margin, once 93.9% under concurrent load, re-measured at ~101% on a quiet disk (2026-07-20); the margin concern is retired ([docs/container.md](docs/container.md))
 - Multimodal input and MTP are out of scope until P4+; text in, text out
 
 ## Contributing
