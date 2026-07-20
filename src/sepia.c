@@ -2123,6 +2123,58 @@ typedef struct {
     int64_t shared_gate_stride, shared_up_stride, shared_w2_stride;
 } RealLayer;
 
+/* Task 9: the GPU-resident twin of RealLayer -- same per-layer tensors, but
+ * every weight is (ggml_type, BYTE OFFSET into the one wrapped gpu_res_buf,
+ * dims) instead of an arena/mmap pointer. Built once at real_load time (only
+ * when --metal initialized the GPU runtime first) directly from the
+ * already-resolved, already-bounds-checked RealLayer fields -- see
+ * gpu_off_of/gpu_qtensor_off/real_gpu_layer_build below. F32 resident
+ * tensors that the GPU path only ever needs as scalar host reads (dense/
+ * router global_scale, router_bias) stay accessed via RealLayer's existing
+ * host pointers; only tensors an actual GPU kernel dispatch reads get an
+ * offset here. */
+typedef struct { int ggml_type; size_t w_off; int64_t out_dim, in_dim; } GpuQTensor;
+
+typedef struct {
+    size_t attn_norm_off, mlp_norm_off, q_norm_off, k_norm_off, rel_proj_off;
+    size_t k_sconv_off, v_sconv_off, attn_sconv_off, mlp_sconv_off;
+    GpuQTensor wq, wk, wv, wr, wo;
+
+    /* dense only */
+    GpuQTensor dense_gate, dense_up, dense_w2;
+
+    /* sparse only */
+    size_t router_w_off; /* F32 [n_total,hidden] */
+    GpuQTensor shared_gate0, shared_up0, shared_w2_0; /* stack index 0's slice; caller offsets by
+                                                        * s*stride the same way RealLayer's do */
+    int64_t shared_gate_stride, shared_up_stride, shared_w2_stride;
+} RealLayerGpu;
+
+/* Task 9: persistent per-layer GPU KV cache + sconv-history buffers (Shared
+ * storage, so both GPU kernels and the one host readback the attention
+ * block needs -- see real_attn_forward_chunk_gpu's tau-sync -- can touch
+ * them). Allocated once per generation (gpu_cache_create_cfg), zeroed at
+ * creation (sconv history and a fresh KV cache both start at all-zero,
+ * matching cache_create_cfg's xcalloc exactly) and mutated in place by
+ * GPU-side dispatches only (sepia_gpu_copy for cache writes,
+ * sepia_gpu_sconv_hist_roll for history) -- never re-uploaded wholesale the
+ * way the tiny GPU path (Task 8) re-uploads its full k/v history every
+ * call, which is the actual point of keeping these persistent: attention
+ * reads directly from the SAME buffer across every layer/token this
+ * generation runs. */
+typedef struct {
+    SepiaGpuBuf *k, *v;                /* [cap, kv_dim] */
+    SepiaGpuBuf *k_hist, *v_hist;      /* [Km1, kv_dim] */
+    SepiaGpuBuf *attn_hist, *mlp_hist; /* [Km1, hidden] */
+    int64_t kv_dim;
+    int len;
+} GpuLayerCache;
+
+typedef struct {
+    GpuLayerCache *layers; /* [num_hidden_layers] */
+    int num_layers, cap;
+} GpuCache;
+
 /* Bound to the owning RealModel by real_fill_layer on every call (not by
  * real_load), which sidesteps a return-by-value hazard: real_load builds
  * its RealModel on the stack and returns it by value, so any pointer set
@@ -2170,7 +2222,135 @@ typedef struct {
     size_t arena_floats;
 
     RealExperts real_exps;
+
+    /* Task 9: non-NULL only when gpu_res_buf is set (--metal). gpu_layers
+     * mirrors `layers` field-for-field but with GPU offsets instead of
+     * pointers; gpu_unembed is output.weight's GPU descriptor (the logits
+     * matvec_q). */
+    RealLayerGpu *gpu_layers; /* [num_hidden_layers] */
+    GpuQTensor gpu_unembed;
 } RealModel;
+
+/* Computes the byte offset of a resident-buffer pointer (already validated
+ * once by manifest_load's own [offset,offset+nbytes) <= res_size check at
+ * load time) relative to m->res_base, for use as an `_off` GPU op's weight-
+ * offset argument into the SAME wrapped gpu_res_buf. Task 4's review-tracked
+ * hardening carried to Task 9: bounds-check offset+nbytes against the
+ * buffer length AGAIN here (independent of manifest_load's check -- this is
+ * the last point before a GPU kernel dispatch would silently read out of
+ * bounds) and assert the offset is EVEN (every quant block's f16 scale
+ * fields, and this model's own half-precision reads, need 2-byte
+ * alignment; an odd offset would silently corrupt them) -- die() loudly at
+ * load time here, never at dispatch. */
+static size_t gpu_off_of(const RealModel *m, const void *ptr, size_t nbytes, const char *what) {
+    const uint8_t *base = (const uint8_t *)m->res_base;
+    const uint8_t *p = (const uint8_t *)ptr;
+    if (!p || p < base || p > base + m->res_size)
+        die("metal: resident tensor '%s' pointer is outside resident.bin's mapped range", what);
+    size_t off = (size_t)(p - base);
+    if (off % 2 != 0)
+        die("metal: resident tensor '%s' has an odd byte offset %zu into resident.bin "
+            "(half-precision reads require 2-byte alignment)", what, off);
+    if (off + nbytes > m->res_size)
+        die("metal: resident tensor '%s' [%zu,%zu) exceeds resident.bin size %zu bytes",
+            what, off, off + nbytes, m->res_size);
+    return off;
+}
+
+/* Same bounds+alignment discipline as gpu_off_of, for a QTensor (quantized
+ * weight matrix) rather than a plain F32 pointer -- nbytes is the row-major
+ * [out_dim,in_dim] quantized footprint, the same formula resident_qtensor
+ * itself already validated at manifest-parse time. */
+static GpuQTensor gpu_qtensor_off(const RealModel *m, const QTensor *q, const char *what) {
+    size_t nbytes = quants_row_bytes(q->ggml_type, q->in_dim) * (size_t)q->out_dim;
+    GpuQTensor g;
+    g.ggml_type = q->ggml_type;
+    g.w_off = gpu_off_of(m, q->data, nbytes, what);
+    g.out_dim = q->out_dim;
+    g.in_dim = q->in_dim;
+    return g;
+}
+
+/* Builds one layer's RealLayerGpu from its already-resolved RealLayer
+ * (m->layers[layer]) -- every dim/type/stride is copied straight from the
+ * fields real_load's own per-layer loop already validated; this function
+ * only adds the GPU byte-offset (+bounds/alignment check) for every tensor
+ * an actual GPU kernel dispatch will read. */
+static void real_gpu_layer_build(RealModel *m, int layer) {
+    const Config *cfg = &m->cfg;
+    const RealLayer *rl = &m->layers[layer];
+    RealLayerGpu *g = &m->gpu_layers[layer];
+    int is_sliding = cfg->layer_is_sliding[layer];
+    int hidden = cfg->hidden_size;
+    int Dh = is_sliding ? cfg->swa_head_dim : cfg->head_dim;
+    int num_kv = is_sliding ? cfg->swa_num_key_value_heads : cfg->num_key_value_heads;
+    int kv_dim = num_kv * Dh;
+    int rel_extent = is_sliding ? cfg->sliding_window_size : cfg->rel_extent;
+    int K = cfg->conv_kernel_size;
+
+    g->attn_norm_off = gpu_off_of(m, rl->attn_norm, (size_t)hidden * sizeof(float), "attn_norm.weight");
+    g->mlp_norm_off  = gpu_off_of(m, rl->mlp_norm,  (size_t)hidden * sizeof(float), "ffn_norm.weight");
+    g->q_norm_off    = gpu_off_of(m, rl->q_norm,    (size_t)Dh * sizeof(float), "attn_q_norm.weight");
+    g->k_norm_off    = gpu_off_of(m, rl->k_norm,    (size_t)Dh * sizeof(float), "attn_k_norm.weight");
+    g->rel_proj_off  = gpu_off_of(m, rl->rel_proj,
+                                   (size_t)cfg->d_rel * (size_t)rel_extent * sizeof(float), "attn_rel_proj.weight");
+    g->k_sconv_off = gpu_off_of(m, rl->k_sconv_w, (size_t)kv_dim * (size_t)K * sizeof(float), "shortconv_k.weight");
+    g->v_sconv_off = gpu_off_of(m, rl->v_sconv_w, (size_t)kv_dim * (size_t)K * sizeof(float), "shortconv_v.weight");
+    g->attn_sconv_off = gpu_off_of(m, rl->attn_sconv_w, (size_t)hidden * (size_t)K * sizeof(float),
+                                    "shortconv_attn.weight");
+    g->mlp_sconv_off  = gpu_off_of(m, rl->mlp_sconv_w,  (size_t)hidden * (size_t)K * sizeof(float),
+                                    "shortconv_mlp.weight");
+
+    g->wq = gpu_qtensor_off(m, &rl->wq, "attn_q.weight");
+    g->wk = gpu_qtensor_off(m, &rl->wk, "attn_k.weight");
+    g->wv = gpu_qtensor_off(m, &rl->wv, "attn_v.weight");
+    g->wr = gpu_qtensor_off(m, &rl->wr, "attn_r.weight");
+    g->wo = gpu_qtensor_off(m, &rl->wo, "attn_output.weight");
+
+    if (!cfg->layer_is_sparse[layer]) {
+        g->dense_gate = gpu_qtensor_off(m, &rl->dense_gate, "ffn_gate.weight");
+        g->dense_up   = gpu_qtensor_off(m, &rl->dense_up,   "ffn_up.weight");
+        g->dense_w2   = gpu_qtensor_off(m, &rl->dense_w2,   "ffn_down.weight");
+    } else {
+        int n_total = cfg->n_routed_experts + cfg->n_shared_experts;
+        g->router_w_off = gpu_off_of(m, rl->router_w, (size_t)n_total * (size_t)hidden * sizeof(float),
+                                      "ffn_gate_inp.weight");
+        g->shared_gate0 = gpu_qtensor_off(m, &rl->shared_gate0, "ffn_gate_shexp.weight");
+        g->shared_up0   = gpu_qtensor_off(m, &rl->shared_up0,   "ffn_up_shexp.weight");
+        g->shared_w2_0  = gpu_qtensor_off(m, &rl->shared_w2_0,  "ffn_down_shexp.weight");
+        g->shared_gate_stride = rl->shared_gate_stride;
+        g->shared_up_stride   = rl->shared_up_stride;
+        g->shared_w2_stride   = rl->shared_w2_stride;
+
+        /* gpu_qtensor_off above only validated stack index 0's byte range;
+         * real_mlp_moe_forward_gpu's dispatch adds s*stride for every other
+         * stack index (s in [1,n_shared)) before handing that offset to a
+         * GPU kernel -- Task 4's hardening carry requires bounds+alignment
+         * on every offset a dispatch actually uses, so validate the OTHER
+         * stacks here too, at load time, rather than trusting the stride
+         * arithmetic to stay in bounds at dispatch time. */
+        size_t gate_nbytes = quants_row_bytes(g->shared_gate0.ggml_type, g->shared_gate0.in_dim) *
+                             (size_t)g->shared_gate0.out_dim;
+        size_t up_nbytes = quants_row_bytes(g->shared_up0.ggml_type, g->shared_up0.in_dim) *
+                           (size_t)g->shared_up0.out_dim;
+        size_t w2_nbytes = quants_row_bytes(g->shared_w2_0.ggml_type, g->shared_w2_0.in_dim) *
+                           (size_t)g->shared_w2_0.out_dim;
+        for (int s = 1; s < cfg->n_shared_experts; s++) {
+            size_t goff = g->shared_gate0.w_off + (size_t)s * (size_t)g->shared_gate_stride;
+            size_t uoff = g->shared_up0.w_off + (size_t)s * (size_t)g->shared_up_stride;
+            size_t woff = g->shared_w2_0.w_off + (size_t)s * (size_t)g->shared_w2_stride;
+            if (goff % 2 != 0 || goff + gate_nbytes > m->res_size)
+                die("metal: ffn_gate_shexp.weight stack %d [%zu,%zu) exceeds resident.bin size %zu bytes "
+                    "or is oddly aligned", s, goff, goff + gate_nbytes, m->res_size);
+            if (uoff % 2 != 0 || uoff + up_nbytes > m->res_size)
+                die("metal: ffn_up_shexp.weight stack %d [%zu,%zu) exceeds resident.bin size %zu bytes "
+                    "or is oddly aligned", s, uoff, uoff + up_nbytes, m->res_size);
+            if (woff % 2 != 0 || woff + w2_nbytes > m->res_size)
+                die("metal: ffn_down_shexp.weight stack %d [%zu,%zu) exceeds resident.bin size %zu bytes "
+                    "or is oddly aligned", s, woff, woff + w2_nbytes, m->res_size);
+        }
+    }
+}
 
 /* --------------------------------- real_load --------------------------------- */
 
@@ -2345,13 +2525,22 @@ static RealModel real_load(const char *config_path, const char *manifest_path,
     m.real_exps.row_scratch = xmalloc(sizeof(float) * row_scratch_floats);
 
     /* --metal already ran (main() initializes the GPU runtime before
-     * calling real_load): wrap resident.bin's existing mmap zero-copy.
-     * No functional use yet -- later tasks read weights through it. */
+     * calling real_load): wrap resident.bin's existing mmap zero-copy, then
+     * (Task 9) build the per-layer GPU offset table + the logits tensor's
+     * GPU descriptor directly from the RealLayer/QTensor fields the loop
+     * above just resolved -- gpu_off_of bounds/alignment-checks every one
+     * of them again here, dying loudly at load if anything is wrong rather
+     * than corrupting a dispatch later. */
     if (sepia_gpu_available()) {
         SepiaGpuBuf *gbuf = sepia_gpu_wrap_mmap(m.res_base, m.res_size);
         if (!gbuf) die("metal: failed to wrap resident.bin (%zu bytes) as a Metal buffer", m.res_size);
         m.gpu_res_buf = gbuf;
         fprintf(stderr, "sepia: metal: resident.bin wrapped (%.2f GB)\n", (double)m.res_size / 1e9);
+
+        m.gpu_layers = xcalloc((size_t)cfg->num_hidden_layers, sizeof(RealLayerGpu));
+        for (int i = 0; i < cfg->num_hidden_layers; i++) real_gpu_layer_build(&m, i);
+        m.gpu_unembed = gpu_qtensor_off(&m, &m.unembed, "output.weight");
+        fprintf(stderr, "sepia: metal: real-model GPU offset table built (%d layers)\n", cfg->num_hidden_layers);
     }
 
     return m;
@@ -2584,6 +2773,554 @@ static void real_forward_chunk(RealModel *m, Cache *cache, const int *token_ids,
     free(normed);
 }
 
+/* ========================= real model, GPU resident path (Task 9) ========= *
+ * real_forward_chunk_gpu is the --metal twin of real_forward_chunk above:
+ * same math (mirrors decoder_layer_forward/attn_forward_chunk/
+ * mlp_dense_forward/mlp_moe_forward exactly), but every resident weight is
+ * read straight out of the wrapped gpu_res_buf via the RealLayerGpu offset
+ * table (no CPU dequant into the arena -- real_fill_layer/the arena are
+ * bypassed entirely in this path) and the KV cache + sconv histories are
+ * persistent GPU buffers (GpuCache) instead of host arrays, so attention
+ * never re-uploads history the way the tiny GPU path (Task 8) does.
+ *
+ * Batching: a single logical batch (sepia_gpu_begin/.../end) spans the
+ * WHOLE forward-chunk call, paused (end()+begin()) only at the two points
+ * the host genuinely needs to read GPU-computed data:
+ *   1. every layer's attention block, once, for the tau precision fix
+ *      (Metal has no double type, and q_scaled must equal the CPU's
+ *      `(float)((double)q * tau)` bit-for-bit -- see real_attn_forward_
+ *      chunk_gpu below);
+ *   2. every SPARSE layer's MoE block, once per token, to read back router
+ *      logits (needed for moe_route_select, host-side) and the mlp-normed
+ *      activation (needed as real_expert_ffn's `x`, still CPU-streamed this
+ *      task) -- the "expert install boundary" from the plan's sync budget.
+ * Dense layers therefore cost exactly 1 sync (tau); sparse layers cost 2
+ * (tau + router/expert). Cache writes and sconv-history rolls are GPU-side
+ * (sepia_gpu_copy / sepia_gpu_sconv_hist_roll) and need no sync at all --
+ * see task-9-report.md for the measured per-token sync count. */
+
+static SepiaGpuBuf *real_gpu_scratch(size_t nfloats) {
+    SepiaGpuBuf *b = sepia_gpu_alloc(sizeof(float) * (nfloats ? nfloats : 1), 0);
+    if (!b) die("metal: real: scratch GPU buffer alloc failed (%zu floats)", nfloats);
+    return b;
+}
+
+static SepiaGpuBuf *gpu_zeroed_alloc(size_t nfloats) {
+    SepiaGpuBuf *b = sepia_gpu_alloc(sizeof(float) * (nfloats ? nfloats : 1), 0);
+    if (!b) die("metal: real: GPU cache buffer alloc failed (%zu floats)", nfloats);
+    if (nfloats) memset(sepia_gpu_host_ptr(b), 0, sizeof(float) * nfloats);
+    return b;
+}
+
+/* Returns a usable [dim]-float, offset-0 operand for row t of a [T,dim]
+ * multi-row buffer. Row 0 always sits at byte offset 0, so t==0 returns
+ * `multi` directly with ZERO extra dispatches -- this is what keeps the
+ * T==1 decode hot path free of any row-copy overhead (T>1 only happens
+ * during prefill, a one-time cost). t>0 dispatches a GPU-side copy into the
+ * caller-owned, reusable `scratch` buffer -- no host round trip either
+ * way. */
+static SepiaGpuBuf *real_gpu_row_in(SepiaGpuBuf *multi, int64_t t, int64_t dim, SepiaGpuBuf *scratch) {
+    if (t == 0) return multi;
+    if (!sepia_gpu_copy(multi, (size_t)(t * dim) * sizeof(float), scratch, 0, dim))
+        die("metal: real: row-in copy dispatch failed");
+    return scratch;
+}
+
+/* Writes a [dim]-float row (e.g. a matvec_q's single-vector output) into row
+ * t of a [T,dim] multi-row destination -- only ever called for t>0 (t==0's
+ * dispatch already targets `multi` directly, see the call sites below). */
+static void real_gpu_row_out(SepiaGpuBuf *srcrow, SepiaGpuBuf *multi, int64_t t, int64_t dim) {
+    if (!sepia_gpu_copy(srcrow, 0, multi, (size_t)(t * dim) * sizeof(float), dim))
+        die("metal: real: row-out copy dispatch failed");
+}
+
+/* Dispatches sepia_gpu_matvec_q for token row t of a [T,in_dim] input,
+ * writing into row t of a [T,out_dim] output -- xrow/yrow are reusable
+ * scratch the caller keeps alive across its whole t loop. */
+static void real_gpu_matvec_q_row(SepiaGpuBuf *gres, const GpuQTensor *w,
+                                   SepiaGpuBuf *x_multi, int64_t t, SepiaGpuBuf *y_multi,
+                                   SepiaGpuBuf *xrow, SepiaGpuBuf *yrow, const char *what) {
+    SepiaGpuBuf *xt = real_gpu_row_in(x_multi, t, w->in_dim, xrow);
+    SepiaGpuBuf *yt = (t == 0) ? y_multi : yrow;
+    if (!sepia_gpu_matvec_q(w->ggml_type, gres, w->w_off, xt, yt, w->out_dim, w->in_dim))
+        die("metal: real: matvec_q '%s' dispatch failed", what);
+    if (t != 0) real_gpu_row_out(yt, y_multi, t, w->out_dim);
+}
+
+/* Persistent per-layer GPU KV cache + sconv histories, sized/zeroed exactly
+ * like cache_create_cfg's CPU counterpart (same per-layer-type kv_dim
+ * formula, same Km1 history depth). */
+static GpuCache *gpu_cache_create_cfg(const Config *cfg, int cap) {
+    GpuCache *c = xmalloc(sizeof(GpuCache));
+    c->cap = cap;
+    c->num_layers = cfg->num_hidden_layers;
+    c->layers = xcalloc((size_t)c->num_layers, sizeof(GpuLayerCache));
+    int Km1 = cfg->conv_kernel_size - 1;
+    int hidden = cfg->hidden_size;
+    for (int i = 0; i < c->num_layers; i++) {
+        GpuLayerCache *lc = &c->layers[i];
+        int is_sliding = cfg->layer_is_sliding[i];
+        int kv_dim = is_sliding ? cfg->swa_num_key_value_heads * cfg->swa_head_dim
+                                : cfg->num_key_value_heads * cfg->head_dim;
+        lc->kv_dim = kv_dim;
+        lc->k = gpu_zeroed_alloc((size_t)cap * (size_t)kv_dim);
+        lc->v = gpu_zeroed_alloc((size_t)cap * (size_t)kv_dim);
+        lc->k_hist = gpu_zeroed_alloc((size_t)Km1 * (size_t)kv_dim);
+        lc->v_hist = gpu_zeroed_alloc((size_t)Km1 * (size_t)kv_dim);
+        lc->attn_hist = gpu_zeroed_alloc((size_t)Km1 * (size_t)hidden);
+        lc->mlp_hist = gpu_zeroed_alloc((size_t)Km1 * (size_t)hidden);
+        lc->len = 0;
+    }
+    return c;
+}
+
+static void gpu_cache_free(GpuCache *c) {
+    if (!c) return;
+    for (int i = 0; i < c->num_layers; i++) {
+        GpuLayerCache *lc = &c->layers[i];
+        sepia_gpu_free(lc->k);
+        sepia_gpu_free(lc->v);
+        sepia_gpu_free(lc->k_hist);
+        sepia_gpu_free(lc->v_hist);
+        sepia_gpu_free(lc->attn_hist);
+        sepia_gpu_free(lc->mlp_hist);
+    }
+    free(c->layers);
+    free(c);
+}
+
+/* GPU-resident twin of attn_forward_chunk. x_normed/out are [T,hidden]. The
+ * ONE sync this function performs is the tau precision fix (mandate carry
+ * from Task 8's review): q_scaled must equal `(float)((double)q_normed *
+ * tau)` bit-for-bit, matching attn_forward_chunk's own formula -- Metal has
+ * no double type, so this needs a host round trip. Every other step
+ * (projections, sconv+history-roll, per-head norms, cache write,
+ * rel-project, banded attention, wo) is GPU-only, no readback. */
+static void real_attn_forward_chunk_gpu(RealModel *m, const RealLayerGpu *g, const Config *cfg,
+                                         int is_sliding, GpuLayerCache *lc,
+                                         SepiaGpuBuf *x_normed, int T, int start_pos, SepiaGpuBuf *out) {
+    SepiaGpuBuf *gres = (SepiaGpuBuf *)m->gpu_res_buf;
+    int hidden = cfg->hidden_size;
+    int H = is_sliding ? cfg->swa_num_attention_heads : cfg->num_attention_heads;
+    int Hkv = is_sliding ? cfg->swa_num_key_value_heads : cfg->num_key_value_heads;
+    int Dh = is_sliding ? cfg->swa_head_dim : cfg->head_dim;
+    int rel_extent = is_sliding ? cfg->sliding_window_size : cfg->rel_extent;
+    int q_dim = H * Dh, kv_dim = Hkv * Dh, r_dim = H * cfg->d_rel;
+    int K = cfg->conv_kernel_size, d_rel = cfg->d_rel;
+
+    /* 1. projections: wq/wk/wv/wr matvec_q, one dispatch per (weight, t). */
+    SepiaGpuBuf *q_raw = real_gpu_scratch((size_t)T * q_dim);
+    SepiaGpuBuf *k_raw = real_gpu_scratch((size_t)T * kv_dim);
+    SepiaGpuBuf *v_raw = real_gpu_scratch((size_t)T * kv_dim);
+    SepiaGpuBuf *r_raw = real_gpu_scratch((size_t)T * r_dim);
+    {
+        SepiaGpuBuf *xrow = real_gpu_scratch((size_t)hidden);
+        SepiaGpuBuf *yrow_q = real_gpu_scratch((size_t)q_dim);
+        SepiaGpuBuf *yrow_k = real_gpu_scratch((size_t)kv_dim);
+        SepiaGpuBuf *yrow_v = real_gpu_scratch((size_t)kv_dim);
+        SepiaGpuBuf *yrow_r = real_gpu_scratch((size_t)r_dim);
+        for (int t = 0; t < T; t++) {
+            real_gpu_matvec_q_row(gres, &g->wq, x_normed, t, q_raw, xrow, yrow_q, "wq");
+            real_gpu_matvec_q_row(gres, &g->wk, x_normed, t, k_raw, xrow, yrow_k, "wk");
+            real_gpu_matvec_q_row(gres, &g->wv, x_normed, t, v_raw, xrow, yrow_v, "wv");
+            real_gpu_matvec_q_row(gres, &g->wr, x_normed, t, r_raw, xrow, yrow_r, "wr");
+        }
+        sepia_gpu_free(xrow);
+        sepia_gpu_free(yrow_q);
+        sepia_gpu_free(yrow_k);
+        sepia_gpu_free(yrow_v);
+        sepia_gpu_free(yrow_r);
+    }
+
+    /* 2. k/v sconv against the layer's persistent GPU history, then roll
+     * that history forward on the GPU (no host round trip -- the point of
+     * Task 9's sconv_hist_roll kernel over Task 8's host-side design). */
+    SepiaGpuBuf *k_sconv = real_gpu_scratch((size_t)T * kv_dim);
+    SepiaGpuBuf *v_sconv = real_gpu_scratch((size_t)T * kv_dim);
+    if (!sepia_gpu_sconv_off(gres, g->k_sconv_off, lc->k_hist, k_raw, k_sconv, kv_dim, K, T))
+        die("metal: real: k sconv dispatch failed");
+    if (!sepia_gpu_sconv_off(gres, g->v_sconv_off, lc->v_hist, v_raw, v_sconv, kv_dim, K, T))
+        die("metal: real: v sconv dispatch failed");
+    if (!sepia_gpu_sconv_hist_roll(lc->k_hist, k_raw, kv_dim, K, T)) die("metal: real: k hist-roll dispatch failed");
+    if (!sepia_gpu_sconv_hist_roll(lc->v_hist, v_raw, kv_dim, K, T)) die("metal: real: v hist-roll dispatch failed");
+    sepia_gpu_free(k_raw);
+    sepia_gpu_free(v_raw);
+
+    /* 3. per-head RMSNorm (no norm on v). */
+    SepiaGpuBuf *q_normed = real_gpu_scratch((size_t)T * q_dim);
+    SepiaGpuBuf *k_normed = real_gpu_scratch((size_t)T * kv_dim);
+    if (!sepia_gpu_rmsnorm_off(gres, g->q_norm_off, q_raw, q_normed, (int64_t)T * H, Dh, (float)cfg->rms_norm_eps))
+        die("metal: real: q rmsnorm dispatch failed");
+    if (!sepia_gpu_rmsnorm_off(gres, g->k_norm_off, k_sconv, k_normed, (int64_t)T * Hkv, Dh, (float)cfg->rms_norm_eps))
+        die("metal: real: k rmsnorm dispatch failed");
+    sepia_gpu_free(q_raw);
+    sepia_gpu_free(k_sconv);
+
+    /* 4. cache write (normed K, raw-sconv'd V), BEFORE the attention loop
+     * reads lc->k/lc->v below -- matches attn_forward_chunk's own ordering
+     * (self-attention includes the just-written position). Both are single
+     * contiguous-range GPU->GPU copies into the persistent cache at row
+     * start_pos -- no host round trip, no reupload of prior history (lc->k/
+     * lc->v ARE the full-history buffer banded_attn reads directly, unlike
+     * Task 8's tiny path which reuploads the whole history every call). */
+    if (!sepia_gpu_copy(k_normed, 0, lc->k, (size_t)start_pos * (size_t)kv_dim * sizeof(float), (int64_t)T * kv_dim))
+        die("metal: real: k cache-write dispatch failed");
+    if (!sepia_gpu_copy(v_sconv, 0, lc->v, (size_t)start_pos * (size_t)kv_dim * sizeof(float), (int64_t)T * kv_dim))
+        die("metal: real: v cache-write dispatch failed");
+    sepia_gpu_free(k_normed);
+    sepia_gpu_free(v_sconv);
+    if (start_pos + T > lc->len) lc->len = start_pos + T;
+
+    /* 5. rel-project (no tau/host dependency -- dispatched before the sync
+     * below). */
+    SepiaGpuBuf *rel_logits = real_gpu_scratch((size_t)T * (size_t)H * (size_t)rel_extent);
+    if (!sepia_gpu_rel_project_off(r_raw, gres, g->rel_proj_off, rel_logits, T, H, d_rel, rel_extent))
+        die("metal: real: rel_project dispatch failed");
+    sepia_gpu_free(r_raw);
+
+    /* ---- SYNC (attention's one sync per layer): tau precision fix. ---- */
+    int have_log_scaling = (!is_sliding) && cfg->has_log_scaling_floor;
+    if (!sepia_gpu_end()) die("metal: real: attention tau-sync failed");
+    {
+        float *qp = (float *)sepia_gpu_host_ptr(q_normed);
+        for (int t = 0; t < T; t++) {
+            int q_pos = start_pos + t;
+            double tau = 1.0;
+            if (have_log_scaling) {
+                double effective_n = (double)(q_pos + 1);
+                double ratio = effective_n / (double)cfg->log_scaling_n_floor;
+                if (ratio < 1.0) ratio = 1.0;
+                tau = 1.0 + cfg->log_scaling_alpha * log(ratio);
+            }
+            for (int i = 0; i < q_dim; i++) {
+                float *qi = qp + (size_t)t * q_dim + i;
+                *qi = (float)((double)(*qi) * tau); /* matches attn_forward_chunk's own formula exactly */
+            }
+        }
+    }
+    if (!sepia_gpu_begin()) die("metal: real: failed to resume the batch after the tau sync");
+
+    /* tau/kv_lo/kv_hi host arrays for banded_attn -- same formula as CPU. */
+    int64_t *kv_lo = xmalloc(sizeof(int64_t) * (size_t)T);
+    int64_t *kv_hi = xmalloc(sizeof(int64_t) * (size_t)T);
+    float *tau_arr = xmalloc(sizeof(float) * (size_t)T);
+    for (int t = 0; t < T; t++) {
+        int q_pos = start_pos + t;
+        double tv = 1.0;
+        if (have_log_scaling) {
+            double effective_n = (double)(q_pos + 1);
+            double ratio = effective_n / (double)cfg->log_scaling_n_floor;
+            if (ratio < 1.0) ratio = 1.0;
+            tv = 1.0 + cfg->log_scaling_alpha * log(ratio);
+        }
+        tau_arr[t] = (float)tv;
+        int64_t kvlo = is_sliding ? (int64_t)q_pos - (int64_t)cfg->sliding_window_size + 1 : 0;
+        if (kvlo < 0) kvlo = 0;
+        kv_lo[t] = kvlo;
+        kv_hi[t] = q_pos;
+    }
+
+    /* 6. banded attention over the full persistent cache (lc->k/lc->v
+     * already hold [0,start_pos+T) after step 4's write; the buffer's own
+     * allocated capacity is >= that, and the kernel never reads past
+     * kv_hi). */
+    SepiaGpuBuf *attn_concat = real_gpu_scratch((size_t)T * q_dim);
+    if (!sepia_gpu_banded_attn(q_normed, lc->k, lc->v, rel_logits, attn_concat, kv_lo, kv_hi, tau_arr,
+                                T, H, Hkv, Dh, rel_extent, start_pos, kv_dim, 1.0f / (float)Dh))
+        die("metal: real: banded_attn dispatch failed");
+    free(kv_lo);
+    free(kv_hi);
+    free(tau_arr);
+    sepia_gpu_free(q_normed);
+    sepia_gpu_free(rel_logits);
+
+    /* 7. wo matvec_q, one dispatch per t. */
+    {
+        SepiaGpuBuf *xrow = real_gpu_scratch((size_t)q_dim);
+        SepiaGpuBuf *yrow = real_gpu_scratch((size_t)hidden);
+        for (int t = 0; t < T; t++)
+            real_gpu_matvec_q_row(gres, &g->wo, attn_concat, t, out, xrow, yrow, "wo");
+        sepia_gpu_free(xrow);
+        sepia_gpu_free(yrow);
+    }
+    sepia_gpu_free(attn_concat);
+}
+
+/* GPU twin of mlp_dense_forward: gate/up are SEPARATE on-disk quantized
+ * tensors in the real GGUF layout (unlike the SafeTensors oracle's
+ * interleaved dense_w13), so there is no gather trick to reproduce here --
+ * a plain matvec_q per weight, then silu_mul, then matvec_q down, then the
+ * global_scale (known before any readback -- always fully GPU-side, see
+ * sepia_gpu_scale's header doc). */
+static void real_mlp_dense_forward_gpu(RealModel *m, const RealLayerGpu *g, int hidden, int dense_inter,
+                                        const RealLayer *rl, SepiaGpuBuf *x, int T, SepiaGpuBuf *out) {
+    SepiaGpuBuf *gres = (SepiaGpuBuf *)m->gpu_res_buf;
+    SepiaGpuBuf *g_full = real_gpu_scratch((size_t)T * dense_inter);
+    SepiaGpuBuf *u_full = real_gpu_scratch((size_t)T * dense_inter);
+    {
+        SepiaGpuBuf *xrow = real_gpu_scratch((size_t)hidden);
+        SepiaGpuBuf *yrow_g = real_gpu_scratch((size_t)dense_inter);
+        SepiaGpuBuf *yrow_u = real_gpu_scratch((size_t)dense_inter);
+        for (int t = 0; t < T; t++) {
+            real_gpu_matvec_q_row(gres, &g->dense_gate, x, t, g_full, xrow, yrow_g, "dense_gate");
+            real_gpu_matvec_q_row(gres, &g->dense_up, x, t, u_full, xrow, yrow_u, "dense_up");
+        }
+        sepia_gpu_free(xrow);
+        sepia_gpu_free(yrow_g);
+        sepia_gpu_free(yrow_u);
+    }
+
+    SepiaGpuBuf *h_full = real_gpu_scratch((size_t)T * dense_inter);
+    if (!sepia_gpu_silu_mul(g_full, u_full, h_full, (int64_t)T * dense_inter))
+        die("metal: real: dense silu_mul dispatch failed");
+    sepia_gpu_free(g_full);
+    sepia_gpu_free(u_full);
+
+    SepiaGpuBuf *y_full = real_gpu_scratch((size_t)T * hidden);
+    {
+        SepiaGpuBuf *hrow = real_gpu_scratch((size_t)dense_inter);
+        SepiaGpuBuf *yrow = real_gpu_scratch((size_t)hidden);
+        for (int t = 0; t < T; t++)
+            real_gpu_matvec_q_row(gres, &g->dense_w2, h_full, t, y_full, hrow, yrow, "dense_w2");
+        sepia_gpu_free(hrow);
+        sepia_gpu_free(yrow);
+    }
+    sepia_gpu_free(h_full);
+
+    float gscale = rl->dense_global_scale[0];
+    if (!sepia_gpu_scale(gscale, y_full, out, (int64_t)T * hidden)) die("metal: real: dense gscale dispatch failed");
+    sepia_gpu_free(y_full);
+}
+
+/* GPU twin of mlp_moe_forward for ONE token row t, writing the routed+shared
+ * mixed output into out_row[hidden] (a host array -- Task 10 moves this
+ * fully onto GPU). Router matvec + shared-expert compute (gate/up/down, no
+ * gamma -- see below) run on GPU before any readback, since neither depends
+ * on router SELECTION; only after the router-logits sync do we know which
+ * routed experts to stream (real_expert_ffn, CPU, unchanged this task) and
+ * what each shared expert's mixing weight (gamma) is. Since down_proj is
+ * linear, gamma*down_proj(h) == down_proj(gamma*h) -- mlp_moe_forward's own
+ * comment notes this equivalence -- so folding gamma in AFTER the (already
+ * GPU-computed) shared down_proj output is mathematically identical to the
+ * CPU oracle's h*=gamma-before-down_proj order, and lets the expensive
+ * matvec_q work happen before the sync instead of after. This function's
+ * ONE sync is exactly the plan's "router readback + expert install
+ * boundary" pair (bundled into a single end()/begin(), since router logits,
+ * the shared outputs, AND the normed activation real_expert_ffn needs are
+ * ALL readable from the SAME batch's completion). */
+static void real_mlp_moe_forward_gpu(RealModel *m, const RealLayerGpu *g, const Config *cfg, int layer,
+                                      SepiaGpuBuf *x_multi, int64_t t, int hidden, float *out_row) {
+    SepiaGpuBuf *gres = (SepiaGpuBuf *)m->gpu_res_buf;
+    const RealLayer *rl = &m->layers[layer];
+    int n_shared = cfg->n_shared_experts, topk = cfg->num_experts_per_tok;
+    int n_total = cfg->n_routed_experts + n_shared;
+    int moe_inter = cfg->moe_intermediate_size;
+
+    SepiaGpuBuf *xrow = real_gpu_scratch((size_t)hidden);
+    SepiaGpuBuf *xt = real_gpu_row_in(x_multi, t, hidden, xrow);
+
+    SepiaGpuBuf *router_logits_buf = real_gpu_scratch((size_t)n_total);
+    if (!sepia_gpu_matvec_off(gres, g->router_w_off, xt, router_logits_buf, n_total, hidden))
+        die("metal: real: router matvec dispatch failed");
+
+    SepiaGpuBuf **shared_raw = xmalloc(sizeof(SepiaGpuBuf *) * (size_t)n_shared);
+    SepiaGpuBuf *gbuf = real_gpu_scratch((size_t)moe_inter);
+    SepiaGpuBuf *ubuf = real_gpu_scratch((size_t)moe_inter);
+    SepiaGpuBuf *hbuf = real_gpu_scratch((size_t)moe_inter);
+    for (int s = 0; s < n_shared; s++) {
+        GpuQTensor gate_s = g->shared_gate0, up_s = g->shared_up0, w2_s = g->shared_w2_0;
+        gate_s.w_off += (size_t)s * (size_t)g->shared_gate_stride;
+        up_s.w_off += (size_t)s * (size_t)g->shared_up_stride;
+        w2_s.w_off += (size_t)s * (size_t)g->shared_w2_stride;
+
+        if (!sepia_gpu_matvec_q(gate_s.ggml_type, gres, gate_s.w_off, xt, gbuf, gate_s.out_dim, gate_s.in_dim))
+            die("metal: real: shared[%d] gate matvec_q dispatch failed", s);
+        if (!sepia_gpu_matvec_q(up_s.ggml_type, gres, up_s.w_off, xt, ubuf, up_s.out_dim, up_s.in_dim))
+            die("metal: real: shared[%d] up matvec_q dispatch failed", s);
+        if (!sepia_gpu_silu_mul(gbuf, ubuf, hbuf, moe_inter)) die("metal: real: shared[%d] silu_mul dispatch failed", s);
+        shared_raw[s] = real_gpu_scratch((size_t)hidden);
+        if (!sepia_gpu_matvec_q(w2_s.ggml_type, gres, w2_s.w_off, hbuf, shared_raw[s], w2_s.out_dim, w2_s.in_dim))
+            die("metal: real: shared[%d] down matvec_q dispatch failed", s);
+    }
+
+    /* ---- SYNC: router logits + shared raw outputs + the normed activation
+     * (real_expert_ffn's `x`), all readable off this ONE batch's
+     * completion. ---- */
+    if (!sepia_gpu_end()) die("metal: real: MoE router/shared readback sync failed");
+
+    const float *router_logits = (const float *)sepia_gpu_host_ptr(router_logits_buf);
+    LayerWeights fake_lw = {0}; /* moe_route_select only reads router_bias/router_global_scale */
+    fake_lw.router_bias = rl->router_bias;
+    fake_lw.router_global_scale = rl->router_global_scale;
+    int *topk_idx = xmalloc(sizeof(int) * (size_t)topk);
+    int n_sel = topk + n_shared;
+    float *weights = xmalloc(sizeof(float) * (size_t)n_sel);
+    moe_route_select(cfg, &fake_lw, router_logits, topk_idx, weights);
+
+    m->real_exps.idx = &m->idx;
+    m->real_exps.part_fds = m->part_fds;
+    m->real_exps.cur_layer = layer;
+    const float *x_host_row = (const float *)sepia_gpu_host_ptr(xt);
+
+    for (int d = 0; d < hidden; d++) out_row[d] = 0.0f;
+    float *expert_out = xmalloc(sizeof(float) * (size_t)hidden);
+    for (int j = 0; j < topk; j++) {
+        int e = topk_idx[j];
+        real_expert_ffn(&m->real_exps, e, x_host_row, expert_out);
+        float wj = weights[j];
+        for (int d = 0; d < hidden; d++) out_row[d] += expert_out[d] * wj;
+    }
+    for (int s = 0; s < n_shared; s++) {
+        const float *sraw = (const float *)sepia_gpu_host_ptr(shared_raw[s]);
+        float gamma = weights[topk + s];
+        for (int d = 0; d < hidden; d++) out_row[d] += sraw[d] * gamma;
+    }
+    free(expert_out);
+    free(topk_idx);
+    free(weights);
+
+    for (int s = 0; s < n_shared; s++) sepia_gpu_free(shared_raw[s]);
+    free(shared_raw);
+    sepia_gpu_free(router_logits_buf);
+    sepia_gpu_free(gbuf);
+    sepia_gpu_free(ubuf);
+    sepia_gpu_free(hbuf);
+    sepia_gpu_free(xrow);
+
+    /* ---- resume the batch for the caller to continue encoding. ---- */
+    if (!sepia_gpu_begin()) die("metal: real: failed to resume the batch after the MoE sync");
+}
+
+/* GPU twin of decoder_layer_forward: same pre-norm residual wiring, same
+ * per-layer sconv history (now GPU-persistent) across calls. */
+static void real_decoder_layer_forward_gpu(RealModel *m, int layer, const Config *cfg, GpuLayerCache *lc,
+                                            SepiaGpuBuf *x, int T, int start_pos) {
+    const RealLayerGpu *g = &m->gpu_layers[layer];
+    SepiaGpuBuf *gres = (SepiaGpuBuf *)m->gpu_res_buf;
+    int hidden = cfg->hidden_size;
+    int K = cfg->conv_kernel_size;
+    int is_sliding = cfg->layer_is_sliding[layer];
+
+    SepiaGpuBuf *normed = real_gpu_scratch((size_t)T * hidden);
+    if (!sepia_gpu_rmsnorm_off(gres, g->attn_norm_off, x, normed, T, hidden, (float)cfg->rms_norm_eps))
+        die("metal: real: attn_norm dispatch failed");
+
+    SepiaGpuBuf *attn_out = real_gpu_scratch((size_t)T * hidden);
+    real_attn_forward_chunk_gpu(m, g, cfg, is_sliding, lc, normed, T, start_pos, attn_out);
+    sepia_gpu_free(normed);
+
+    SepiaGpuBuf *attn_sconv_out = real_gpu_scratch((size_t)T * hidden);
+    if (!sepia_gpu_sconv_off(gres, g->attn_sconv_off, lc->attn_hist, attn_out, attn_sconv_out, hidden, K, T))
+        die("metal: real: attn sconv dispatch failed");
+    if (!sepia_gpu_sconv_hist_roll(lc->attn_hist, attn_out, hidden, K, T))
+        die("metal: real: attn hist-roll dispatch failed");
+    sepia_gpu_free(attn_out);
+    if (!sepia_gpu_add(x, attn_sconv_out, x, (int64_t)T * hidden)) die("metal: real: attn residual add dispatch failed");
+    sepia_gpu_free(attn_sconv_out);
+
+    SepiaGpuBuf *normed2 = real_gpu_scratch((size_t)T * hidden);
+    if (!sepia_gpu_rmsnorm_off(gres, g->mlp_norm_off, x, normed2, T, hidden, (float)cfg->rms_norm_eps))
+        die("metal: real: mlp_norm dispatch failed");
+
+    SepiaGpuBuf *mlp_out = real_gpu_scratch((size_t)T * hidden);
+    if (!cfg->layer_is_sparse[layer]) {
+        real_mlp_dense_forward_gpu(m, g, hidden, cfg->dense_intermediate_size, &m->layers[layer], normed2, T, mlp_out);
+    } else {
+        float *out_row = xmalloc(sizeof(float) * (size_t)hidden);
+        float *mlp_out_host = xmalloc(sizeof(float) * (size_t)T * hidden);
+        for (int t = 0; t < T; t++) {
+            real_mlp_moe_forward_gpu(m, g, cfg, layer, normed2, t, hidden, out_row);
+            memcpy(mlp_out_host + (size_t)t * hidden, out_row, sizeof(float) * (size_t)hidden);
+        }
+        free(out_row);
+        /* Host-accumulated MoE output -> mlp_out's Shared storage: a plain
+         * memcpy, no dispatch touched mlp_out yet this call, so no extra
+         * sync is needed (the batch real_mlp_moe_forward_gpu leaves open on
+         * return is exactly the one this memcpy writes into, safely, since
+         * nothing has been encoded against mlp_out in it). */
+        memcpy(sepia_gpu_host_ptr(mlp_out), mlp_out_host, sizeof(float) * (size_t)T * (size_t)hidden);
+        free(mlp_out_host);
+    }
+    sepia_gpu_free(normed2);
+
+    SepiaGpuBuf *mlp_sconv_out = real_gpu_scratch((size_t)T * hidden);
+    if (!sepia_gpu_sconv_off(gres, g->mlp_sconv_off, lc->mlp_hist, mlp_out, mlp_sconv_out, hidden, K, T))
+        die("metal: real: mlp sconv dispatch failed");
+    if (!sepia_gpu_sconv_hist_roll(lc->mlp_hist, mlp_out, hidden, K, T))
+        die("metal: real: mlp hist-roll dispatch failed");
+    sepia_gpu_free(mlp_out);
+    if (!sepia_gpu_add(x, mlp_sconv_out, x, (int64_t)T * hidden)) die("metal: real: mlp residual add dispatch failed");
+    sepia_gpu_free(mlp_sconv_out);
+}
+
+/* GPU twin of real_forward_chunk. Embed lookup + embed_norm + final_norm
+ * stay on the CPU (single-row-per-token rmsnorm over a [hidden] vector --
+ * negligible cost either way, and this keeps the residual stream's one
+ * genuinely necessary host round trip -- reading the last layer's output
+ * back for final_norm -- as the only non-per-layer sync in this function,
+ * plus the logits matvec_q's own readback). */
+static void real_forward_chunk_gpu(RealModel *m, GpuCache *gcache, const int *token_ids, int T, int start_pos,
+                                    float *logits_out) {
+    const Config *cfg = &m->cfg;
+    int hidden = cfg->hidden_size;
+
+    float *x_host = xmalloc(sizeof(float) * (size_t)T * (size_t)hidden);
+    float *erow = xmalloc(sizeof(float) * (size_t)hidden);
+    for (int t = 0; t < T; t++) {
+        qrow(&m->embed, token_ids[t], erow);
+        rmsnorm(erow, m->embed_norm, hidden, (float)cfg->rms_norm_eps, x_host + (size_t)t * hidden);
+    }
+    free(erow);
+
+    SepiaGpuBuf *x = real_gpu_scratch((size_t)T * hidden);
+    memcpy(sepia_gpu_host_ptr(x), x_host, sizeof(float) * (size_t)T * (size_t)hidden);
+    free(x_host);
+
+    if (!sepia_gpu_begin()) die("metal: real: failed to open the forward-chunk batch");
+    for (int l = 0; l < cfg->num_hidden_layers; l++)
+        real_decoder_layer_forward_gpu(m, l, cfg, &gcache->layers[l], x, T, start_pos);
+    if (!sepia_gpu_end()) die("metal: real: final residual-stream readback sync failed");
+
+    const float *x_final = (const float *)sepia_gpu_host_ptr(x);
+    float *normed = xmalloc(sizeof(float) * (size_t)T * (size_t)hidden);
+    for (int t = 0; t < T; t++)
+        rmsnorm(x_final + (size_t)t * hidden, m->final_norm, hidden, (float)cfg->rms_norm_eps,
+                normed + (size_t)t * hidden);
+    sepia_gpu_free(x);
+
+    if (logits_out) {
+        int unpadded = cfg->unpadded_vocab_size;
+        float mup = (float)cfg->logits_mup_width_multiplier;
+        float *h = xmalloc(sizeof(float) * (size_t)T * (size_t)hidden);
+        for (int i = 0; i < T * hidden; i++) h[i] = normed[i] / mup;
+
+        SepiaGpuBuf *hbuf = real_gpu_scratch((size_t)T * hidden);
+        memcpy(sepia_gpu_host_ptr(hbuf), h, sizeof(float) * (size_t)T * (size_t)hidden);
+        free(h);
+
+        SepiaGpuBuf *gres = (SepiaGpuBuf *)m->gpu_res_buf;
+        /* Q4_K matvec_q over only the unpadded rows (architecture-notes.md
+         * sec.8) -- same "cap out_dim to the unpadded count" trick
+         * real_forward_chunk's CPU path applies to unembed_unpadded. */
+        GpuQTensor unembed_unpadded = m->gpu_unembed;
+        unembed_unpadded.out_dim = unpadded;
+        SepiaGpuBuf *logits_buf = real_gpu_scratch((size_t)T * unpadded);
+        SepiaGpuBuf *hrow = real_gpu_scratch((size_t)hidden);
+        SepiaGpuBuf *yrow = real_gpu_scratch((size_t)unpadded);
+        if (!sepia_gpu_begin()) die("metal: real: failed to open the logits batch");
+        for (int t = 0; t < T; t++)
+            real_gpu_matvec_q_row(gres, &unembed_unpadded, hbuf, t, logits_buf, hrow, yrow, "logits");
+        if (!sepia_gpu_end()) die("metal: real: logits readback sync failed");
+        memcpy(logits_out, sepia_gpu_host_ptr(logits_buf), sizeof(float) * (size_t)T * (size_t)unpadded);
+
+        sepia_gpu_free(hbuf);
+        sepia_gpu_free(logits_buf);
+        sepia_gpu_free(hrow);
+        sepia_gpu_free(yrow);
+    }
+    free(normed);
+}
+
 static double elapsed_ms(struct timespec t0, struct timespec t1) {
     return (double)(t1.tv_sec - t0.tv_sec) * 1000.0 + (double)(t1.tv_nsec - t0.tv_nsec) / 1e6;
 }
@@ -2673,6 +3410,90 @@ static void real_print_top_logits(RealModel *m, const char *prompt) {
     free(ids32);
     free(ids);
     cache_free(cache);
+}
+
+/* --metal --real twins of real_generate/real_print_top_logits, identical in
+ * every way except the cache type and the forward-chunk call -- see
+ * real_forward_chunk_gpu's header doc for what's actually different under
+ * the hood (resident weights read via GPU offsets instead of CPU-dequanted
+ * into an arena; KV cache + sconv history persistent on GPU). */
+static void real_generate_gpu(RealModel *m, const char *prompt, int n_gen) {
+    const Config *cfg = &m->cfg;
+    int unpadded = cfg->unpadded_vocab_size;
+
+    int32_t *ids = xmalloc(sizeof(int32_t) * (size_t)REAL_MAX_PROMPT_IDS);
+    int n_prompt = tokenizer_encode(m->tok, prompt, ids, REAL_MAX_PROMPT_IDS);
+    int *ids32 = xmalloc(sizeof(int) * (size_t)n_prompt);
+    for (int i = 0; i < n_prompt; i++) ids32[i] = (int)ids[i];
+
+    GpuCache *cache = gpu_cache_create_cfg(cfg, n_prompt + n_gen + 8);
+
+    float *logits = xmalloc(sizeof(float) * (size_t)n_prompt * (size_t)unpadded);
+    struct timespec t0, t1;
+    clock_gettime(CLOCK_MONOTONIC, &t0);
+    real_forward_chunk_gpu(m, cache, ids32, n_prompt, 0, logits);
+    clock_gettime(CLOCK_MONOTONIC, &t1);
+    double ms = elapsed_ms(t0, t1);
+    free(ids32);
+
+    float *cur = xmalloc(sizeof(float) * (size_t)unpadded);
+    memcpy(cur, logits + (size_t)(n_prompt - 1) * unpadded, sizeof(float) * (size_t)unpadded);
+    free(logits);
+
+    int eos_id = tokenizer_eos_id(m->tok);
+    int pos = n_prompt;
+    char textbuf[256];
+    for (int i = 0; i < n_gen; i++) {
+        int tok = argmax_f(cur, unpadded);
+        tokenizer_decode(m->tok, &tok, 1, textbuf, sizeof textbuf);
+        printf("%d\t%s\t%.1f ms\n", tok, textbuf, ms);
+        fflush(stdout);
+        if (tok == eos_id) break;
+        int next_id = tok;
+        clock_gettime(CLOCK_MONOTONIC, &t0);
+        real_forward_chunk_gpu(m, cache, &next_id, 1, pos, cur);
+        clock_gettime(CLOCK_MONOTONIC, &t1);
+        ms = elapsed_ms(t0, t1);
+        pos++;
+    }
+    gpu_cache_free(cache);
+    free(ids);
+    free(cur);
+}
+
+static void real_print_top_logits_gpu(RealModel *m, const char *prompt) {
+    const Config *cfg = &m->cfg;
+    int unpadded = cfg->unpadded_vocab_size;
+
+    int32_t *ids = xmalloc(sizeof(int32_t) * (size_t)REAL_MAX_PROMPT_IDS);
+    int n_prompt = tokenizer_encode(m->tok, prompt, ids, REAL_MAX_PROMPT_IDS);
+    int *ids32 = xmalloc(sizeof(int) * (size_t)n_prompt);
+    for (int i = 0; i < n_prompt; i++) ids32[i] = (int)ids[i];
+
+    GpuCache *cache = gpu_cache_create_cfg(cfg, n_prompt);
+    float *logits = xmalloc(sizeof(float) * (size_t)n_prompt * (size_t)unpadded);
+    real_forward_chunk_gpu(m, cache, ids32, n_prompt, 0, logits);
+    const float *last = logits + (size_t)(n_prompt - 1) * unpadded;
+
+    int idx[10];
+    float val[10];
+    for (int k = 0; k < 10; k++) { idx[k] = -1; val[k] = -INFINITY; }
+    for (int v = 0; v < unpadded; v++) {
+        float x = last[v];
+        if (x > val[9]) {
+            int p = 9;
+            while (p > 0 && x > val[p - 1]) { val[p] = val[p - 1]; idx[p] = idx[p - 1]; p--; }
+            val[p] = x;
+            idx[p] = v;
+        }
+    }
+    printf("top-10 first-token logits for a %d-token prompt:\n", n_prompt);
+    for (int k = 0; k < 10; k++) printf("  [%d] id=%d logit=%.6f\n", k, idx[k], (double)val[k]);
+
+    free(logits);
+    free(ids32);
+    free(ids);
+    gpu_cache_free(cache);
 }
 
 /* ------------------------------ --smoke mode -------------------------------- */
@@ -4554,12 +5375,20 @@ int main(int argc, char **argv) {
             fprintf(stderr, "real: mlock'd resident.bin (%zu bytes)\n", rm.res_size);
         }
 
+        /* --metal routes generation through the real-model GPU resident
+         * path (Task 9: quantized weights read straight off gpu_res_buf, no
+         * CPU dequant); without --metal, CPU real mode stays byte-for-byte
+         * what P1 shipped. do_metal implies rm.gpu_res_buf is set (main()
+         * initializes the GPU runtime, dying on failure, before real_load
+         * runs). */
         if (logits_only) {
-            real_print_top_logits(&rm, prompt);
+            if (do_metal) real_print_top_logits_gpu(&rm, prompt);
+            else real_print_top_logits(&rm, prompt);
             return 0;
         }
 
-        real_generate(&rm, prompt, n_gen);
+        if (do_metal) real_generate_gpu(&rm, prompt, n_gen);
+        else real_generate(&rm, prompt, n_gen);
         return 0;
     }
 
