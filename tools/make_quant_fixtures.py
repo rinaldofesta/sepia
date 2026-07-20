@@ -79,10 +79,23 @@ def main():
         expect = dequantize(np.frombuffer(raw, dtype=np.uint8), qt).astype(np.float32)
         write_fixture(qt, raw, expect)
 
-    make_qlinear_fixture(rng)   # defined in Task 13; stub `pass` until then
+    make_qlinear_fixture(rng)   # Task 13's qlinear fixture
 
 def make_qlinear_fixture(rng):
-    pass
+    out_dim, in_dim = 8, 64            # in_dim multiple of QK8_0=32
+    w = rng.standard_normal((out_dim, in_dim), dtype=np.float32)
+    x = rng.standard_normal(in_dim, dtype=np.float32)
+    raw = b"".join(quantize(w[i], T.Q8_0).tobytes() for i in range(out_dim))
+    wdq = np.stack([dequantize(np.frombuffer(quantize(w[i], T.Q8_0).tobytes(), dtype=np.uint8), T.Q8_0)
+                    for i in range(out_dim)]).astype(np.float32)
+    y = (wdq.astype(np.float64) @ x.astype(np.float64)).astype(np.float32)
+    path = OUT_DIR / "qlinear_q8_0.bin"
+    with open(path, "wb") as f:
+        f.write(struct.pack("<5I", 0x584C5153, 1, int(T.Q8_0), out_dim, in_dim))
+        f.write(raw)
+        f.write(x.astype("<f4").tobytes())
+        f.write(y.astype("<f4").tobytes())
+    print(f"{path}  {out_dim}x{in_dim}")
 
 if __name__ == "__main__":
     main()

@@ -8,7 +8,7 @@ LDFLAGS ?= -pthread -lm
 #   test     (0.4)  oracle self-test
 ci: pycheck tooltests sepia test_quants test_tokenizer
 	./sepia
-	./test_quants tools/fixtures/quants/f16.bin tools/fixtures/quants/q8_0.bin tools/fixtures/quants/q4_k.bin tools/fixtures/quants/q5_k.bin tools/fixtures/quants/q6_k.bin tools/fixtures/quants/iq2_xs.bin tools/fixtures/quants/iq3_xxs.bin tools/fixtures/quants/iq4_xs.bin
+	./test_quants tools/fixtures/quants/f16.bin tools/fixtures/quants/q8_0.bin tools/fixtures/quants/q4_k.bin tools/fixtures/quants/q5_k.bin tools/fixtures/quants/q6_k.bin tools/fixtures/quants/iq2_xs.bin tools/fixtures/quants/iq3_xxs.bin tools/fixtures/quants/iq4_xs.bin tools/fixtures/quants/qlinear_q8_0.bin
 	./test_tokenizer tools/fixtures/tokenizer/mini.bin tools/fixtures/tokenizer/mini_cases.json
 	@echo "ci ok"
 
@@ -31,8 +31,8 @@ pycheck:
 		echo "pycheck: no python tools yet"; \
 	fi
 
-sepia: src/sepia.c
-	$(CC) $(CFLAGS) -o sepia src/sepia.c $(LDFLAGS)
+sepia: src/sepia.c src/quants.c src/quants.h src/tokenizer.c src/tokenizer.h
+	$(CC) $(CFLAGS) -o sepia src/sepia.c src/quants.c src/tokenizer.c $(LDFLAGS)
 
 test: sepia
 	./sepia

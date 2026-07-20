@@ -538,6 +538,19 @@ static Config config_load(const char *path) {
     return cfg;
 }
 
+#include "quants.h"
+
+/* QTensor: a weight matrix stored quantized on disk (Task 14 loads these
+ * in place of the float32 tensors above). Interface only here, above the
+ * model structs; bodies (needing dotf) live in math primitives below. */
+typedef struct { int ggml_type; const void *data; int64_t out_dim, in_dim; } QTensor;
+/* y[out_dim] = W x. Per output row: dequant the row into a scratch (caller-
+ * provided, in_dim floats), then double-accumulated dot -- same numerical
+ * policy as linear() at src/sepia.c:694. */
+static void qlinear(const QTensor *w, const float *x, float *y, float *row_scratch);
+/* Dequant row `r` of W into dst (used for embedding lookups). */
+static void qrow(const QTensor *w, int64_t r, float *dst);
+
 /* ================================ model ================================= */
 /* Per-layer weight pointers plus the resolved per-layer-type dims (sec.2's
  * local/global split). Dense layers leave the moe_* pointers NULL and vice
@@ -693,6 +706,19 @@ static float dotf(const float *a, const float *b, int n) {
 /* y[o] = dot(w[o,:], x) for o in [0,out_dim); w is [out_dim, in_dim] row-major. */
 static void linear(const float *w, int out_dim, int in_dim, const float *x, float *y) {
     for (int o = 0; o < out_dim; o++) y[o] = dotf(w + (size_t)o * (size_t)in_dim, x, in_dim);
+}
+
+static void qrow(const QTensor *w, int64_t r, float *dst) {
+    size_t row_bytes = quants_row_bytes(w->ggml_type, w->in_dim);
+    const uint8_t *base = (const uint8_t *)w->data + (size_t)r * row_bytes;
+    dequantize_row(w->ggml_type, base, dst, w->in_dim);
+}
+
+static void __attribute__((unused)) qlinear(const QTensor *w, const float *x, float *y, float *row_scratch) {
+    for (int64_t o = 0; o < w->out_dim; o++) {
+        qrow(w, o, row_scratch);
+        y[o] = dotf(row_scratch, x, (int)w->in_dim);
+    }
 }
 
 static float sigmoid_f(float x) { return 1.0f / (1.0f + expf(-x)); }
