@@ -8,7 +8,7 @@ LDFLAGS ?= -pthread -lm
 #   test     (0.4)  oracle self-test
 ci: pycheck tooltests sepia test_quants
 	./sepia
-	./test_quants tools/fixtures/quants/f16.bin tools/fixtures/quants/q8_0.bin tools/fixtures/quants/q4_k.bin tools/fixtures/quants/q5_k.bin tools/fixtures/quants/q6_k.bin tools/fixtures/quants/iq2_xs.bin
+	./test_quants tools/fixtures/quants/f16.bin tools/fixtures/quants/q8_0.bin tools/fixtures/quants/q4_k.bin tools/fixtures/quants/q5_k.bin tools/fixtures/quants/q6_k.bin tools/fixtures/quants/iq2_xs.bin tools/fixtures/quants/iq3_xxs.bin tools/fixtures/quants/iq4_xs.bin
 	@echo "ci ok"
 
 # Tool test suites. Excluded on purpose: tools/test_oracle_determinism.sh

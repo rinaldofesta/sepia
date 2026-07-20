@@ -200,6 +200,53 @@ static void dequant_iq2_xs(const void *src, float *dst, int64_t n) {
     }
 }
 
+static void dequant_iq3_xxs(const void *src, float *dst, int64_t n) {
+    const uint8_t *p = (const uint8_t *)src;
+    for (int64_t b = 0; b < n / QK_K; b++) {
+        uint16_t dbits; memcpy(&dbits, p, 2);
+        const float d = quants_f16_to_f32(dbits);
+        const uint8_t *qs = p + 2;
+        const uint8_t *sas = qs + QK_K / 4;      /* 32 bytes of scale-and-signs */
+        for (int ib32 = 0; ib32 < 8; ib32++) {
+            uint32_t aux32; memcpy(&aux32, sas + 4 * ib32, 4);
+            const float db = d * (0.5f + (aux32 >> 28)) * 0.5f;
+            for (int l = 0; l < 4; l++) {
+                const uint8_t signs = ksigns_iq2xs[(aux32 >> (7 * l)) & 127];
+                const uint8_t *grid1 = (const uint8_t *)(iq3xxs_grid + qs[8 * ib32 + 2 * l + 0]);
+                const uint8_t *grid2 = (const uint8_t *)(iq3xxs_grid + qs[8 * ib32 + 2 * l + 1]);
+                for (int j = 0; j < 4; j++) {
+                    dst[j]     = db * grid1[j] * ((signs & kmask_iq2xs[j])     ? -1.0f : 1.0f);
+                    dst[j + 4] = db * grid2[j] * ((signs & kmask_iq2xs[j + 4]) ? -1.0f : 1.0f);
+                }
+                dst += 8;
+            }
+        }
+        p += 98;
+    }
+}
+
+static void dequant_iq4_xs(const void *src, float *dst, int64_t n) {
+    const uint8_t *p = (const uint8_t *)src;
+    for (int64_t b = 0; b < n / QK_K; b++) {
+        uint16_t dbits, scales_h;
+        memcpy(&dbits, p, 2); memcpy(&scales_h, p + 2, 2);
+        const float d = quants_f16_to_f32(dbits);
+        const uint8_t *scales_l = p + 4;
+        const uint8_t *qs = p + 8;
+        for (int ib = 0; ib < 8; ib++) {
+            const int ls = ((scales_l[ib / 2] >> (4 * (ib % 2))) & 0xF)
+                         | (((scales_h >> (2 * ib)) & 3) << 4);
+            const float dl = d * (ls - 32);
+            for (int j = 0; j < 16; j++) {
+                dst[j]      = dl * kvalues_iq4nl[qs[j] & 0xF];
+                dst[j + 16] = dl * kvalues_iq4nl[qs[j] >> 4];
+            }
+            dst += 32; qs += 16;
+        }
+        p += 136;
+    }
+}
+
 void dequantize_row(int t, const void *src, float *dst, int64_t n) {
     if (n % quants_block_size(t) != 0)
         qdie("quants: dequantize_row n=%lld not block-aligned for type %d", (long long)n, t);
@@ -211,6 +258,8 @@ void dequantize_row(int t, const void *src, float *dst, int64_t n) {
     case SEPIA_T_Q5_K: dequant_q5_k(src, dst, n); break;
     case SEPIA_T_Q6_K: dequant_q6_k(src, dst, n); break;
     case SEPIA_T_IQ2_XS: dequant_iq2_xs(src, dst, n); break;
+    case SEPIA_T_IQ3_XXS: dequant_iq3_xxs(src, dst, n); break;
+    case SEPIA_T_IQ4_XS: dequant_iq4_xs(src, dst, n); break;
     default: qdie("quants: dequant for ggml type %d not yet implemented", t);
     }
 }
