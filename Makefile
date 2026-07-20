@@ -125,11 +125,12 @@ gputest: sepia
 gpucompare: sepia
 	./sepia --metal --gpu-compare-tiny
 
-# local-only: needs a live Metal device; the Task 4 gate for the Q8_0/Q4_K
-# dequant-fused matvec kernels -- bitwise dequant vs the committed SQFX
-# fixtures, plus a tolerance-checked matvec vs CPU qlinear. Not in ci for
-# the same reason gputest/gpucompare aren't (needs a live device).
+# local-only: needs a live Metal device; the Task 4/5 gate for the
+# Q8_0/Q4_K/Q5_K/Q6_K dequant-fused matvec kernels -- bitwise dequant vs the
+# committed SQFX fixtures, plus a tolerance-checked matvec vs CPU qlinear.
+# Not in ci for the same reason gputest/gpucompare aren't (needs a live
+# device).
 gpuquants: sepia
-	./sepia --metal --gpu-quants tools/fixtures/quants/q8_0.bin tools/fixtures/quants/q4_k.bin
+	./sepia --metal --gpu-quants tools/fixtures/quants/q8_0.bin tools/fixtures/quants/q4_k.bin tools/fixtures/quants/q5_k.bin tools/fixtures/quants/q6_k.bin
 
 .PHONY: ci pycheck tooltests sepia test iobench test_quants test_tokenizer tokreal configcheck shadercheck gputest gpucompare gpuquants

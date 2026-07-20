@@ -3183,9 +3183,9 @@ static void run_gpu_compare_tiny(void) {
     printf("gpu compare ok\n");
 }
 
-/* --gpu-quants (local-only, needs --metal): the Task 4 gate for the
- * dequant-fused Q8_0/Q4_K Metal matvec kernels. For each SQFX fixture
- * (tools/fixtures/quants/, format documented at tools/test_quants.c's
+/* --gpu-quants (local-only, needs --metal): the Task 4/5 gate for the
+ * dequant-fused Q8_0/Q4_K/Q5_K/Q6_K Metal matvec kernels. For each SQFX
+ * fixture (tools/fixtures/quants/, format documented at tools/test_quants.c's
  * run_dequant_fixture): upload the raw quant blocks, run the standalone
  * debug kernel (sepia_gpu_dequant_rows), and require BITWISE equality
  * against the fixture's expected f32 payload -- dequantization has no
@@ -3197,15 +3197,15 @@ static void run_gpu_compare_tiny(void) {
  * always sits at offset 0 regardless of nb1), draws a deterministic random
  * x, and compares sepia_gpu_matvec_q against the CPU qlinear reference at
  * SEPIA_GPU_COMPARE_TOL (the same relative-tolerance gate --gpu-compare-tiny
- * uses). Fixture types without a GPU kernel yet (Q5_K, Q6_K, the IQ family
- * -- Tasks 5-6) are skipped with a notice, not a failure, so this mode
- * stays forward-compatible with the already-committed fixtures for those
- * types. */
+ * uses). Fixture types without a GPU kernel yet (the IQ family -- Task 6)
+ * are skipped with a notice, not a failure, so this mode stays forward-
+ * compatible with the already-committed fixtures for those types. */
 
 static int g_gpu_quants_failed = 0;
 
 static int gpu_quants_type_has_kernel(int ggml_type) {
-    return ggml_type == SEPIA_T_Q8_0 || ggml_type == SEPIA_T_Q4_K;
+    return ggml_type == SEPIA_T_Q8_0 || ggml_type == SEPIA_T_Q4_K ||
+           ggml_type == SEPIA_T_Q5_K || ggml_type == SEPIA_T_Q6_K;
 }
 
 static uint32_t gq_rd_u32(FILE *f, const char *path) {
