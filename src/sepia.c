@@ -2512,6 +2512,13 @@ typedef struct {
      * never back-pointers into `m` itself). Zeroed (all-miss, empty) until
      * expert_store_init runs inside real_load's existing GPU-init block. */
     ExpertGpuStore expert_store;
+
+    /* Task 13 (--route-log FILE): non-NULL only when the flag is given
+     * (--metal --real only, see main()). real_mlp_moe_forward_gpu appends
+     * one RouteLogRecord per (token, sparse-layer) MoE selection when set;
+     * NULL means "don't log", the default, and the check costs one branch
+     * per MoE layer -- no other behavior change (Task 13's own gate). */
+    FILE *route_log;
 } RealModel;
 
 /* Computes the byte offset of a resident-buffer pointer (already validated
@@ -3759,8 +3766,59 @@ static void real_mlp_moe_dispatch_routed(RealModel *m, const ExpertCacheSlot *sl
         die("metal: real: routed[%d] down matvec_q dispatch failed", j);
 }
 
+/* Task 13 PILOT instrumentation (--route-log FILE): one flat, fixed-size
+ * binary record per (token, sparse-layer) MoE selection made by the GPU
+ * forward path, appended with a single fwrite() per record -- no header, no
+ * version byte, no framing. This is an internal diagnostic file consumed
+ * only by tools/pilot_routing.py on the same machine, not a public format,
+ * so it prioritizes simplicity over generality (per the task brief). 56
+ * bytes/record, no padding: every member is 4 bytes wide (int32_t/float) at
+ * natural 4-byte alignment throughout, so sizeof(RouteLogRecord) == 56 on
+ * any platform this project targets (Darwin arm64/x86_64).
+ *
+ *   token_idx    absolute generation position (prompt tokens then generated
+ *                tokens, 0-based) -- the same position real_forward_chunk_gpu
+ *                threads through as start_pos+t, i.e. the KV-cache position.
+ *   layer_idx    0..cfg->num_hidden_layers-1. Only sparse (MoE) layers ever
+ *                write a record; dense layers naturally never call this
+ *                function, so they are simply absent from the log (no
+ *                sentinel needed -- tools/pilot_routing.py treats a missing
+ *                (token,layer) as "no router at this layer").
+ *   expert_ids   the num_experts_per_tok selected routed-expert ids, in
+ *                router-weight order. Fixed at 6 slots: Inkling's config is
+ *                num_experts_per_tok=6 (docs/inkling-config.json) and this
+ *                record format hardcodes that, dying loudly (route_log_write)
+ *                if a differently-configured model is ever pointed at it.
+ *   expert_w     the matching post-route mixing weights (route_scale *
+ *                global_scale * renormalized softmax weight -- moe_route_
+ *                select's sec.6 formula), NOT including the shared-expert
+ *                gammas that live past index topk in moe_route_select's own
+ *                weights[] array. */
+typedef struct {
+    int32_t token_idx;
+    int32_t layer_idx;
+    int32_t expert_ids[6];
+    float   expert_w[6];
+} RouteLogRecord;
+
+static void route_log_write(FILE *f, int32_t token_idx, int32_t layer_idx,
+                             const int *topk_idx, const float *weights, int topk) {
+    if (topk != 6)
+        die("route-log: expected num_experts_per_tok=6 (Inkling's config), got %d -- "
+            "the fixed-width record format assumes 6, see the RouteLogRecord comment", topk);
+    RouteLogRecord rec;
+    rec.token_idx = token_idx;
+    rec.layer_idx = layer_idx;
+    for (int j = 0; j < 6; j++) {
+        rec.expert_ids[j] = (int32_t)topk_idx[j];
+        rec.expert_w[j] = weights[j];
+    }
+    if (fwrite(&rec, sizeof rec, 1, f) != 1)
+        die("route-log: fwrite failed: %s", strerror(errno));
+}
+
 static void real_mlp_moe_forward_gpu(RealModel *m, const RealLayerGpu *g, const Config *cfg, int layer,
-                                      SepiaGpuBuf *x_multi, int64_t t, int hidden, float *out_row) {
+                                      SepiaGpuBuf *x_multi, int64_t t, int hidden, float *out_row, int start_pos) {
     SepiaGpuBuf *gres = (SepiaGpuBuf *)m->gpu_res_buf;
     const RealLayer *rl = &m->layers[layer];
     int n_shared = cfg->n_shared_experts, topk = cfg->num_experts_per_tok;
@@ -3806,6 +3864,13 @@ static void real_mlp_moe_forward_gpu(RealModel *m, const RealLayerGpu *g, const 
     int n_sel = topk + n_shared;
     float *weights = xmalloc(sizeof(float) * (size_t)n_sel);
     moe_route_select(cfg, &fake_lw, router_logits, topk_idx, weights);
+
+    /* Task 13: log the selection BEFORE any streaming/eviction work below --
+     * route logging is purely an observer of moe_route_select's output and
+     * must never perturb it (the --route-log gate: identical token sequences
+     * with or without the flag). */
+    if (m->route_log)
+        route_log_write(m->route_log, (int32_t)(start_pos + (int)t), (int32_t)layer, topk_idx, weights, topk);
 
     /* Task 10/11: routed experts stream through the GPU-resident LRU cache
      * (m->expert_store) instead of real_expert_ffn's per-call CPU
@@ -3933,7 +3998,7 @@ static void real_decoder_layer_forward_gpu(RealModel *m, int layer, const Config
         float *out_row = xmalloc(sizeof(float) * (size_t)hidden);
         float *mlp_out_host = xmalloc(sizeof(float) * (size_t)T * hidden);
         for (int t = 0; t < T; t++) {
-            real_mlp_moe_forward_gpu(m, g, cfg, layer, normed2, t, hidden, out_row);
+            real_mlp_moe_forward_gpu(m, g, cfg, layer, normed2, t, hidden, out_row, start_pos);
             memcpy(mlp_out_host + (size_t)t * hidden, out_row, sizeof(float) * (size_t)hidden);
         }
         free(out_row);
@@ -5994,6 +6059,7 @@ int main(int argc, char **argv) {
     int do_gpu_quants = 0, do_gpu_compare_attn = 0;
     char **gpu_quants_paths = NULL;
     int gpu_quants_n = 0;
+    const char *route_log_path = NULL; /* Task 13: --route-log FILE, --metal --real only */
     /* Task 10: default sized well under the ~110GB locked+resident ceiling
      * (Global Constraints) alongside the 14.23GB resident.bin wrap + KV
      * cache/scratch (a few hundred MB) -- see the expert_store_init log
@@ -6047,12 +6113,14 @@ int main(int argc, char **argv) {
             gpu_quants_paths = &argv[i + 1];
             gpu_quants_n = argc - (i + 1);
             i = argc; /* the rest of argv is fixture paths, not flags */
+        } else if (strcmp(argv[i], "--route-log") == 0 && i + 1 < argc) {
+            route_log_path = argv[++i];
         } else {
             fprintf(stderr,
                 "usage: %s [--dump-acts FILE] [--metal]\n"
                 "       %s --smoke DIR\n"
                 "       %s --real [--prompt TEXT] [--n-gen N] [--mlock] [--logits-only] [--metal]\n"
-                "          [--expert-cache-gb N] [--verbose-cache]\n"
+                "          [--expert-cache-gb N] [--verbose-cache] [--route-log FILE]\n"
                 "       %s --metal --gpu-selftest\n"
                 "       %s --metal --gpu-compare-tiny\n"
                 "       %s --metal --gpu-compare-attn\n"
@@ -6088,7 +6156,11 @@ int main(int argc, char **argv) {
                 "also proves double-run determinism when the token sequence matches across runs.\n"
                 "--expert-io-mode {nocache|pagecache} (--metal --real only) selects the routed-expert\n"
                 "pread path (Task 11 A/B): nocache (default) is F_NOCACHE direct I/O; pagecache is ds4's\n"
-                "alternative (buffered reads + an F_RDADVISE readahead hint per region).\n",
+                "alternative (buffered reads + an F_RDADVISE readahead hint per region).\n"
+                "--route-log FILE (Task 13, --metal --real only) appends one fixed-size binary record\n"
+                "per (token, sparse-layer) MoE selection -- see the RouteLogRecord comment in\n"
+                "src/sepia.c and tools/pilot_routing.py, the PILOT routing-predictability analysis.\n"
+                "Purely an observer: it does not change generation behavior.\n",
                 argv[0], argv[0], argv[0], argv[0], argv[0], argv[0], argv[0]);
             return 2;
         }
@@ -6148,6 +6220,18 @@ int main(int argc, char **argv) {
             fprintf(stderr, "real: mlock'd resident.bin (%zu bytes)\n", rm.res_size);
         }
 
+        /* Task 13: route logging only instruments the GPU MoE path
+         * (real_mlp_moe_forward_gpu) -- die rather than silently no-op if
+         * asked for on CPU real mode, so a mistaken invocation is loud, not
+         * an empty file. */
+        if (route_log_path) {
+            if (!do_metal)
+                die("--route-log requires --metal (only the GPU MoE path is instrumented, Task 13)");
+            rm.route_log = fopen(route_log_path, "wb");
+            if (!rm.route_log) die("route-log: fopen('%s'): %s", route_log_path, strerror(errno));
+            fprintf(stderr, "sepia: route-log: writing to %s\n", route_log_path);
+        }
+
         /* --metal routes generation through the real-model GPU resident
          * path (Task 9: quantized weights read straight off gpu_res_buf, no
          * CPU dequant); without --metal, CPU real mode stays byte-for-byte
@@ -6161,6 +6245,7 @@ int main(int argc, char **argv) {
                 expert_store_shutdown(&rm.expert_store);
                 expert_loader_pool_shutdown();
             }
+            if (rm.route_log) fclose(rm.route_log);
             return 0;
         }
 
@@ -6180,6 +6265,7 @@ int main(int argc, char **argv) {
             expert_store_shutdown(&rm.expert_store);
             expert_loader_pool_shutdown();
         }
+        if (rm.route_log) fclose(rm.route_log);
         return 0;
     }
 
