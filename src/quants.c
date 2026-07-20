@@ -123,6 +123,58 @@ static void dequant_q4_k(const void *src, float *dst, int64_t n) {
     }
 }
 
+static void dequant_q5_k(const void *src, float *dst, int64_t n) {
+    const uint8_t *p = (const uint8_t *)src;
+    for (int64_t b = 0; b < n / QK_K; b++) {
+        uint16_t dbits, mbits;
+        memcpy(&dbits, p, 2); memcpy(&mbits, p + 2, 2);
+        const float d = quants_f16_to_f32(dbits), min = quants_f16_to_f32(mbits);
+        const uint8_t *scales = p + 4;
+        const uint8_t *qh = p + 16;
+        const uint8_t *ql = p + 48;
+        int is = 0;
+        uint8_t u1 = 1, u2 = 2;
+        for (int j = 0; j < QK_K; j += 64) {
+            uint8_t sc, m;
+            get_scale_min_k4(is + 0, scales, &sc, &m);
+            const float d1 = d * sc, m1 = min * m;
+            get_scale_min_k4(is + 1, scales, &sc, &m);
+            const float d2 = d * sc, m2 = min * m;
+            for (int l = 0; l < 32; l++) dst[l]      = d1 * ((ql[l] & 0xF) + ((qh[l] & u1) ? 16 : 0)) - m1;
+            for (int l = 0; l < 32; l++) dst[l + 32] = d2 * ((ql[l] >> 4)  + ((qh[l] & u2) ? 16 : 0)) - m2;
+            dst += 64; ql += 32; is += 2;
+            u1 <<= 2; u2 <<= 2;
+        }
+        p += 176;
+    }
+}
+
+static void dequant_q6_k(const void *src, float *dst, int64_t n) {
+    const uint8_t *p = (const uint8_t *)src;
+    for (int64_t b = 0; b < n / QK_K; b++) {
+        const uint8_t *ql = p;
+        const uint8_t *qh = p + 128;
+        const int8_t *sc = (const int8_t *)(p + 192);
+        uint16_t dbits; memcpy(&dbits, p + 208, 2);
+        const float d = quants_f16_to_f32(dbits);
+        for (int half = 0; half < 2; half++) {
+            for (int l = 0; l < 32; l++) {
+                int is = l / 16;
+                int8_t q1 = (int8_t)(((ql[l]      & 0xF) | (((qh[l] >> 0) & 3) << 4)) - 32);
+                int8_t q2 = (int8_t)(((ql[l + 32] & 0xF) | (((qh[l] >> 2) & 3) << 4)) - 32);
+                int8_t q3 = (int8_t)(((ql[l]      >> 4)  | (((qh[l] >> 4) & 3) << 4)) - 32);
+                int8_t q4 = (int8_t)(((ql[l + 32] >> 4)  | (((qh[l] >> 6) & 3) << 4)) - 32);
+                dst[l]      = d * sc[is + 0] * q1;
+                dst[l + 32] = d * sc[is + 2] * q2;
+                dst[l + 64] = d * sc[is + 4] * q3;
+                dst[l + 96] = d * sc[is + 6] * q4;
+            }
+            dst += 128; ql += 64; qh += 32; sc += 8;
+        }
+        p += 210;
+    }
+}
+
 void dequantize_row(int t, const void *src, float *dst, int64_t n) {
     if (n % quants_block_size(t) != 0)
         qdie("quants: dequantize_row n=%lld not block-aligned for type %d", (long long)n, t);
@@ -131,6 +183,8 @@ void dequantize_row(int t, const void *src, float *dst, int64_t n) {
     case SEPIA_T_F16: dequant_f16(src, dst, n); break;
     case SEPIA_T_Q8_0: dequant_q8_0(src, dst, n); break;
     case SEPIA_T_Q4_K: dequant_q4_k(src, dst, n); break;
+    case SEPIA_T_Q5_K: dequant_q5_k(src, dst, n); break;
+    case SEPIA_T_Q6_K: dequant_q6_k(src, dst, n); break;
     default: qdie("quants: dequant for ggml type %d not yet implemented", t);
     }
 }
