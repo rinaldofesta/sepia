@@ -2195,6 +2195,234 @@ typedef struct RealExperts {
     float *row_scratch;                    /* [max(hidden,moe_inter)], qlinear's row-dequant scratch */
 } RealExperts;
 
+/* ------------------------ GPU expert store (Task 10) ------------------------ */
+/* LRU-streamed, mlocked GPU-resident cache for routed-expert weights --
+ * replaces real_expert_ffn's per-call CPU pread+qlinear on the --metal path
+ * (real_expert_ffn itself is untouched and still serves CPU real mode).
+ * Ported from ds4's slab/slot/free-list/per-slot-mlock/bindless-address-
+ * table shape (ds4_metal.m:8274-8410) with ds4's hotness-decayed LFU
+ * replaced by plain LRU (P2 scope; ds4's fancier policy is P3 per the
+ * plan). The plan's own Task 10 text calls out an "or reuse the
+ * offset-addressed matvec_q against the slot's SepiaGpuBuf" alternative to
+ * a new address-based kernel variant -- this implementation takes exactly
+ * that path: `table[layer*n_experts+expert]` is the per-layer hit/miss
+ * lookup (-1 = miss, else a slot index), and a hit's actual GPU dispatch
+ * reuses the SAME offset-addressed sepia_gpu_matvec_q the resident path
+ * already calls (SepiaGpuBuf* + byte offset) rather than true in-kernel
+ * bindless pointer chasing. This needs zero new Metal surface -- no new
+ * .metal kernels, no sepia_gpu.h/sepia_metal.m changes at all, every
+ * dispatch below is an existing call. */
+#define SEPIA_MOE_MAX_TOPK 16      /* compile-time bound on num_experts_per_tok;
+                                    * this model's config uses 6 (SEPIA_MOE_MAX_TOPK
+                                    * gives headroom, matching the SEPIA_ATTN_MAX_DH/
+                                    * SEPIA_SCONV_MAX_KM1 bound-check precedent) */
+#define SEPIA_EXPERT_SLAB_BYTES ((size_t)4ULL * 1024 * 1024 * 1024) /* ~4GiB, ds4-matched */
+
+typedef struct {
+    int layer, expert;        /* current owner; -1/-1 if never installed */
+    int ggml_type_gate, ggml_type_up, ggml_type_down;
+    int slab_idx;              /* which slab (slabs[slab_idx]) this slot lives in */
+    size_t base_off;           /* gate region's byte offset within that slab;
+                                 * up = base_off+region_bytes, down = base_off+2*region_bytes
+                                 * (the 3 regions are laid out contiguously per slot, so ONE
+                                 * mlock call covers the whole slot) */
+    int mlocked;                /* mlock'd exactly once, on this slot's first install ever --
+                                  * later reinstalls (different expert, same slot) reuse the
+                                  * same locked VA range, no re-mlock needed */
+    uint64_t safe_gen;          /* not evictable while gen_completed < safe_gen -- see
+                                  * expert_cache_evict_or_get_free's header comment */
+    int lru_prev, lru_next;    /* -1 = list end */
+} ExpertCacheSlot;
+
+typedef struct {
+    SepiaGpuBuf **slabs;
+    int n_slabs;
+    size_t region_bytes;        /* per gate/up/down region: page_round(idx->max_slab_bytes) */
+    size_t slot_bytes;          /* 3 * region_bytes */
+    int slots_per_slab;
+    int n_slots;
+    ExpertCacheSlot *slots;      /* [n_slots] */
+    int lru_head, lru_tail;      /* MRU / LRU list ends (index into slots[]) */
+
+    int *table;                  /* [n_layers_alloc*n_experts], -1 = miss, else slot index */
+    int n_layers_alloc, n_experts;
+
+    /* In-flight generation stamps (ds4_metal.m:834-912's pattern, scoped down
+     * to a single counter pair): gen_completed is bumped by real_gpu_end
+     * every time the real-model GPU path's sepia_gpu_end() succeeds. A
+     * slot's safe_gen records the generation its NEXT read will complete
+     * under (gen_completed+1 at install time) -- eviction skips any slot
+     * with safe_gen > gen_completed. Under Task 10's synchronous per-call
+     * design this can never actually block eviction (every routed-expert
+     * batch this function opens is fully synced before the function
+     * returns, so by the next cache-install pass gen_completed already
+     * reflects it) -- the mechanism is defensive groundwork for Task 11's
+     * async overlap, not exercised today, but implemented now so Task 11
+     * doesn't need a rewrite. */
+    uint64_t gen_completed;
+
+    /* mlock failure degrades the cache (stop trying to pin further slots,
+     * one warning) rather than aborting -- Global Constraints' mlock policy.
+     * Already-locked slots keep their lock; unlocked slots still work
+     * correctly, just eligible for swap under real memory pressure. */
+    int mlock_disabled, mlock_warned;
+
+    uint64_t hits, misses;
+    int verbose;                 /* --verbose-cache */
+} ExpertGpuStore;
+
+/* Doubly-linked-list splice: detach slot `idx` from wherever it sits in the
+ * LRU list. Safe to call on an already-detached node only if lru_head/tail
+ * are updated consistently by the caller -- every call site below always
+ * re-attaches immediately via push_head, so the list is never left with a
+ * dangling member. */
+static void expert_cache_lru_unlink(ExpertGpuStore *st, int idx) {
+    ExpertCacheSlot *sl = &st->slots[idx];
+    if (sl->lru_prev >= 0) st->slots[sl->lru_prev].lru_next = sl->lru_next;
+    else st->lru_head = sl->lru_next;
+    if (sl->lru_next >= 0) st->slots[sl->lru_next].lru_prev = sl->lru_prev;
+    else st->lru_tail = sl->lru_prev;
+    sl->lru_prev = sl->lru_next = -1;
+}
+
+static void expert_cache_lru_push_head(ExpertGpuStore *st, int idx) {
+    ExpertCacheSlot *sl = &st->slots[idx];
+    sl->lru_prev = -1;
+    sl->lru_next = st->lru_head;
+    if (st->lru_head >= 0) st->slots[st->lru_head].lru_prev = idx;
+    st->lru_head = idx;
+    if (st->lru_tail < 0) st->lru_tail = idx;
+}
+
+/* Picks a slot to (re)use for a cache miss: the true LRU tail, unless it (or
+ * slots ahead of it) are still in-flight (safe_gen > gen_completed), in
+ * which case walks toward the head looking for one that's safe. Bounded to
+ * n_slots steps -- never loops forever -- and falls back to the tail slot
+ * outright if every slot in the list is (implausibly) unsafe, which is
+ * always correct under Task 10's synchronous design (see the ExpertGpuStore
+ * comment above): Gate 4's "first mlock/eviction failure must not hang or
+ * crash" concern is satisfied by this bound plus expert_slot_mlock_once's
+ * own degrade-not-abort policy below. */
+static int expert_cache_evict_or_get_free(ExpertGpuStore *st) {
+    int idx = st->lru_tail;
+    for (int steps = 0; steps < st->n_slots && idx >= 0; steps++) {
+        ExpertCacheSlot *sl = &st->slots[idx];
+        if (sl->layer < 0 || sl->safe_gen <= st->gen_completed) return idx;
+        idx = sl->lru_prev;
+    }
+    return st->lru_tail;
+}
+
+/* Per-slot mlock, exactly once over that slot's lifetime (subsequent
+ * reinstalls into the same physical slot for a different expert don't need
+ * to re-lock -- the VA range is already pinned). On failure: warn ONCE,
+ * disable further mlock attempts (the cache keeps working correctly
+ * without pinning, just loses the "stays resident under memory pressure"
+ * guarantee for slots locked after the failure) -- never abort. This is
+ * also the answer to Gate 4's "what if the very first mlock ever attempted
+ * fails": mlock_warned/mlock_disabled start at 0, the first failure sets
+ * both and returns, the slot is simply left unmlocked and the cache
+ * continues -- no loop, no crash. */
+static void expert_slot_mlock_once(ExpertGpuStore *st, ExpertCacheSlot *sl, void *slab_base) {
+    if (sl->mlocked || st->mlock_disabled) return;
+    void *region = (uint8_t *)slab_base + sl->base_off;
+    if (mlock(region, st->slot_bytes) != 0) {
+        if (!st->mlock_warned) {
+            fprintf(stderr,
+                    "sepia: metal: expert-cache: mlock failed (%s) -- degrading: "
+                    "further slots will not be pinned (already-pinned slots keep their lock); "
+                    "the cache remains correct, just swappable under memory pressure\n",
+                    strerror(errno));
+            st->mlock_warned = 1;
+        }
+        st->mlock_disabled = 1;
+        return;
+    }
+    sl->mlocked = 1;
+}
+
+/* Allocates slab(s) sized to fit budget_bytes (capped at the distinct
+ * (layer,expert) pair count -- more slots than that can ever be used is
+ * wasted GPU memory) and builds the free/LRU list + lookup table. idx's
+ * OWN pointer (not stored) is only read for its VALUE fields here --
+ * expert_cache_get (below, after pread_exact) takes idx/part_fds as
+ * explicit per-call arguments from the caller's stable RealModel*, the
+ * same rebind-per-call discipline RealExperts documents above, since
+ * real_load's own `m.idx`/`m.part_fds` addresses do not survive its
+ * return-by-value. */
+static void expert_store_init(ExpertGpuStore *st, const ExpertIndex *idx, size_t budget_bytes, int verbose) {
+    memset(st, 0, sizeof(*st));
+    st->verbose = verbose;
+    st->n_layers_alloc = idx->n_layers_alloc;
+    st->n_experts = idx->n_experts;
+
+    if (st->n_layers_alloc <= 0 || st->n_experts <= 0) {
+        fprintf(stderr, "sepia: metal: expert-cache: no MoE layers in the index -- cache disabled\n");
+        return;
+    }
+
+    size_t page = (size_t)getpagesize();
+    size_t max_slab = (size_t)idx->max_slab_bytes;
+    if (max_slab == 0) max_slab = 1;
+    st->region_bytes = (max_slab + page - 1) / page * page;
+    st->slot_bytes = st->region_bytes * 3;
+
+    st->slots_per_slab = (int)(SEPIA_EXPERT_SLAB_BYTES / st->slot_bytes);
+    if (st->slots_per_slab < 1) st->slots_per_slab = 1;
+
+    int64_t total_pairs = (int64_t)st->n_layers_alloc * (int64_t)st->n_experts;
+    int64_t want_slots = (int64_t)(budget_bytes / st->slot_bytes);
+    if (want_slots > total_pairs) want_slots = total_pairs;
+    if (want_slots < 1) want_slots = 1;
+    st->n_slots = (int)want_slots;
+
+    st->n_slabs = (st->n_slots + st->slots_per_slab - 1) / st->slots_per_slab;
+    if (st->n_slabs < 1) st->n_slabs = 1;
+
+    st->slabs = xcalloc((size_t)st->n_slabs, sizeof(SepiaGpuBuf *));
+    for (int i = 0; i < st->n_slabs; i++) {
+        int slots_this_slab = (i == st->n_slabs - 1) ? st->n_slots - i * st->slots_per_slab : st->slots_per_slab;
+        size_t this_slab_bytes = (size_t)slots_this_slab * st->slot_bytes;
+        st->slabs[i] = sepia_gpu_alloc(this_slab_bytes, /*gpu_private=*/0);
+        if (!st->slabs[i])
+            die("metal: expert-cache: failed to allocate slab %d/%d (%.2f GB)",
+                i, st->n_slabs, (double)this_slab_bytes / 1e9);
+    }
+
+    st->slots = xcalloc((size_t)st->n_slots, sizeof(ExpertCacheSlot));
+    for (int i = 0; i < st->n_slots; i++) {
+        ExpertCacheSlot *sl = &st->slots[i];
+        sl->layer = -1;
+        sl->expert = -1;
+        sl->slab_idx = i / st->slots_per_slab;
+        sl->base_off = (size_t)(i % st->slots_per_slab) * st->slot_bytes;
+        sl->lru_prev = i - 1;
+        sl->lru_next = (i == st->n_slots - 1) ? -1 : i + 1;
+    }
+    st->lru_head = 0;
+    st->lru_tail = st->n_slots - 1;
+
+    size_t table_n = (size_t)st->n_layers_alloc * (size_t)st->n_experts;
+    st->table = xmalloc(sizeof(int) * table_n);
+    for (size_t i = 0; i < table_n; i++) st->table[i] = -1;
+
+    fprintf(stderr,
+            "sepia: metal: expert-cache: %d slots across %d slab(s) (%.2f MB/slot) -- "
+            "%.2f GB budget covers %.1f%% of %lld distinct (layer,expert) pairs\n",
+            st->n_slots, st->n_slabs, (double)st->slot_bytes / 1e6, (double)budget_bytes / 1e9,
+            100.0 * (double)st->n_slots / (double)total_pairs, (long long)total_pairs);
+}
+
+static void expert_store_shutdown(ExpertGpuStore *st) {
+    if (st->slabs) {
+        for (int i = 0; i < st->n_slabs; i++) sepia_gpu_free(st->slabs[i]);
+        free(st->slabs);
+    }
+    free(st->slots);
+    free(st->table);
+    memset(st, 0, sizeof(*st));
+}
+
 typedef struct {
     Config cfg;
     Tokenizer *tok;
@@ -2229,6 +2457,13 @@ typedef struct {
      * matvec_q). */
     RealLayerGpu *gpu_layers; /* [num_hidden_layers] */
     GpuQTensor gpu_unembed;
+
+    /* Task 10: the GPU-resident LRU expert cache (embedded by value, safe
+     * across real_load's return-by-value the same way real_exps is --
+     * ExpertGpuStore's own pointer fields are all stable heap allocations,
+     * never back-pointers into `m` itself). Zeroed (all-miss, empty) until
+     * expert_store_init runs inside real_load's existing GPU-init block. */
+    ExpertGpuStore expert_store;
 } RealModel;
 
 /* Computes the byte offset of a resident-buffer pointer (already validated
@@ -2355,7 +2590,8 @@ static void real_gpu_layer_build(RealModel *m, int layer) {
 /* --------------------------------- real_load --------------------------------- */
 
 static RealModel real_load(const char *config_path, const char *manifest_path,
-                            const char *index_path, const char *tokenizer_path) {
+                            const char *index_path, const char *tokenizer_path,
+                            size_t expert_cache_budget_bytes, int verbose_cache) {
     RealModel m = {0};
     m.cfg = config_load(config_path);
     m.tok = tokenizer_load(tokenizer_path);
@@ -2541,6 +2777,13 @@ static RealModel real_load(const char *config_path, const char *manifest_path,
         for (int i = 0; i < cfg->num_hidden_layers; i++) real_gpu_layer_build(&m, i);
         m.gpu_unembed = gpu_qtensor_off(&m, &m.unembed, "output.weight");
         fprintf(stderr, "sepia: metal: real-model GPU offset table built (%d layers)\n", cfg->num_hidden_layers);
+
+        /* Task 10: the routed-expert GPU cache. m.idx's pointer members
+         * (by_layer etc.) are stable heap allocations independent of how
+         * many times the enclosing RealModel gets copied, so reading VALUE
+         * fields off &m.idx here (never storing that address itself) is
+         * safe despite real_load's own return-by-value. */
+        expert_store_init(&m.expert_store, &m.idx, expert_cache_budget_bytes, verbose_cache);
     }
 
     return m;
@@ -2703,6 +2946,67 @@ static void real_expert_ffn(const struct RealExperts *re, int expert_idx, const 
     qlinear(&down_qt, re->h_buf, expert_out, re->row_scratch);
 }
 
+/* Task 10: (layer,expert) -> resident GPU slot, installing on a miss.
+ * Pure CPU/IO work (same F_NOCACHE fds/index sidecar real_expert_ffn reads
+ * above) -- callers must not have a GPU batch open when calling this (the
+ * real-model GPU path always resolves every selected expert's slot in the
+ * gap between a sync and the next sepia_gpu_begin(), matching real_expert_
+ * ffn's own call site conventions). `idx`/`part_fds` are explicit
+ * parameters (not stored on `st`) for the same return-by-value safety
+ * reason RealExperts documents: the caller always passes its own stable
+ * RealModel's &m->idx/m->part_fds. */
+static ExpertCacheSlot *expert_cache_get(ExpertGpuStore *st, const ExpertIndex *idx, const int *part_fds,
+                                          int layer, int expert) {
+    if (layer < 0 || layer >= st->n_layers_alloc || expert < 0 || expert >= st->n_experts)
+        die("metal: expert-cache: (layer=%d,expert=%d) out of range", layer, expert);
+    const MoeLayerIndex *mli = &idx->by_layer[layer];
+    if (!mli->gate) die("metal: expert-cache: layer %d has no expert index entry", layer);
+
+    int table_idx = layer * st->n_experts + expert;
+    int slot_idx = st->table[table_idx];
+    if (slot_idx >= 0) {
+        st->hits++;
+        expert_cache_lru_unlink(st, slot_idx);
+        expert_cache_lru_push_head(st, slot_idx);
+        return &st->slots[slot_idx];
+    }
+    st->misses++;
+
+    int new_idx = expert_cache_evict_or_get_free(st);
+    ExpertCacheSlot *sl = &st->slots[new_idx];
+    if (sl->layer >= 0) st->table[sl->layer * st->n_experts + sl->expert] = -1;
+
+    const ExpertSlot *ge = &mli->gate[expert];
+    const ExpertSlot *ue = &mli->up[expert];
+    const ExpertSlot *de = &mli->down[expert];
+
+    void *slab_base = sepia_gpu_host_ptr(st->slabs[sl->slab_idx]);
+    uint8_t *gate_dst = (uint8_t *)slab_base + sl->base_off;
+    uint8_t *up_dst   = (uint8_t *)slab_base + sl->base_off + st->region_bytes;
+    uint8_t *down_dst = (uint8_t *)slab_base + sl->base_off + 2 * st->region_bytes;
+
+    pread_exact(part_fds[ge->part_idx], gate_dst, (size_t)ge->nbytes, ge->abs_offset, "expert gate slab (gpu cache)");
+    pread_exact(part_fds[ue->part_idx], up_dst,   (size_t)ue->nbytes, ue->abs_offset, "expert up slab (gpu cache)");
+    pread_exact(part_fds[de->part_idx], down_dst, (size_t)de->nbytes, de->abs_offset, "expert down slab (gpu cache)");
+
+    sl->ggml_type_gate = ge->ggml_type;
+    sl->ggml_type_up   = ue->ggml_type;
+    sl->ggml_type_down = de->ggml_type;
+    sl->layer = layer;
+    sl->expert = expert;
+    /* This slot's first GPU read is encoded in the batch the caller opens
+     * right after this function returns -- that batch completes under
+     * generation gen_completed+1, so it isn't safe to evict until then. */
+    sl->safe_gen = st->gen_completed + 1;
+
+    expert_slot_mlock_once(st, sl, slab_base);
+
+    st->table[table_idx] = new_idx;
+    expert_cache_lru_unlink(st, new_idx);
+    expert_cache_lru_push_head(st, new_idx);
+    return sl;
+}
+
 /* Cache sized directly from Config (real mode has no permanent LayerWeights
  * array to read kv_dim off of -- LayerWeights is transient/rebuilt every
  * layer/call by real_fill_layer). Mirrors cache_create's per-layer kv_dim
@@ -2832,6 +3136,19 @@ static SepiaGpuBuf *real_gpu_row_in(SepiaGpuBuf *multi, int64_t t, int64_t dim, 
 static void real_gpu_row_out(SepiaGpuBuf *srcrow, SepiaGpuBuf *multi, int64_t t, int64_t dim) {
     if (!sepia_gpu_copy(srcrow, 0, multi, (size_t)(t * dim) * sizeof(float), dim))
         die("metal: real: row-out copy dispatch failed");
+}
+
+/* Task 10: every real-model-path sepia_gpu_end() goes through this wrapper
+ * instead of calling it directly, so the expert cache's in-flight
+ * generation counter (m->expert_store.gen_completed) advances at exactly
+ * the ds4-anchored point the design calls for ("incremented at
+ * sepia_gpu_end()") -- see expert_cache_evict_or_get_free's header comment
+ * for what this buys (defensive groundwork for Task 11, inert today under
+ * the synchronous per-call design). */
+static int real_gpu_end(RealModel *m) {
+    int ok = sepia_gpu_end();
+    if (ok) m->expert_store.gen_completed++;
+    return ok;
 }
 
 /* Dispatches sepia_gpu_matvec_q for token row t of a [T,in_dim] input,
@@ -2980,7 +3297,7 @@ static void real_attn_forward_chunk_gpu(RealModel *m, const RealLayerGpu *g, con
 
     /* ---- SYNC (attention's one sync per layer): tau precision fix. ---- */
     int have_log_scaling = (!is_sliding) && cfg->has_log_scaling_floor;
-    if (!sepia_gpu_end()) die("metal: real: attention tau-sync failed");
+    if (!real_gpu_end(m)) die("metal: real: attention tau-sync failed");
     {
         float *qp = (float *)sepia_gpu_host_ptr(q_normed);
         for (int t = 0; t < T; t++) {
@@ -3143,10 +3460,9 @@ static void real_mlp_moe_forward_gpu(RealModel *m, const RealLayerGpu *g, const 
             die("metal: real: shared[%d] down matvec_q dispatch failed", s);
     }
 
-    /* ---- SYNC: router logits + shared raw outputs + the normed activation
-     * (real_expert_ffn's `x`), all readable off this ONE batch's
-     * completion. ---- */
-    if (!sepia_gpu_end()) die("metal: real: MoE router/shared readback sync failed");
+    /* ---- SYNC #1: router logits + shared raw outputs readable off this
+     * batch's completion. ---- */
+    if (!real_gpu_end(m)) die("metal: real: MoE router/shared readback sync failed");
 
     const float *router_logits = (const float *)sepia_gpu_host_ptr(router_logits_buf);
     LayerWeights fake_lw = {0}; /* moe_route_select only reads router_bias/router_global_scale */
@@ -3157,28 +3473,57 @@ static void real_mlp_moe_forward_gpu(RealModel *m, const RealLayerGpu *g, const 
     float *weights = xmalloc(sizeof(float) * (size_t)n_sel);
     moe_route_select(cfg, &fake_lw, router_logits, topk_idx, weights);
 
-    m->real_exps.idx = &m->idx;
-    m->real_exps.part_fds = m->part_fds;
-    m->real_exps.cur_layer = layer;
-    const float *x_host_row = (const float *)sepia_gpu_host_ptr(xt);
+    /* Task 10: routed experts now stream through the GPU-resident LRU cache
+     * (m->expert_store) instead of real_expert_ffn's per-call CPU
+     * pread+qlinear -- real_expert_ffn itself is unchanged and still serves
+     * CPU real mode. Resolve every selected expert's slot (installing on a
+     * miss) BEFORE opening a new batch: pread/mlock/evict is pure CPU/IO
+     * work that must not straddle an open encoder. */
+    if (topk > SEPIA_MOE_MAX_TOPK)
+        die("metal: real: num_experts_per_tok=%d exceeds the GPU expert-cache dispatch's compiled bound (%d)",
+            topk, SEPIA_MOE_MAX_TOPK);
+    ExpertCacheSlot *cslot[SEPIA_MOE_MAX_TOPK];
+    for (int j = 0; j < topk; j++)
+        cslot[j] = expert_cache_get(&m->expert_store, &m->idx, m->part_fds, layer, topk_idx[j]);
+
+    if (!sepia_gpu_begin()) die("metal: real: failed to open the routed-expert dispatch batch");
+    SepiaGpuBuf *routed_raw[SEPIA_MOE_MAX_TOPK];
+    for (int j = 0; j < topk; j++) {
+        const ExpertCacheSlot *sl = cslot[j];
+        SepiaGpuBuf *slab = m->expert_store.slabs[sl->slab_idx];
+        size_t off_gate = sl->base_off;
+        size_t off_up   = sl->base_off + m->expert_store.region_bytes;
+        size_t off_down = sl->base_off + 2 * m->expert_store.region_bytes;
+
+        if (!sepia_gpu_matvec_q(sl->ggml_type_gate, slab, off_gate, xt, gbuf, moe_inter, hidden))
+            die("metal: real: routed[%d] gate matvec_q dispatch failed", j);
+        if (!sepia_gpu_matvec_q(sl->ggml_type_up, slab, off_up, xt, ubuf, moe_inter, hidden))
+            die("metal: real: routed[%d] up matvec_q dispatch failed", j);
+        if (!sepia_gpu_silu_mul(gbuf, ubuf, hbuf, moe_inter))
+            die("metal: real: routed[%d] silu_mul dispatch failed", j);
+        routed_raw[j] = real_gpu_scratch((size_t)hidden);
+        if (!sepia_gpu_matvec_q(sl->ggml_type_down, slab, off_down, hbuf, routed_raw[j], hidden, moe_inter))
+            die("metal: real: routed[%d] down matvec_q dispatch failed", j);
+    }
+    /* ---- SYNC #2: routed-expert down-projections readable off this
+     * batch's completion. ---- */
+    if (!real_gpu_end(m)) die("metal: real: routed-expert readback sync failed");
 
     for (int d = 0; d < hidden; d++) out_row[d] = 0.0f;
-    float *expert_out = xmalloc(sizeof(float) * (size_t)hidden);
     for (int j = 0; j < topk; j++) {
-        int e = topk_idx[j];
-        real_expert_ffn(&m->real_exps, e, x_host_row, expert_out);
+        const float *eraw = (const float *)sepia_gpu_host_ptr(routed_raw[j]);
         float wj = weights[j];
-        for (int d = 0; d < hidden; d++) out_row[d] += expert_out[d] * wj;
+        for (int d = 0; d < hidden; d++) out_row[d] += eraw[d] * wj;
     }
     for (int s = 0; s < n_shared; s++) {
         const float *sraw = (const float *)sepia_gpu_host_ptr(shared_raw[s]);
         float gamma = weights[topk + s];
         for (int d = 0; d < hidden; d++) out_row[d] += sraw[d] * gamma;
     }
-    free(expert_out);
     free(topk_idx);
     free(weights);
 
+    for (int j = 0; j < topk; j++) sepia_gpu_free(routed_raw[j]);
     for (int s = 0; s < n_shared; s++) sepia_gpu_free(shared_raw[s]);
     free(shared_raw);
     sepia_gpu_free(router_logits_buf);
@@ -3279,7 +3624,7 @@ static void real_forward_chunk_gpu(RealModel *m, GpuCache *gcache, const int *to
     if (!sepia_gpu_begin()) die("metal: real: failed to open the forward-chunk batch");
     for (int l = 0; l < cfg->num_hidden_layers; l++)
         real_decoder_layer_forward_gpu(m, l, cfg, &gcache->layers[l], x, T, start_pos);
-    if (!sepia_gpu_end()) die("metal: real: final residual-stream readback sync failed");
+    if (!real_gpu_end(m)) die("metal: real: final residual-stream readback sync failed");
 
     const float *x_final = (const float *)sepia_gpu_host_ptr(x);
     float *normed = xmalloc(sizeof(float) * (size_t)T * (size_t)hidden);
@@ -3310,7 +3655,7 @@ static void real_forward_chunk_gpu(RealModel *m, GpuCache *gcache, const int *to
         if (!sepia_gpu_begin()) die("metal: real: failed to open the logits batch");
         for (int t = 0; t < T; t++)
             real_gpu_matvec_q_row(gres, &unembed_unpadded, hbuf, t, logits_buf, hrow, yrow, "logits");
-        if (!sepia_gpu_end()) die("metal: real: logits readback sync failed");
+        if (!real_gpu_end(m)) die("metal: real: logits readback sync failed");
         memcpy(logits_out, sepia_gpu_host_ptr(logits_buf), sizeof(float) * (size_t)T * (size_t)unpadded);
 
         sepia_gpu_free(hbuf);
@@ -3412,6 +3757,25 @@ static void real_print_top_logits(RealModel *m, const char *prompt) {
     cache_free(cache);
 }
 
+/* --verbose-cache: prints this step's hit/miss delta plus the running
+ * total, then folds the delta into (*prev_hits, *prev_misses) so the NEXT
+ * call reports a fresh delta. A no-op when the store wasn't built verbose
+ * (--metal --real without --verbose-cache, or CPU real mode). */
+static void expert_cache_report_step(const ExpertGpuStore *st, const char *label,
+                                      uint64_t *prev_hits, uint64_t *prev_misses) {
+    if (!st->verbose) return;
+    uint64_t dh = st->hits - *prev_hits, dm = st->misses - *prev_misses;
+    uint64_t dt = dh + dm;
+    uint64_t th = st->hits, tm = st->misses, tt = th + tm;
+    fprintf(stderr,
+            "sepia: metal: expert-cache: %s hits=%llu misses=%llu (%.1f%% hit) "
+            "-- total hits=%llu misses=%llu (%.1f%% hit)\n",
+            label, (unsigned long long)dh, (unsigned long long)dm, dt ? 100.0 * (double)dh / (double)dt : 0.0,
+            (unsigned long long)th, (unsigned long long)tm, tt ? 100.0 * (double)th / (double)tt : 0.0);
+    *prev_hits = st->hits;
+    *prev_misses = st->misses;
+}
+
 /* --metal --real twins of real_generate/real_print_top_logits, identical in
  * every way except the cache type and the forward-chunk call -- see
  * real_forward_chunk_gpu's header doc for what's actually different under
@@ -3428,6 +3792,12 @@ static void real_generate_gpu(RealModel *m, const char *prompt, int n_gen) {
 
     GpuCache *cache = gpu_cache_create_cfg(cfg, n_prompt + n_gen + 8);
 
+    /* Snapshot the store's CUMULATIVE counts before this call -- on a warm
+     * repeat (same process, m->expert_store already populated from a prior
+     * real_generate_gpu call), this makes the first reported delta reflect
+     * only what THIS call does, not everything accumulated before it. */
+    uint64_t prev_hits = m->expert_store.hits, prev_misses = m->expert_store.misses;
+
     float *logits = xmalloc(sizeof(float) * (size_t)n_prompt * (size_t)unpadded);
     struct timespec t0, t1;
     clock_gettime(CLOCK_MONOTONIC, &t0);
@@ -3435,6 +3805,8 @@ static void real_generate_gpu(RealModel *m, const char *prompt, int n_gen) {
     clock_gettime(CLOCK_MONOTONIC, &t1);
     double ms = elapsed_ms(t0, t1);
     free(ids32);
+
+    expert_cache_report_step(&m->expert_store, "prefill", &prev_hits, &prev_misses);
 
     float *cur = xmalloc(sizeof(float) * (size_t)unpadded);
     memcpy(cur, logits + (size_t)(n_prompt - 1) * unpadded, sizeof(float) * (size_t)unpadded);
@@ -3454,6 +3826,9 @@ static void real_generate_gpu(RealModel *m, const char *prompt, int n_gen) {
         real_forward_chunk_gpu(m, cache, &next_id, 1, pos, cur);
         clock_gettime(CLOCK_MONOTONIC, &t1);
         ms = elapsed_ms(t0, t1);
+        char label[32];
+        snprintf(label, sizeof label, "token %d", i + 1);
+        expert_cache_report_step(&m->expert_store, label, &prev_hits, &prev_misses);
         pos++;
     }
     gpu_cache_free(cache);
@@ -3489,6 +3864,9 @@ static void real_print_top_logits_gpu(RealModel *m, const char *prompt) {
     }
     printf("top-10 first-token logits for a %d-token prompt:\n", n_prompt);
     for (int k = 0; k < 10; k++) printf("  [%d] id=%d logit=%.6f\n", k, idx[k], (double)val[k]);
+
+    uint64_t prev_hits = 0, prev_misses = 0;
+    expert_cache_report_step(&m->expert_store, "logits-only prompt", &prev_hits, &prev_misses);
 
     free(logits);
     free(ids32);
@@ -5257,6 +5635,14 @@ int main(int argc, char **argv) {
     int do_gpu_quants = 0, do_gpu_compare_attn = 0;
     char **gpu_quants_paths = NULL;
     int gpu_quants_n = 0;
+    /* Task 10: default sized well under the ~110GB locked+resident ceiling
+     * (Global Constraints) alongside the 14.23GB resident.bin wrap + KV
+     * cache/scratch (a few hundred MB) -- see the expert_store_init log
+     * line and docs/superpowers/sdd/task-10-report.md for the arithmetic.
+     * --expert-cache-gb overrides for local experimentation. */
+    double expert_cache_gb = 64.0;
+    int verbose_cache = 0;
+    int n_repeat = 1;
 
     for (int i = 1; i < argc; i++) {
         if (strcmp(argv[i], "--dump-acts") == 0 && i + 1 < argc) {
@@ -5281,6 +5667,12 @@ int main(int argc, char **argv) {
             do_gpu_compare_tiny = 1;
         } else if (strcmp(argv[i], "--gpu-compare-attn") == 0) {
             do_gpu_compare_attn = 1;
+        } else if (strcmp(argv[i], "--expert-cache-gb") == 0 && i + 1 < argc) {
+            expert_cache_gb = atof(argv[++i]);
+        } else if (strcmp(argv[i], "--verbose-cache") == 0) {
+            verbose_cache = 1;
+        } else if (strcmp(argv[i], "--repeat") == 0 && i + 1 < argc) {
+            n_repeat = atoi(argv[++i]);
         } else if (strcmp(argv[i], "--gpu-quants") == 0) {
             do_gpu_quants = 1;
             gpu_quants_paths = &argv[i + 1];
@@ -5291,6 +5683,7 @@ int main(int argc, char **argv) {
                 "usage: %s [--dump-acts FILE] [--metal]\n"
                 "       %s --smoke DIR\n"
                 "       %s --real [--prompt TEXT] [--n-gen N] [--mlock] [--logits-only] [--metal]\n"
+                "          [--expert-cache-gb N] [--verbose-cache]\n"
                 "       %s --metal --gpu-selftest\n"
                 "       %s --metal --gpu-compare-tiny\n"
                 "       %s --metal --gpu-compare-attn\n"
@@ -5318,7 +5711,12 @@ int main(int argc, char **argv) {
                 "edge case; requires --metal, local-only (needs a Metal GPU).\n"
                 "--gpu-quants runs each SQFX fixture's dequant kernel bitwise against its expected f32\n"
                 "payload, plus a tolerance-checked matvec vs CPU qlinear; requires --metal, local-only\n"
-                "(needs a Metal GPU).\n",
+                "(needs a Metal GPU).\n"
+                "--expert-cache-gb N (--metal --real only) sizes the GPU-resident, per-slot-mlocked,\n"
+                "LRU-evicted routed-expert cache (Task 10); default 64 GB. --verbose-cache prints\n"
+                "per-step cache hit/miss counts. --repeat N (--real only) repeats generation N times\n"
+                "in the SAME process (same RealModel/expert cache) -- run 1 is cold, runs 2+ are warm;\n"
+                "also proves double-run determinism when the token sequence matches across runs.\n",
                 argv[0], argv[0], argv[0], argv[0], argv[0], argv[0], argv[0]);
             return 2;
         }
@@ -5363,9 +5761,12 @@ int main(int argc, char **argv) {
         const char *index_path = env_or("SEPIA_REAL_INDEX_PATH", "weights/inkling-ud-q2_k_xl.sepia-index.json");
         const char *tokenizer_path = env_or("SEPIA_REAL_TOKENIZER_PATH", "weights/tokenizer.bin");
 
+        size_t expert_cache_budget_bytes = (size_t)(expert_cache_gb * 1e9);
+
         struct timespec t0, t1;
         clock_gettime(CLOCK_MONOTONIC, &t0);
-        RealModel rm = real_load(real_config_path, manifest_path, index_path, tokenizer_path);
+        RealModel rm = real_load(real_config_path, manifest_path, index_path, tokenizer_path,
+                                  expert_cache_budget_bytes, verbose_cache);
         clock_gettime(CLOCK_MONOTONIC, &t1);
         fprintf(stderr, "real: loaded in %.2fs (resident.bin %.2f GB mmap'd, %d GGUF part(s) open)\n",
                 elapsed_ms(t0, t1) / 1000.0, (double)rm.res_size / 1e9, rm.idx.n_parts);
@@ -5384,11 +5785,23 @@ int main(int argc, char **argv) {
         if (logits_only) {
             if (do_metal) real_print_top_logits_gpu(&rm, prompt);
             else real_print_top_logits(&rm, prompt);
+            if (do_metal) expert_store_shutdown(&rm.expert_store);
             return 0;
         }
 
-        if (do_metal) real_generate_gpu(&rm, prompt, n_gen);
-        else real_generate(&rm, prompt, n_gen);
+        if (n_repeat < 1) n_repeat = 1;
+        for (int r = 0; r < n_repeat; r++) {
+            if (n_repeat > 1)
+                fprintf(stderr, "sepia: real: === run %d/%d (%s) ===\n", r + 1, n_repeat, r == 0 ? "cold" : "warm");
+            struct timespec r0, r1;
+            clock_gettime(CLOCK_MONOTONIC, &r0);
+            if (do_metal) real_generate_gpu(&rm, prompt, n_gen);
+            else real_generate(&rm, prompt, n_gen);
+            clock_gettime(CLOCK_MONOTONIC, &r1);
+            if (n_repeat > 1)
+                fprintf(stderr, "sepia: real: === run %d/%d wall %.2fs ===\n", r + 1, n_repeat, elapsed_ms(r0, r1) / 1000.0);
+        }
+        if (do_metal) expert_store_shutdown(&rm.expert_store);
         return 0;
     }
 
