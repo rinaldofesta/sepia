@@ -224,3 +224,80 @@ kernel void sepia_sconv_f32(
     }
     out[t * C + c] = in[t * C + c] + acc;
 }
+
+// ---------------------------------------------------------------------------
+// sepia_copy_f32: out[i] = in[i], plain elementwise copy. Both operands are
+// bound with independent byte offsets by the host (setBuffer:offset:), so
+// the kernel body itself is offset-agnostic -- Task 9's real-model graph
+// uses this to (a) materialize a single token row of a multi-row buffer as
+// an offset-0 operand for matvec/matvec_q, and (b) move a layer's freshly
+// computed K/V rows into a persistent KV-cache buffer at the right position,
+// both without a host round trip.
+kernel void sepia_copy_f32(
+        device const float *in  [[buffer(0)]],
+        device       float *out [[buffer(1)]],
+        uint i [[thread_position_in_grid]]) {
+    out[i] = in[i];
+}
+
+// ---------------------------------------------------------------------------
+// sepia_scale_f32: y[i] = x[i] * scale -- elementwise scalar multiply (the
+// dense-MLP per-layer global_scale, sec.9; the scalar is always known before
+// any router readback, so this stays fully GPU-side with no host sync).
+struct sepia_args_scale {
+    float scale;
+};
+
+kernel void sepia_scale_f32(
+        constant sepia_args_scale &args [[buffer(0)]],
+        device const float *x   [[buffer(1)]],
+        device       float *y   [[buffer(2)]],
+        uint i [[thread_position_in_grid]]) {
+    y[i] = x[i] * args.scale;
+}
+
+// ---------------------------------------------------------------------------
+// sepia_sconv_hist_roll_f32: GPU-side replacement for Task 8's host-side
+// sconv history roll (design choice (b) -- see src/sepia_gpu.h's header
+// doc), reproducing sconv_apply's own tail update (src/sepia.c) exactly:
+//   T >= Km1: new hist = last Km1 rows of `in`
+//   T <  Km1: new hist = shift-keep old hist rows [T,Km1) ++ append all of `in`
+// One thread per channel c; every thread reads whichever OLD hist values it
+// still needs into registers (the `keep` array) BEFORE writing any new hist
+// value at that channel -- since each thread only ever touches its own
+// column c (both the read and the write), there is no cross-thread race and
+// no same-thread hazard (all reads happen-before all writes, in program
+// order). Pure data movement, no floating-point operation -- needs no
+// tolerance gate, only a bitwise/structural one.
+#define SEPIA_SCONV_MAX_KM1 15
+
+struct sepia_args_sconv_hist {
+    int32_t C;
+    int32_t Km1; // K-1
+    int32_t T;
+};
+
+kernel void sepia_sconv_hist_roll_f32(
+        constant sepia_args_sconv_hist &args [[buffer(0)]],
+        device       float *hist [[buffer(1)]], // [Km1, C], in/out
+        device const float *in   [[buffer(2)]], // [T, C]
+        uint c [[thread_position_in_grid]]) {
+    const int32_t C = args.C, Km1 = args.Km1, T = args.T;
+    if ((int32_t)c >= C || Km1 <= 0) return;
+
+    float keep[SEPIA_SCONV_MAX_KM1];
+    const int32_t keep_n = (T >= Km1) ? 0 : (Km1 - T);
+    for (int32_t j = 0; j < keep_n; j++) keep[j] = hist[(int64_t)(T + j) * C + (int64_t)c];
+
+    for (int32_t j = 0; j < Km1; j++) {
+        float v;
+        if (T >= Km1) {
+            v = in[(int64_t)(T - Km1 + j) * C + (int64_t)c];
+        } else if (j < keep_n) {
+            v = keep[j];
+        } else {
+            v = in[(int64_t)(j - keep_n) * C + (int64_t)c];
+        }
+        hist[(int64_t)j * C + (int64_t)c] = v;
+    }
+}

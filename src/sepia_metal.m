@@ -864,6 +864,226 @@ int sepia_gpu_banded_attn(SepiaGpuBuf *q, SepiaGpuBuf *k, SepiaGpuBuf *v, SepiaG
     return 1;
 }
 
+/* ------------------------ real-model resident path (Task 9) --------------- */
+/* `_off` twins of the existing f32 ops: identical kernels, identical numerics,
+ * the WEIGHT operand is bound at a caller-supplied byte offset instead of
+ * always 0 -- see src/sepia_gpu.h's header doc. */
+
+int sepia_gpu_matvec_off(SepiaGpuBuf *w, size_t w_off, SepiaGpuBuf *x, SepiaGpuBuf *y, int64_t out_dim, int64_t in_dim) {
+    if (!w || !w->buffer || !x || !x->buffer || !y || !y->buffer || out_dim <= 0 || in_dim <= 0) {
+        fprintf(stderr, "sepia: metal: matvec_off: invalid arguments\n");
+        return 0;
+    }
+    @autoreleasepool {
+        id<MTLComputeCommandEncoder> enc = sepia_gpu_encoder();
+        if (!enc) {
+            fprintf(stderr, "sepia: metal: matvec_off: no active batch (call sepia_gpu_begin first)\n");
+            return 0;
+        }
+        id<MTLComputePipelineState> pso = sepia_gpu_pso(@"sepia_matvec_f32");
+        if (!pso) return 0;
+
+        sepia_args_matvec args = { (int32_t)in_dim, (uint64_t)(in_dim * (int64_t)sizeof(float)) };
+        [enc setComputePipelineState:pso];
+        [enc setBytes:&args length:sizeof(args) atIndex:0];
+        [enc setBuffer:w->buffer offset:w_off atIndex:1];
+        [enc setBuffer:x->buffer offset:0 atIndex:2];
+        [enc setBuffer:y->buffer offset:0 atIndex:3];
+        [enc setThreadgroupMemoryLength:32 * sizeof(float) atIndex:0];
+
+        NSUInteger tw = sepia_gpu_reduce_width(in_dim);
+        [enc dispatchThreadgroups:MTLSizeMake((NSUInteger)out_dim, 1, 1)
+             threadsPerThreadgroup:MTLSizeMake(tw, 1, 1)];
+    }
+    return 1;
+}
+
+int sepia_gpu_rmsnorm_off(SepiaGpuBuf *w, size_t w_off, SepiaGpuBuf *x, SepiaGpuBuf *y, int64_t rows, int64_t n, float eps) {
+    if (!w || !w->buffer || !x || !x->buffer || !y || !y->buffer || rows <= 0 || n <= 0) {
+        fprintf(stderr, "sepia: metal: rmsnorm_off: invalid arguments\n");
+        return 0;
+    }
+    @autoreleasepool {
+        id<MTLComputeCommandEncoder> enc = sepia_gpu_encoder();
+        if (!enc) {
+            fprintf(stderr, "sepia: metal: rmsnorm_off: no active batch (call sepia_gpu_begin first)\n");
+            return 0;
+        }
+        id<MTLComputePipelineState> pso = sepia_gpu_pso(@"sepia_rmsnorm_f32");
+        if (!pso) return 0;
+
+        sepia_args_rmsnorm args = { (int32_t)n, eps };
+        [enc setComputePipelineState:pso];
+        [enc setBytes:&args length:sizeof(args) atIndex:0];
+        [enc setBuffer:w->buffer offset:w_off atIndex:1];
+        [enc setBuffer:x->buffer offset:0 atIndex:2];
+        [enc setBuffer:y->buffer offset:0 atIndex:3];
+        [enc setThreadgroupMemoryLength:32 * sizeof(float) atIndex:0];
+
+        NSUInteger tw = sepia_gpu_reduce_width(n);
+        [enc dispatchThreadgroups:MTLSizeMake((NSUInteger)rows, 1, 1)
+             threadsPerThreadgroup:MTLSizeMake(tw, 1, 1)];
+    }
+    return 1;
+}
+
+int sepia_gpu_sconv_off(SepiaGpuBuf *w, size_t w_off, SepiaGpuBuf *hist, SepiaGpuBuf *in, SepiaGpuBuf *out,
+                         int64_t C, int64_t K, int64_t T) {
+    if (!w || !w->buffer || !hist || !hist->buffer || !in || !in->buffer || !out || !out->buffer ||
+        C <= 0 || K <= 0 || T <= 0) {
+        fprintf(stderr, "sepia: metal: sconv_off: invalid arguments\n");
+        return 0;
+    }
+    @autoreleasepool {
+        id<MTLComputeCommandEncoder> enc = sepia_gpu_encoder();
+        if (!enc) {
+            fprintf(stderr, "sepia: metal: sconv_off: no active batch (call sepia_gpu_begin first)\n");
+            return 0;
+        }
+        id<MTLComputePipelineState> pso = sepia_gpu_pso(@"sepia_sconv_f32");
+        if (!pso) return 0;
+
+        sepia_args_sconv args = { (int32_t)C, (int32_t)K, (int32_t)T };
+        [enc setComputePipelineState:pso];
+        [enc setBytes:&args length:sizeof(args) atIndex:0];
+        [enc setBuffer:w->buffer offset:w_off atIndex:1];
+        [enc setBuffer:hist->buffer offset:0 atIndex:2];
+        [enc setBuffer:in->buffer offset:0 atIndex:3];
+        [enc setBuffer:out->buffer offset:0 atIndex:4];
+
+        NSUInteger tgx = MIN((NSUInteger)C, (NSUInteger)32);
+        NSUInteger tgy = MIN((NSUInteger)T, (NSUInteger)32);
+        [enc dispatchThreads:MTLSizeMake((NSUInteger)C, (NSUInteger)T, 1)
+             threadsPerThreadgroup:MTLSizeMake(tgx, tgy, 1)];
+    }
+    return 1;
+}
+
+int sepia_gpu_rel_project_off(SepiaGpuBuf *r_vec, SepiaGpuBuf *rel_proj, size_t rel_proj_off, SepiaGpuBuf *rel_logits,
+                              int64_t T, int64_t H, int64_t d_rel, int64_t rel_extent) {
+    if (!r_vec || !r_vec->buffer || !rel_proj || !rel_proj->buffer || !rel_logits || !rel_logits->buffer ||
+        T <= 0 || H <= 0 || d_rel <= 0 || rel_extent <= 0) {
+        fprintf(stderr, "sepia: metal: rel_project_off: invalid arguments\n");
+        return 0;
+    }
+    @autoreleasepool {
+        id<MTLComputeCommandEncoder> enc = sepia_gpu_encoder();
+        if (!enc) {
+            fprintf(stderr, "sepia: metal: rel_project_off: no active batch (call sepia_gpu_begin first)\n");
+            return 0;
+        }
+        id<MTLComputePipelineState> pso = sepia_gpu_pso(@"sepia_rel_project_f32");
+        if (!pso) return 0;
+
+        sepia_args_rel_project args = { (int32_t)H, (int32_t)d_rel, (int32_t)rel_extent };
+        [enc setComputePipelineState:pso];
+        [enc setBytes:&args length:sizeof(args) atIndex:0];
+        [enc setBuffer:r_vec->buffer offset:0 atIndex:1];
+        [enc setBuffer:rel_proj->buffer offset:rel_proj_off atIndex:2];
+        [enc setBuffer:rel_logits->buffer offset:0 atIndex:3];
+
+        NSUInteger tw = sepia_gpu_reduce_width(rel_extent);
+        [enc dispatchThreadgroups:MTLSizeMake((NSUInteger)H, (NSUInteger)T, 1)
+             threadsPerThreadgroup:MTLSizeMake(tw, 1, 1)];
+    }
+    return 1;
+}
+
+int sepia_gpu_copy(SepiaGpuBuf *src, size_t src_off, SepiaGpuBuf *dst, size_t dst_off, int64_t n) {
+    if (!src || !src->buffer || !dst || !dst->buffer || n <= 0) {
+        fprintf(stderr, "sepia: metal: copy: invalid arguments\n");
+        return 0;
+    }
+    @autoreleasepool {
+        id<MTLComputeCommandEncoder> enc = sepia_gpu_encoder();
+        if (!enc) {
+            fprintf(stderr, "sepia: metal: copy: no active batch (call sepia_gpu_begin first)\n");
+            return 0;
+        }
+        id<MTLComputePipelineState> pso = sepia_gpu_pso(@"sepia_copy_f32");
+        if (!pso) return 0;
+
+        [enc setComputePipelineState:pso];
+        [enc setBuffer:src->buffer offset:src_off atIndex:0];
+        [enc setBuffer:dst->buffer offset:dst_off atIndex:1];
+
+        NSUInteger width = pso.threadExecutionWidth;
+        if (width > (NSUInteger)n) width = (NSUInteger)n;
+        [enc dispatchThreads:MTLSizeMake((NSUInteger)n, 1, 1)
+             threadsPerThreadgroup:MTLSizeMake(width, 1, 1)];
+    }
+    return 1;
+}
+
+int sepia_gpu_scale(float scale, SepiaGpuBuf *x, SepiaGpuBuf *y, int64_t n) {
+    if (!x || !x->buffer || !y || !y->buffer || n <= 0) {
+        fprintf(stderr, "sepia: metal: scale: invalid arguments\n");
+        return 0;
+    }
+    @autoreleasepool {
+        id<MTLComputeCommandEncoder> enc = sepia_gpu_encoder();
+        if (!enc) {
+            fprintf(stderr, "sepia: metal: scale: no active batch (call sepia_gpu_begin first)\n");
+            return 0;
+        }
+        id<MTLComputePipelineState> pso = sepia_gpu_pso(@"sepia_scale_f32");
+        if (!pso) return 0;
+
+        struct { float scale; } args = { scale };
+        [enc setComputePipelineState:pso];
+        [enc setBytes:&args length:sizeof(args) atIndex:0];
+        [enc setBuffer:x->buffer offset:0 atIndex:1];
+        [enc setBuffer:y->buffer offset:0 atIndex:2];
+
+        NSUInteger width = pso.threadExecutionWidth;
+        if (width > (NSUInteger)n) width = (NSUInteger)n;
+        [enc dispatchThreads:MTLSizeMake((NSUInteger)n, 1, 1)
+             threadsPerThreadgroup:MTLSizeMake(width, 1, 1)];
+    }
+    return 1;
+}
+
+typedef struct {
+    int32_t C;
+    int32_t Km1;
+    int32_t T;
+} sepia_args_sconv_hist;
+
+int sepia_gpu_sconv_hist_roll(SepiaGpuBuf *hist, SepiaGpuBuf *in, int64_t C, int64_t K, int64_t T) {
+    if (!hist || !hist->buffer || !in || !in->buffer || C <= 0 || K <= 0 || T <= 0) {
+        fprintf(stderr, "sepia: metal: sconv_hist_roll: invalid arguments\n");
+        return 0;
+    }
+    int64_t Km1 = K - 1;
+    if (Km1 > 15) {
+        fprintf(stderr, "sepia: metal: sconv_hist_roll: K-1=%lld exceeds SEPIA_SCONV_MAX_KM1 (15)\n",
+                (long long)Km1);
+        return 0;
+    }
+    if (Km1 == 0) return 1; /* nothing to roll */
+    @autoreleasepool {
+        id<MTLComputeCommandEncoder> enc = sepia_gpu_encoder();
+        if (!enc) {
+            fprintf(stderr, "sepia: metal: sconv_hist_roll: no active batch (call sepia_gpu_begin first)\n");
+            return 0;
+        }
+        id<MTLComputePipelineState> pso = sepia_gpu_pso(@"sepia_sconv_hist_roll_f32");
+        if (!pso) return 0;
+
+        sepia_args_sconv_hist args = { (int32_t)C, (int32_t)Km1, (int32_t)T };
+        [enc setComputePipelineState:pso];
+        [enc setBytes:&args length:sizeof(args) atIndex:0];
+        [enc setBuffer:hist->buffer offset:0 atIndex:1];
+        [enc setBuffer:in->buffer offset:0 atIndex:2];
+
+        NSUInteger width = pso.threadExecutionWidth;
+        if (width > (NSUInteger)C) width = (NSUInteger)C;
+        [enc dispatchThreads:MTLSizeMake((NSUInteger)C, 1, 1)
+             threadsPerThreadgroup:MTLSizeMake(width, 1, 1)];
+    }
+    return 1;
+}
+
 int sepia_gpu_selftest_touch(SepiaGpuBuf *buf, size_t n_floats) {
     if (!g_available || !g_device || !g_queue || !g_library) {
         fprintf(stderr, "sepia: metal: selftest_touch: GPU not initialized\n");

@@ -4028,10 +4028,19 @@ static void gpu_attn_forward_chunk(const Config *cfg, const LayerWeights *lw, La
         kv_lo[t] = kvlo;
         kv_hi[t] = q_pos;
     }
+    /* tau precision (P2 Task 9 review carry): must match attn_forward_chunk's
+     * own formula bit-for-bit -- `(float)((double)q * tau)`, double-precision
+     * intermediate, not a plain float*float multiply. This tiny-oracle gate
+     * never caught the earlier float-only version because have_log_scaling
+     * is never true here (tau==1.0 at every tested position, where the two
+     * formulas coincide exactly); Task 9's real model does exercise
+     * log-scaling (global layers past the floor position), so the gap is
+     * fixed here too, not just in the real-path code that motivated it. */
     float *q_scaled = xmalloc(sizeof(float) * (size_t)T * (size_t)q_dim);
     for (int t = 0; t < T; t++)
         for (int i = 0; i < q_dim; i++)
-            q_scaled[(size_t)t * q_dim + i] = q_normed[(size_t)t * q_dim + i] * tau[t];
+            q_scaled[(size_t)t * q_dim + i] =
+                (float)((double)q_normed[(size_t)t * q_dim + i] * (double)tau[t]);
     free(q_normed);
 
     /* 6. rel-project. */

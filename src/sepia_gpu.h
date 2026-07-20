@@ -229,4 +229,59 @@ int sepia_gpu_banded_attn(SepiaGpuBuf *q, SepiaGpuBuf *k, SepiaGpuBuf *v, SepiaG
                            int64_t T, int64_t H, int64_t Hkv, int64_t Dh, int64_t rel_extent,
                            int64_t q_pos_base, int64_t kv_dim, float inv_head_dim);
 
+/* ------------------------- real-model resident path (Task 9) --------------- */
+/* The real model's F32 resident tensors (norms, rel_proj, router weight,
+ * sconv weights) live at arbitrary byte offsets inside the ONE wrapped
+ * gpu_res_buf (resident.bin, Task 2's sepia_gpu_wrap_mmap) rather than in
+ * their own freshly-uploaded buffer the way the tiny-model path (Task 8)
+ * uploads a fresh copy per call. These `_off` twins of the existing f32 ops
+ * are identical in every way except the WEIGHT operand is bound at a
+ * caller-supplied byte offset into an existing buffer instead of always 0 --
+ * same kernels, same numerics, just a different `offset:` argument at the
+ * Metal buffer-binding call site (metal/ops.metal and metal/banded_attn.metal
+ * need no new kernel code for these). Existing (non-`_off`) call sites and
+ * gates (gputest/gpucompare/gpuattn/gpuquants, the tiny --metal forward
+ * path) are untouched -- these are purely additive. The `x`/`in`/`r_vec`
+ * operand keeps its existing always-offset-0 contract in every case; Task
+ * 9's real-model graph uses sepia_gpu_copy (below) to materialize a
+ * single-row, offset-0 view whenever it needs to feed one token's row out
+ * of a multi-row buffer. */
+int sepia_gpu_matvec_off(SepiaGpuBuf *w, size_t w_off, SepiaGpuBuf *x, SepiaGpuBuf *y, int64_t out_dim, int64_t in_dim);
+int sepia_gpu_rmsnorm_off(SepiaGpuBuf *w, size_t w_off, SepiaGpuBuf *x, SepiaGpuBuf *y, int64_t rows, int64_t n, float eps);
+int sepia_gpu_sconv_off(SepiaGpuBuf *w, size_t w_off, SepiaGpuBuf *hist, SepiaGpuBuf *in, SepiaGpuBuf *out,
+                         int64_t C, int64_t K, int64_t T);
+int sepia_gpu_rel_project_off(SepiaGpuBuf *r_vec, SepiaGpuBuf *rel_proj, size_t rel_proj_off, SepiaGpuBuf *rel_logits,
+                              int64_t T, int64_t H, int64_t d_rel, int64_t rel_extent);
+
+/* out[i] = in[i] for i in [0,n) -- a plain elementwise GPU->GPU copy with
+ * INDEPENDENT byte offsets on both sides (src_off/dst_off), used two ways in
+ * the real-model graph: (a) materializing one token row of a [T,dim]
+ * multi-row buffer as a standalone offset-0 operand for matvec/matvec_q
+ * (whose x/y operands are always bound at offset 0), and (b) cache-write
+ * (moving a layer's freshly computed K/V rows into the persistent per-layer
+ * KV-cache buffer at the current position's byte offset) -- both purely
+ * GPU-side data movement, no host round trip, no floating-point operation. */
+int sepia_gpu_copy(SepiaGpuBuf *src, size_t src_off, SepiaGpuBuf *dst, size_t dst_off, int64_t n);
+
+/* y[i] = x[i] * scale -- elementwise scalar multiply (e.g. the dense-MLP
+ * per-layer global_scale, sec.9, applied to the FFN output; the scalar is
+ * known before any router readback, so this always runs fully on GPU with
+ * no host dependency, unlike the MoE branch's per-shared-expert gamma,
+ * which IS readback-dependent and stays a host-side scalar accumulate,
+ * see real_mlp_moe_forward_gpu's design note in src/sepia.c). */
+int sepia_gpu_scale(float scale, SepiaGpuBuf *x, SepiaGpuBuf *y, int64_t n);
+
+/* GPU-side replacement for Task 8's host-side sconv history roll (design
+ * choice (b), sconv-history gap): updates `hist` [Km1,C] in place from the
+ * OLD hist plus this call's `in` [T,C], reproducing sconv_apply's own tail
+ * update (src/sepia.c) exactly -- pure data movement, no floating-point
+ * operation, so it needs no tolerance and no host round trip (unlike Task
+ * 8's tiny path, which could afford a host round trip per op at tiny scale
+ * but Task 9's real model, at 66 layers x 4 sconv sites/layer, cannot).
+ * T >= K-1: new hist = last K-1 rows of `in`. T < K-1: new hist = shift-keep
+ * old hist rows [T,K-1) then append all of `in`. K-1 must be <= 15 (generous
+ * bound for this model's K=4; dies loudly, not silently, if a future config
+ * exceeds it -- see metal/ops.metal's SEPIA_SCONV_MAX_KM1). */
+int sepia_gpu_sconv_hist_roll(SepiaGpuBuf *hist, SepiaGpuBuf *in, int64_t C, int64_t K, int64_t T);
+
 #endif
