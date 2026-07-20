@@ -13,6 +13,7 @@ build/
 *.dSYM/
 /sepia
 /iobench
+/test_quants
 
 # activation-dump debugging artifacts (tools/dump_activations.py, sepia
 # --dump-acts): the script is tracked, its output is not

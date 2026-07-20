@@ -6,8 +6,9 @@ LDFLAGS ?= -pthread -lm
 #   sepia    (0.4)  CPU reference engine
 #   iobench  (0.5)  SSD microbenchmark
 #   test     (0.4)  oracle self-test
-ci: pycheck tooltests sepia
+ci: pycheck tooltests sepia test_quants
 	./sepia
+	./test_quants tools/fixtures/quants/f16.bin
 	@echo "ci ok"
 
 # Tool test suites. Excluded on purpose: tools/test_oracle_determinism.sh
@@ -39,4 +40,7 @@ test: sepia
 iobench: tools/iobench.c
 	$(CC) $(CFLAGS) -o iobench tools/iobench.c $(LDFLAGS)
 
-.PHONY: ci pycheck tooltests sepia test iobench
+test_quants: tools/test_quants.c src/quants.c src/quants.h
+	$(CC) $(CFLAGS) -o test_quants tools/test_quants.c src/quants.c $(LDFLAGS)
+
+.PHONY: ci pycheck tooltests sepia test iobench test_quants
