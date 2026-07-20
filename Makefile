@@ -44,4 +44,7 @@ iobench: tools/iobench.c
 test_quants: tools/test_quants.c src/quants.c src/quants.h
 	$(CC) $(CFLAGS) -o test_quants tools/test_quants.c src/quants.c $(LDFLAGS)
 
-.PHONY: ci pycheck tooltests sepia test iobench test_quants
+test_tokenizer: tools/test_tokenizer.c src/tokenizer.c src/tokenizer.h
+	$(CC) $(CFLAGS) -o test_tokenizer tools/test_tokenizer.c src/tokenizer.c $(LDFLAGS)
+
+.PHONY: ci pycheck tooltests sepia test iobench test_quants test_tokenizer

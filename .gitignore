@@ -14,6 +14,7 @@ build/
 /sepia
 /iobench
 /test_quants
+/test_tokenizer
 
 # activation-dump debugging artifacts (tools/dump_activations.py, sepia
 # --dump-acts): the script is tracked, its output is not
