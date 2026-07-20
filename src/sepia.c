@@ -2350,7 +2350,8 @@ static void expert_slot_mlock_once(ExpertGpuStore *st, ExpertCacheSlot *sl, void
  * same rebind-per-call discipline RealExperts documents above, since
  * real_load's own `m.idx`/`m.part_fds` addresses do not survive its
  * return-by-value. */
-static void expert_store_init(ExpertGpuStore *st, const ExpertIndex *idx, size_t budget_bytes, int verbose) {
+static void expert_store_init(ExpertGpuStore *st, const ExpertIndex *idx, size_t budget_bytes,
+                               int num_experts_per_tok, int verbose) {
     memset(st, 0, sizeof(*st));
     st->verbose = verbose;
     st->n_layers_alloc = idx->n_layers_alloc;
@@ -2375,6 +2376,19 @@ static void expert_store_init(ExpertGpuStore *st, const ExpertIndex *idx, size_t
     if (want_slots > total_pairs) want_slots = total_pairs;
     if (want_slots < 1) want_slots = 1;
     st->n_slots = (int)want_slots;
+
+    /* Task 10 review fix: a per-token expert loop installs up to topk
+     * distinct experts before any sync (real_mlp_moe_forward_gpu), and
+     * expert_cache_evict_or_get_free's bounded fallback assumes at least
+     * that many physical slots exist -- otherwise it can hand back a slot
+     * already claimed by an earlier iteration of the SAME token's loop,
+     * silently overwriting one expert's weights with another's mid-token.
+     * A too-small --expert-cache-gb (or a malformed value that parses to
+     * ~0 via atof()) must fail loudly at load, not corrupt output later. */
+    if (st->n_slots < num_experts_per_tok)
+        die("metal: expert cache too small (%d slots, need at least %d for top-%d routing) -- "
+            "increase --expert-cache-gb",
+            st->n_slots, num_experts_per_tok, num_experts_per_tok);
 
     st->n_slabs = (st->n_slots + st->slots_per_slab - 1) / st->slots_per_slab;
     if (st->n_slabs < 1) st->n_slabs = 1;
@@ -2783,7 +2797,7 @@ static RealModel real_load(const char *config_path, const char *manifest_path,
          * many times the enclosing RealModel gets copied, so reading VALUE
          * fields off &m.idx here (never storing that address itself) is
          * safe despite real_load's own return-by-value. */
-        expert_store_init(&m.expert_store, &m.idx, expert_cache_budget_bytes, verbose_cache);
+        expert_store_init(&m.expert_store, &m.idx, expert_cache_budget_bytes, cfg->num_experts_per_tok, verbose_cache);
     }
 
     return m;
@@ -3414,17 +3428,20 @@ static void real_mlp_dense_forward_gpu(RealModel *m, const RealLayerGpu *g, int 
  * fully onto GPU). Router matvec + shared-expert compute (gate/up/down, no
  * gamma -- see below) run on GPU before any readback, since neither depends
  * on router SELECTION; only after the router-logits sync do we know which
- * routed experts to stream (real_expert_ffn, CPU, unchanged this task) and
- * what each shared expert's mixing weight (gamma) is. Since down_proj is
- * linear, gamma*down_proj(h) == down_proj(gamma*h) -- mlp_moe_forward's own
- * comment notes this equivalence -- so folding gamma in AFTER the (already
- * GPU-computed) shared down_proj output is mathematically identical to the
- * CPU oracle's h*=gamma-before-down_proj order, and lets the expensive
- * matvec_q work happen before the sync instead of after. This function's
- * ONE sync is exactly the plan's "router readback + expert install
- * boundary" pair (bundled into a single end()/begin(), since router logits,
- * the shared outputs, AND the normed activation real_expert_ffn needs are
- * ALL readable from the SAME batch's completion). */
+ * routed experts to fetch -- Task 10 streams them through the GPU-resident
+ * LRU expert cache (m->expert_store / expert_cache_get) instead of
+ * real_expert_ffn's CPU pread+qlinear -- and what each shared expert's
+ * mixing weight (gamma) is. Since down_proj is linear, gamma*down_proj(h)
+ * == down_proj(gamma*h) -- mlp_moe_forward's own comment notes this
+ * equivalence -- so folding gamma in AFTER the (already GPU-computed)
+ * shared down_proj output is mathematically identical to the CPU oracle's
+ * h*=gamma-before-down_proj order, and lets the expensive matvec_q work
+ * happen before the sync instead of after. This function now spans TWO
+ * syncs, not one: SYNC #1 (below) publishes router logits + shared outputs
+ * so expert slots can be resolved on the CPU before any new batch opens;
+ * SYNC #2 (further down) publishes the routed-expert down-projections for
+ * the final weighted mix. See the inline "SYNC #1"/"SYNC #2" comments at
+ * their call sites for the exact boundaries. */
 static void real_mlp_moe_forward_gpu(RealModel *m, const RealLayerGpu *g, const Config *cfg, int layer,
                                       SepiaGpuBuf *x_multi, int64_t t, int hidden, float *out_row) {
     SepiaGpuBuf *gres = (SepiaGpuBuf *)m->gpu_res_buf;
