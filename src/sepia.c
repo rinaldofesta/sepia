@@ -69,6 +69,15 @@ static void *xcalloc(size_t n, size_t sz) {
     return p;
 }
 
+/* --gpu-compare-tiny's capture lists (below) grow by doubling; realloc(3)
+ * itself tolerates a NULL pointer (equivalent to malloc), matching xmalloc's
+ * out-of-memory die() policy. */
+static void *xrealloc(void *p, size_t n) {
+    void *q = realloc(p, n ? n : 1);
+    if (!q) die("out of memory (realloc %zu bytes)", n);
+    return q;
+}
+
 /* Environment override for a default path, e.g. SEPIA_WEIGHTS_PATH to point
  * at a different fixture directory without a build-system change --
  * exercised by tools/test_sepia_malformed.sh, which needs to run sepia
@@ -859,6 +868,143 @@ static void cache_free(Cache *c) {
     free(c);
 }
 
+/* ============================ op capture (GPU compare) ==================== */
+/* --gpu-compare-tiny (local-only): while g_opcap is set, the call sites
+ * below additionally snapshot their real (input, params, CPU-computed
+ * output) tuples into the per-op-kind lists here, alongside the existing,
+ * completely unmodified math -- these are pure side-effect captures, never
+ * read back by the CPU forward pass itself, so with g_opcap==0 (every other
+ * mode: the self-test, --real, --dump-acts, --smoke) every function in this
+ * file computes byte-identical results to before this section existed. The
+ * harness (run_gpu_compare_tiny, near main()) drives one T=32 prefill
+ * through the UNMODIFIED model_forward_chunk with g_opcap set, then replays
+ * each captured instance through the matching sepia_gpu_* kernel and
+ * reports max-relative-error per op kind.
+ *
+ * g_opcap_selected_layer restricts the per-layer op kinds (matvec, sconv,
+ * softmax, silu_mul, and the per-layer rmsnorm sites) to layer 0 and the
+ * last layer, set by model_forward_chunk's layer loop just before each
+ * decoder_layer_forward call -- layer 0 is dense-MLP + sliding-window
+ * attention and the last layer is sparse-MoE + global attention in every
+ * config this codebase has seen (tiny oracle and the real checkpoint alike,
+ * sec.1/sec.2), so this one pair naturally exercises both MLP branches and
+ * both attention-window branches without a special case for either. The
+ * always-on sites (embed_norm, final_norm rmsnorm in model_forward_chunk)
+ * aren't layer-scoped and use g_opcap directly. */
+static int g_opcap = 0;
+static int g_opcap_selected_layer = 0;
+
+static float *fdup(const float *src, size_t n) {
+    float *d = xmalloc(sizeof(float) * (n ? n : 1));
+    memcpy(d, src, sizeof(float) * n);
+    return d;
+}
+
+static void opcap_ensure(void **items, int *count, int *cap, size_t elem_size) {
+    if (*count == *cap) {
+        *cap = *cap ? *cap * 2 : 64;
+        *items = xrealloc(*items, elem_size * (size_t)(*cap));
+    }
+}
+
+typedef struct { int n; float eps; float *x, *w, *y; } CapRmsnorm;
+typedef struct { CapRmsnorm *items; int count, cap; } CapRmsnormList;
+static CapRmsnormList g_cap_rmsnorm;
+
+static void cap_push_rmsnorm(const float *x, const float *w, int n, float eps, const float *y) {
+    opcap_ensure((void **)&g_cap_rmsnorm.items, &g_cap_rmsnorm.count, &g_cap_rmsnorm.cap, sizeof(CapRmsnorm));
+    CapRmsnorm *it = &g_cap_rmsnorm.items[g_cap_rmsnorm.count++];
+    it->n = n;
+    it->eps = eps;
+    it->x = fdup(x, (size_t)n);
+    it->w = fdup(w, (size_t)n);
+    it->y = fdup(y, (size_t)n);
+}
+
+typedef struct { int out_dim, in_dim; float *w, *x, *y; } CapMatvec;
+typedef struct { CapMatvec *items; int count, cap; } CapMatvecList;
+static CapMatvecList g_cap_matvec;
+
+/* w must be [out_dim,in_dim] row-major CONTIGUOUS (row stride ==
+ * in_dim*sizeof(float)) -- sepia_gpu_matvec's Task 3 scope, see its header
+ * doc. Callers with an interleaved/strided source (dense_w13/experts_w13's
+ * gate/up interleave) are out of scope here; only contiguous-row matvec call
+ * sites (wq/wk/wv/wr/wo, dense_w2, experts_w2/shared_w2, router_w) push. */
+static void cap_push_matvec(const float *w, const float *x, int out_dim, int in_dim, const float *y) {
+    opcap_ensure((void **)&g_cap_matvec.items, &g_cap_matvec.count, &g_cap_matvec.cap, sizeof(CapMatvec));
+    CapMatvec *it = &g_cap_matvec.items[g_cap_matvec.count++];
+    it->out_dim = out_dim;
+    it->in_dim = in_dim;
+    it->w = fdup(w, (size_t)out_dim * (size_t)in_dim);
+    it->x = fdup(x, (size_t)in_dim);
+    it->y = fdup(y, (size_t)out_dim);
+}
+
+typedef struct { int n; float *g, *u, *y; } CapSiluMul;
+typedef struct { CapSiluMul *items; int count, cap; } CapSiluMulList;
+static CapSiluMulList g_cap_silu;
+
+static void cap_push_silu_mul(const float *g, const float *u, int n, const float *y) {
+    opcap_ensure((void **)&g_cap_silu.items, &g_cap_silu.count, &g_cap_silu.cap, sizeof(CapSiluMul));
+    CapSiluMul *it = &g_cap_silu.items[g_cap_silu.count++];
+    it->n = n;
+    it->g = fdup(g, (size_t)n);
+    it->u = fdup(u, (size_t)n);
+    it->y = fdup(y, (size_t)n);
+}
+
+typedef struct { int n; float *a, *b, *y; } CapAdd;
+typedef struct { CapAdd *items; int count, cap; } CapAddList;
+static CapAddList g_cap_add;
+
+static void cap_push_add(const float *a, const float *b, int n, const float *y) {
+    opcap_ensure((void **)&g_cap_add.items, &g_cap_add.count, &g_cap_add.cap, sizeof(CapAdd));
+    CapAdd *it = &g_cap_add.items[g_cap_add.count++];
+    it->n = n;
+    it->a = fdup(a, (size_t)n);
+    it->b = fdup(b, (size_t)n);
+    it->y = fdup(y, (size_t)n);
+}
+
+/* scores: raw pre-softmax scores (content + relative-position bias, before
+ * the max-subtract/exp/normalize steps); y: the final normalized attention
+ * weights for that same (t,h) -- i.e. exactly what attn_forward_chunk's
+ * inlined stable-softmax computes internally but never materializes as an
+ * array (it folds the normalize step into the V-weighted-sum loop instead).
+ * The capture call site reconstructs y explicitly for comparison purposes
+ * only; it does not change what attn_forward_chunk computes or returns. */
+typedef struct { int n; float *scores, *y; } CapSoftmax;
+typedef struct { CapSoftmax *items; int count, cap; } CapSoftmaxList;
+static CapSoftmaxList g_cap_softmax;
+
+static void cap_push_softmax(const float *scores, int n, const float *y) {
+    opcap_ensure((void **)&g_cap_softmax.items, &g_cap_softmax.count, &g_cap_softmax.cap, sizeof(CapSoftmax));
+    CapSoftmax *it = &g_cap_softmax.items[g_cap_softmax.count++];
+    it->n = n;
+    it->scores = fdup(scores, (size_t)n);
+    it->y = fdup(y, (size_t)n);
+}
+
+/* hist: the [K-1,C] history window as sconv_apply saw it BEFORE the call
+ * (sconv_apply mutates it in place to prepare the next chunk's history --
+ * that update is Task 8's concern, not replayed or compared here, see
+ * sepia_gpu_sconv's header doc). */
+typedef struct { int C, K, T; float *w, *hist, *in, *y; } CapSconv;
+typedef struct { CapSconv *items; int count, cap; } CapSconvList;
+static CapSconvList g_cap_sconv;
+
+static void cap_push_sconv(const float *w, const float *hist, const float *in, int C, int K, int T, const float *y) {
+    opcap_ensure((void **)&g_cap_sconv.items, &g_cap_sconv.count, &g_cap_sconv.cap, sizeof(CapSconv));
+    CapSconv *it = &g_cap_sconv.items[g_cap_sconv.count++];
+    it->C = C;
+    it->K = K;
+    it->T = T;
+    it->w = fdup(w, (size_t)C * (size_t)K);
+    it->hist = fdup(hist, (size_t)(K - 1) * (size_t)C);
+    it->in = fdup(in, (size_t)T * (size_t)C);
+    it->y = fdup(y, (size_t)T * (size_t)C);
+}
+
 /* =============================== attention =============================== */
 /* Computes one decoder layer's self-attention block for T new positions
  * starting at absolute position start_pos, appending to the layer's KV
@@ -889,12 +1035,29 @@ static void attn_forward_chunk(const Config *cfg, const LayerWeights *lw, LayerC
         linear(lw->wk, kv_dim, hidden, xt, k_raw + (size_t)t * kv_dim);
         linear(lw->wv, kv_dim, hidden, xt, v_raw + (size_t)t * kv_dim);
         linear(lw->wr, r_dim, hidden, xt, r_raw + (size_t)t * r_dim);
+        if (g_opcap_selected_layer) {
+            cap_push_matvec(lw->wq, xt, q_dim, hidden, q_raw + (size_t)t * q_dim);
+            cap_push_matvec(lw->wk, xt, kv_dim, hidden, k_raw + (size_t)t * kv_dim);
+            cap_push_matvec(lw->wv, xt, kv_dim, hidden, v_raw + (size_t)t * kv_dim);
+            cap_push_matvec(lw->wr, xt, r_dim, hidden, r_raw + (size_t)t * r_dim);
+        }
     }
 
     float *k_sconv = xmalloc(sizeof(float) * (size_t)T * (size_t)kv_dim);
     float *v_sconv = xmalloc(sizeof(float) * (size_t)T * (size_t)kv_dim);
-    sconv_apply(lw->k_sconv_w, kv_dim, K, lc->k_hist, k_raw, T, k_sconv);
-    sconv_apply(lw->v_sconv_w, kv_dim, K, lc->v_hist, v_raw, T, v_sconv);
+    if (g_opcap_selected_layer) {
+        float *k_hist_before = fdup(lc->k_hist, (size_t)(K - 1) * (size_t)kv_dim);
+        float *v_hist_before = fdup(lc->v_hist, (size_t)(K - 1) * (size_t)kv_dim);
+        sconv_apply(lw->k_sconv_w, kv_dim, K, lc->k_hist, k_raw, T, k_sconv);
+        sconv_apply(lw->v_sconv_w, kv_dim, K, lc->v_hist, v_raw, T, v_sconv);
+        cap_push_sconv(lw->k_sconv_w, k_hist_before, k_raw, kv_dim, K, T, k_sconv);
+        cap_push_sconv(lw->v_sconv_w, v_hist_before, v_raw, kv_dim, K, T, v_sconv);
+        free(k_hist_before);
+        free(v_hist_before);
+    } else {
+        sconv_apply(lw->k_sconv_w, kv_dim, K, lc->k_hist, k_raw, T, k_sconv);
+        sconv_apply(lw->v_sconv_w, kv_dim, K, lc->v_hist, v_raw, T, v_sconv);
+    }
     free(k_raw);
     free(v_raw);
 
@@ -905,11 +1068,25 @@ static void attn_forward_chunk(const Config *cfg, const LayerWeights *lw, LayerC
     for (int t = 0; t < T; t++) {
         for (int h = 0; h < H; h++) {
             float *qh = q_raw + (size_t)t * q_dim + (size_t)h * Dh;
-            rmsnorm(qh, lw->q_norm, Dh, (float)cfg->rms_norm_eps, qh);
+            if (g_opcap_selected_layer) {
+                float *qh_before = fdup(qh, (size_t)Dh);
+                rmsnorm(qh, lw->q_norm, Dh, (float)cfg->rms_norm_eps, qh);
+                cap_push_rmsnorm(qh_before, lw->q_norm, Dh, (float)cfg->rms_norm_eps, qh);
+                free(qh_before);
+            } else {
+                rmsnorm(qh, lw->q_norm, Dh, (float)cfg->rms_norm_eps, qh);
+            }
         }
         for (int h = 0; h < Hkv; h++) {
             float *kh = k_sconv + (size_t)t * kv_dim + (size_t)h * Dh;
-            rmsnorm(kh, lw->k_norm, Dh, (float)cfg->rms_norm_eps, kh);
+            if (g_opcap_selected_layer) {
+                float *kh_before = fdup(kh, (size_t)Dh);
+                rmsnorm(kh, lw->k_norm, Dh, (float)cfg->rms_norm_eps, kh);
+                cap_push_rmsnorm(kh_before, lw->k_norm, Dh, (float)cfg->rms_norm_eps, kh);
+                free(kh_before);
+            } else {
+                rmsnorm(kh, lw->k_norm, Dh, (float)cfg->rms_norm_eps, kh);
+            }
         }
     }
 
@@ -969,11 +1146,19 @@ static void attn_forward_chunk(const Config *cfg, const LayerWeights *lw, LayerC
                 scores[kv - kv_lo] = sc;
                 if (sc > max_score) max_score = sc;
             }
+            float *raw_scores_before = g_opcap_selected_layer ? fdup(scores, (size_t)n_kv) : NULL;
             double sum_exp = 0.0;
             for (int i = 0; i < n_kv; i++) {
                 double e = exp((double)(scores[i] - max_score));
                 scores[i] = (float)e;
                 sum_exp += e;
+            }
+            if (raw_scores_before) {
+                float *weights = xmalloc(sizeof(float) * (size_t)n_kv);
+                for (int i = 0; i < n_kv; i++) weights[i] = (float)((double)scores[i] / sum_exp);
+                cap_push_softmax(raw_scores_before, n_kv, weights);
+                free(weights);
+                free(raw_scores_before);
             }
             for (int d = 0; d < Dh; d++) accd[d] = 0.0;
             for (int i = 0; i < n_kv; i++) {
@@ -993,7 +1178,11 @@ static void attn_forward_chunk(const Config *cfg, const LayerWeights *lw, LayerC
     free(q_raw);
     free(r_raw);
 
-    for (int t = 0; t < T; t++) linear(lw->wo, hidden, q_dim, attn_concat + (size_t)t * q_dim, out + (size_t)t * hidden);
+    for (int t = 0; t < T; t++) {
+        linear(lw->wo, hidden, q_dim, attn_concat + (size_t)t * q_dim, out + (size_t)t * hidden);
+        if (g_opcap_selected_layer)
+            cap_push_matvec(lw->wo, attn_concat + (size_t)t * q_dim, hidden, q_dim, out + (size_t)t * hidden);
+    }
     free(attn_concat);
 }
 
@@ -1003,16 +1192,38 @@ static void attn_forward_chunk(const Config *cfg, const LayerWeights *lw, LayerC
  * the analogous per-layer scale multiplies the routing *weights* instead. */
 static void mlp_dense_forward(const LayerWeights *lw, int hidden, int dense_inter, const float *x, float *out) {
     float *h = xmalloc(sizeof(float) * (size_t)dense_inter);
+    float *g_vec = g_opcap_selected_layer ? xmalloc(sizeof(float) * (size_t)dense_inter) : NULL;
+    float *u_vec = g_opcap_selected_layer ? xmalloc(sizeof(float) * (size_t)dense_inter) : NULL;
     int two_inter = 2 * dense_inter;
     for (int i = 0; i < dense_inter; i++) {
         float g = dotf(w13_row(lw->dense_w13, 0, two_inter, hidden, 0, i), x, hidden);
         float u = dotf(w13_row(lw->dense_w13, 0, two_inter, hidden, 1, i), x, hidden);
         h[i] = silu_f(g) * u;
+        if (g_opcap_selected_layer) {
+            g_vec[i] = g;
+            u_vec[i] = u;
+        }
+    }
+    if (g_opcap_selected_layer) {
+        cap_push_silu_mul(g_vec, u_vec, dense_inter, h);
+        free(g_vec);
+        free(u_vec);
     }
     float gscale = lw->dense_global_scale[0];
     for (int d = 0; d < hidden; d++) {
         const float *row = lw->dense_w2 + (size_t)d * dense_inter;
         out[d] = dotf(row, h, dense_inter) * gscale;
+    }
+    if (g_opcap_selected_layer) {
+        /* NOTE: out[] carries an extra *gscale the matvec kernel itself
+         * doesn't apply -- captured for the matvec op's dot-product step
+         * only, so the "expected" y here is the pre-gscale value (recomputed
+         * via a plain dot, gscale divided back out from the already-scaled
+         * out[] would just reintroduce float rounding for no reason). */
+        float *pre_scale = xmalloc(sizeof(float) * (size_t)hidden);
+        for (int d = 0; d < hidden; d++) pre_scale[d] = dotf(lw->dense_w2 + (size_t)d * dense_inter, h, dense_inter);
+        cap_push_matvec(lw->dense_w2, h, hidden, dense_inter, pre_scale);
+        free(pre_scale);
     }
     free(h);
 }
@@ -1031,6 +1242,7 @@ static void mlp_moe_forward(const Config *cfg, const LayerWeights *lw, const flo
 
     float *router_logits = xmalloc(sizeof(float) * (size_t)n_total);
     for (int i = 0; i < n_total; i++) router_logits[i] = dotf(lw->router_w + (size_t)i * hidden, x, hidden);
+    if (g_opcap_selected_layer) cap_push_matvec(lw->router_w, x, n_total, hidden, router_logits);
 
     float *scores_for_choice = xmalloc(sizeof(float) * (size_t)n_routed);
     for (int i = 0; i < n_routed; i++) scores_for_choice[i] = sigmoid_f(router_logits[i]) + lw->router_bias[i];
@@ -1077,6 +1289,8 @@ static void mlp_moe_forward(const Config *cfg, const LayerWeights *lw, const flo
 
     float *h = xmalloc(sizeof(float) * (size_t)moe_inter);
     float *expert_out = xmalloc(sizeof(float) * (size_t)hidden);
+    float *g_vec = g_opcap_selected_layer ? xmalloc(sizeof(float) * (size_t)moe_inter) : NULL;
+    float *u_vec = g_opcap_selected_layer ? xmalloc(sizeof(float) * (size_t)moe_inter) : NULL;
     for (int j = 0; j < topk; j++) {
         int e = topk_idx[j];
         if (lw->real_exps) {
@@ -1088,16 +1302,26 @@ static void mlp_moe_forward(const Config *cfg, const LayerWeights *lw, const flo
                 float g = dotf(w13_row(lw->experts_w13, e, two_inter, hidden, 0, i), x, hidden);
                 float u = dotf(w13_row(lw->experts_w13, e, two_inter, hidden, 1, i), x, hidden);
                 h[i] = silu_f(g) * u;
+                if (g_opcap_selected_layer) {
+                    g_vec[i] = g;
+                    u_vec[i] = u;
+                }
             }
+            if (g_opcap_selected_layer) cap_push_silu_mul(g_vec, u_vec, moe_inter, h);
             for (int d = 0; d < hidden; d++) {
                 const float *row = lw->experts_w2 + ((size_t)e * hidden + (size_t)d) * moe_inter;
                 expert_out[d] = dotf(row, h, moe_inter);
             }
+            if (g_opcap_selected_layer)
+                cap_push_matvec(lw->experts_w2 + (size_t)e * (size_t)hidden * (size_t)moe_inter, h,
+                                 hidden, moe_inter, expert_out);
         }
         float wj = weights[j];
         for (int d = 0; d < hidden; d++) out[d] += expert_out[d] * wj; /* routed: weight applied AFTER down_proj (sec.7) */
     }
     free(expert_out);
+    free(g_vec);
+    free(u_vec);
 
     for (int s = 0; s < n_shared; s++) {
         float gamma = weights[topk + s];
@@ -1144,18 +1368,37 @@ static void decoder_layer_forward(const Config *cfg, const LayerWeights *lw, Lay
     int K = cfg->conv_kernel_size;
 
     float *normed = xmalloc(sizeof(float) * (size_t)T * (size_t)hidden);
-    for (int t = 0; t < T; t++) rmsnorm(x + (size_t)t * hidden, lw->attn_norm, hidden, (float)cfg->rms_norm_eps, normed + (size_t)t * hidden);
+    for (int t = 0; t < T; t++) {
+        rmsnorm(x + (size_t)t * hidden, lw->attn_norm, hidden, (float)cfg->rms_norm_eps, normed + (size_t)t * hidden);
+        if (g_opcap_selected_layer)
+            cap_push_rmsnorm(x + (size_t)t * hidden, lw->attn_norm, hidden, (float)cfg->rms_norm_eps, normed + (size_t)t * hidden);
+    }
 
     float *attn_out = xmalloc(sizeof(float) * (size_t)T * (size_t)hidden);
     attn_forward_chunk(cfg, lw, lc, normed, T, start_pos, attn_out);
 
     float *attn_sconv_out = xmalloc(sizeof(float) * (size_t)T * (size_t)hidden);
-    sconv_apply(lw->attn_sconv_w, hidden, K, lc->attn_hist, attn_out, T, attn_sconv_out);
-    for (size_t i = 0; i < (size_t)T * hidden; i++) x[i] += attn_sconv_out[i];
+    if (g_opcap_selected_layer) {
+        float *attn_hist_before = fdup(lc->attn_hist, (size_t)(K - 1) * (size_t)hidden);
+        sconv_apply(lw->attn_sconv_w, hidden, K, lc->attn_hist, attn_out, T, attn_sconv_out);
+        cap_push_sconv(lw->attn_sconv_w, attn_hist_before, attn_out, hidden, K, T, attn_sconv_out);
+        free(attn_hist_before);
+        float *x_before = fdup(x, (size_t)T * (size_t)hidden);
+        for (size_t i = 0; i < (size_t)T * hidden; i++) x[i] += attn_sconv_out[i];
+        cap_push_add(x_before, attn_sconv_out, T * hidden, x);
+        free(x_before);
+    } else {
+        sconv_apply(lw->attn_sconv_w, hidden, K, lc->attn_hist, attn_out, T, attn_sconv_out);
+        for (size_t i = 0; i < (size_t)T * hidden; i++) x[i] += attn_sconv_out[i];
+    }
     free(attn_out);
     free(attn_sconv_out);
 
-    for (int t = 0; t < T; t++) rmsnorm(x + (size_t)t * hidden, lw->mlp_norm, hidden, (float)cfg->rms_norm_eps, normed + (size_t)t * hidden);
+    for (int t = 0; t < T; t++) {
+        rmsnorm(x + (size_t)t * hidden, lw->mlp_norm, hidden, (float)cfg->rms_norm_eps, normed + (size_t)t * hidden);
+        if (g_opcap_selected_layer)
+            cap_push_rmsnorm(x + (size_t)t * hidden, lw->mlp_norm, hidden, (float)cfg->rms_norm_eps, normed + (size_t)t * hidden);
+    }
 
     float *mlp_out = xmalloc(sizeof(float) * (size_t)T * (size_t)hidden);
     for (int t = 0; t < T; t++) {
@@ -1167,8 +1410,19 @@ static void decoder_layer_forward(const Config *cfg, const LayerWeights *lw, Lay
     free(normed);
 
     float *mlp_sconv_out = xmalloc(sizeof(float) * (size_t)T * (size_t)hidden);
-    sconv_apply(lw->mlp_sconv_w, hidden, K, lc->mlp_hist, mlp_out, T, mlp_sconv_out);
-    for (size_t i = 0; i < (size_t)T * hidden; i++) x[i] += mlp_sconv_out[i];
+    if (g_opcap_selected_layer) {
+        float *mlp_hist_before = fdup(lc->mlp_hist, (size_t)(K - 1) * (size_t)hidden);
+        sconv_apply(lw->mlp_sconv_w, hidden, K, lc->mlp_hist, mlp_out, T, mlp_sconv_out);
+        cap_push_sconv(lw->mlp_sconv_w, mlp_hist_before, mlp_out, hidden, K, T, mlp_sconv_out);
+        free(mlp_hist_before);
+        float *x_before = fdup(x, (size_t)T * (size_t)hidden);
+        for (size_t i = 0; i < (size_t)T * hidden; i++) x[i] += mlp_sconv_out[i];
+        cap_push_add(x_before, mlp_sconv_out, T * hidden, x);
+        free(x_before);
+    } else {
+        sconv_apply(lw->mlp_sconv_w, hidden, K, lc->mlp_hist, mlp_out, T, mlp_sconv_out);
+        for (size_t i = 0; i < (size_t)T * hidden; i++) x[i] += mlp_sconv_out[i];
+    }
     free(mlp_out);
     free(mlp_sconv_out);
 }
@@ -1222,10 +1476,16 @@ static void model_forward_chunk(const Model *m, Cache *cache, const int *token_i
     for (int t = 0; t < T; t++) {
         const float *erow = m->embed + (size_t)token_ids[t] * hidden;
         rmsnorm(erow, m->embed_norm, hidden, (float)cfg->rms_norm_eps, x + (size_t)t * hidden);
+        if (g_opcap) cap_push_rmsnorm(erow, m->embed_norm, hidden, (float)cfg->rms_norm_eps, x + (size_t)t * hidden);
     }
     if (dump) dump_capture(dump, "embed_out", x, T, hidden);
 
     for (int l = 0; l < cfg->num_hidden_layers; l++) {
+        /* --gpu-compare-tiny only: restrict the per-layer op captures (Cap*
+         * lists other than rmsnorm's two always-on sites above/below) to
+         * layer 0 and the last layer -- see the "op capture" section's
+         * doc comment (near cache_free) for why that pair is sufficient. */
+        g_opcap_selected_layer = g_opcap && (l == 0 || l == cfg->num_hidden_layers - 1);
         decoder_layer_forward(cfg, &m->layers[l], &cache->layers[l], x, T, start_pos);
         if (dump) {
             char name[32];
@@ -1233,9 +1493,13 @@ static void model_forward_chunk(const Model *m, Cache *cache, const int *token_i
             dump_capture(dump, name, x, T, hidden);
         }
     }
+    g_opcap_selected_layer = 0;
 
     float *normed = xmalloc(sizeof(float) * (size_t)T * (size_t)hidden);
-    for (int t = 0; t < T; t++) rmsnorm(x + (size_t)t * hidden, m->final_norm, hidden, (float)cfg->rms_norm_eps, normed + (size_t)t * hidden);
+    for (int t = 0; t < T; t++) {
+        rmsnorm(x + (size_t)t * hidden, m->final_norm, hidden, (float)cfg->rms_norm_eps, normed + (size_t)t * hidden);
+        if (g_opcap) cap_push_rmsnorm(x + (size_t)t * hidden, m->final_norm, hidden, (float)cfg->rms_norm_eps, normed + (size_t)t * hidden);
+    }
     if (dump) dump_capture(dump, "final_norm_out", normed, T, hidden);
     free(x);
 
@@ -2496,6 +2760,332 @@ static void run_gpu_selftest(void) {
     printf("gpu selftest ok\n");
 }
 
+/* ------------------------------ gpu compare tiny ---------------------------- */
+/* --gpu-compare-tiny (local-only, needs --metal): the dev loop for Tasks
+ * 4-8. Drives ONE real T=32 prefill through the UNMODIFIED tiny oracle (the
+ * same model_load/model_forward_chunk the plain self-test uses) with
+ * g_opcap set so the "op capture" call sites (see that section's doc
+ * comment, above the attention section) snapshot real (input, params,
+ * CPU-computed output) instances into the Cap*List globals; then replays
+ * every captured instance through the matching sepia_gpu_* kernel and
+ * reports the worst-case max-relative-error per op kind. Gate: every op
+ * kind's worst instance must be <= SEPIA_GPU_COMPARE_TOL (2e-4 -- the P2
+ * plan's Global Constraints (b); the CPU oracle accumulates reductions in
+ * double, these kernels in f32, so a little drift is expected and is what
+ * this tolerance is FOR, not a fudge factor for an actual bug). */
+
+#define SEPIA_GPU_COMPARE_TOL 2e-4
+
+static int g_gpu_compare_failed = 0;
+
+static double gpu_compare_rel_err(float got, float want) {
+    double diff = fabs((double)got - (double)want);
+    double denom = fmax(fabs((double)want), 1e-6); /* absolute floor: avoids a near-zero
+                                                     * CPU target blowing up an otherwise
+                                                     * tiny absolute difference */
+    return diff / denom;
+}
+
+static void gpu_compare_report(const char *op, double max_rel, int n_instances) {
+    printf("gpu-compare: %s max_rel_err %.3e (%d instances)\n", op, max_rel, n_instances);
+    if (n_instances > 0 && max_rel > SEPIA_GPU_COMPARE_TOL) g_gpu_compare_failed = 1;
+}
+
+static void gpu_compare_rmsnorm(void) {
+    int n_inst = g_cap_rmsnorm.count;
+    if (n_inst == 0) {
+        gpu_compare_report("rmsnorm", 0.0, 0);
+        return;
+    }
+    SepiaGpuBuf **xb = xcalloc((size_t)n_inst, sizeof(SepiaGpuBuf *));
+    SepiaGpuBuf **wb = xcalloc((size_t)n_inst, sizeof(SepiaGpuBuf *));
+    SepiaGpuBuf **yb = xcalloc((size_t)n_inst, sizeof(SepiaGpuBuf *));
+
+    if (!sepia_gpu_begin()) die("gpu-compare: rmsnorm: begin failed");
+    for (int i = 0; i < n_inst; i++) {
+        CapRmsnorm *it = &g_cap_rmsnorm.items[i];
+        xb[i] = sepia_gpu_alloc(sizeof(float) * (size_t)it->n, 0);
+        wb[i] = sepia_gpu_alloc(sizeof(float) * (size_t)it->n, 0);
+        yb[i] = sepia_gpu_alloc(sizeof(float) * (size_t)it->n, 0);
+        if (!xb[i] || !wb[i] || !yb[i]) die("gpu-compare: rmsnorm: alloc failed");
+        memcpy(sepia_gpu_host_ptr(xb[i]), it->x, sizeof(float) * (size_t)it->n);
+        memcpy(sepia_gpu_host_ptr(wb[i]), it->w, sizeof(float) * (size_t)it->n);
+        if (!sepia_gpu_rmsnorm(wb[i], xb[i], yb[i], 1, it->n, it->eps))
+            die("gpu-compare: rmsnorm: dispatch failed (instance %d)", i);
+    }
+    if (!sepia_gpu_end()) die("gpu-compare: rmsnorm: end failed");
+
+    double max_rel = 0.0;
+    for (int i = 0; i < n_inst; i++) {
+        CapRmsnorm *it = &g_cap_rmsnorm.items[i];
+        float *y = (float *)sepia_gpu_host_ptr(yb[i]);
+        for (int j = 0; j < it->n; j++) {
+            double rel = gpu_compare_rel_err(y[j], it->y[j]);
+            if (rel > max_rel) max_rel = rel;
+        }
+        sepia_gpu_free(xb[i]);
+        sepia_gpu_free(wb[i]);
+        sepia_gpu_free(yb[i]);
+    }
+    free(xb);
+    free(wb);
+    free(yb);
+    gpu_compare_report("rmsnorm", max_rel, n_inst);
+}
+
+static void gpu_compare_matvec(void) {
+    int n_inst = g_cap_matvec.count;
+    if (n_inst == 0) {
+        gpu_compare_report("matvec", 0.0, 0);
+        return;
+    }
+    SepiaGpuBuf **wb = xcalloc((size_t)n_inst, sizeof(SepiaGpuBuf *));
+    SepiaGpuBuf **xb = xcalloc((size_t)n_inst, sizeof(SepiaGpuBuf *));
+    SepiaGpuBuf **yb = xcalloc((size_t)n_inst, sizeof(SepiaGpuBuf *));
+
+    if (!sepia_gpu_begin()) die("gpu-compare: matvec: begin failed");
+    for (int i = 0; i < n_inst; i++) {
+        CapMatvec *it = &g_cap_matvec.items[i];
+        size_t wn = (size_t)it->out_dim * (size_t)it->in_dim;
+        wb[i] = sepia_gpu_alloc(sizeof(float) * wn, 0);
+        xb[i] = sepia_gpu_alloc(sizeof(float) * (size_t)it->in_dim, 0);
+        yb[i] = sepia_gpu_alloc(sizeof(float) * (size_t)it->out_dim, 0);
+        if (!wb[i] || !xb[i] || !yb[i]) die("gpu-compare: matvec: alloc failed");
+        memcpy(sepia_gpu_host_ptr(wb[i]), it->w, sizeof(float) * wn);
+        memcpy(sepia_gpu_host_ptr(xb[i]), it->x, sizeof(float) * (size_t)it->in_dim);
+        if (!sepia_gpu_matvec(wb[i], xb[i], yb[i], it->out_dim, it->in_dim))
+            die("gpu-compare: matvec: dispatch failed (instance %d)", i);
+    }
+    if (!sepia_gpu_end()) die("gpu-compare: matvec: end failed");
+
+    double max_rel = 0.0;
+    for (int i = 0; i < n_inst; i++) {
+        CapMatvec *it = &g_cap_matvec.items[i];
+        float *y = (float *)sepia_gpu_host_ptr(yb[i]);
+        for (int j = 0; j < it->out_dim; j++) {
+            double rel = gpu_compare_rel_err(y[j], it->y[j]);
+            if (rel > max_rel) max_rel = rel;
+        }
+        sepia_gpu_free(wb[i]);
+        sepia_gpu_free(xb[i]);
+        sepia_gpu_free(yb[i]);
+    }
+    free(wb);
+    free(xb);
+    free(yb);
+    gpu_compare_report("matvec", max_rel, n_inst);
+}
+
+static void gpu_compare_silu_mul(void) {
+    int n_inst = g_cap_silu.count;
+    if (n_inst == 0) {
+        gpu_compare_report("silu_mul", 0.0, 0);
+        return;
+    }
+    SepiaGpuBuf **gb = xcalloc((size_t)n_inst, sizeof(SepiaGpuBuf *));
+    SepiaGpuBuf **ub = xcalloc((size_t)n_inst, sizeof(SepiaGpuBuf *));
+    SepiaGpuBuf **zb = xcalloc((size_t)n_inst, sizeof(SepiaGpuBuf *));
+
+    if (!sepia_gpu_begin()) die("gpu-compare: silu_mul: begin failed");
+    for (int i = 0; i < n_inst; i++) {
+        CapSiluMul *it = &g_cap_silu.items[i];
+        gb[i] = sepia_gpu_alloc(sizeof(float) * (size_t)it->n, 0);
+        ub[i] = sepia_gpu_alloc(sizeof(float) * (size_t)it->n, 0);
+        zb[i] = sepia_gpu_alloc(sizeof(float) * (size_t)it->n, 0);
+        if (!gb[i] || !ub[i] || !zb[i]) die("gpu-compare: silu_mul: alloc failed");
+        memcpy(sepia_gpu_host_ptr(gb[i]), it->g, sizeof(float) * (size_t)it->n);
+        memcpy(sepia_gpu_host_ptr(ub[i]), it->u, sizeof(float) * (size_t)it->n);
+        if (!sepia_gpu_silu_mul(gb[i], ub[i], zb[i], it->n))
+            die("gpu-compare: silu_mul: dispatch failed (instance %d)", i);
+    }
+    if (!sepia_gpu_end()) die("gpu-compare: silu_mul: end failed");
+
+    double max_rel = 0.0;
+    for (int i = 0; i < n_inst; i++) {
+        CapSiluMul *it = &g_cap_silu.items[i];
+        float *z = (float *)sepia_gpu_host_ptr(zb[i]);
+        for (int j = 0; j < it->n; j++) {
+            double rel = gpu_compare_rel_err(z[j], it->y[j]);
+            if (rel > max_rel) max_rel = rel;
+        }
+        sepia_gpu_free(gb[i]);
+        sepia_gpu_free(ub[i]);
+        sepia_gpu_free(zb[i]);
+    }
+    free(gb);
+    free(ub);
+    free(zb);
+    gpu_compare_report("silu_mul", max_rel, n_inst);
+}
+
+static void gpu_compare_add(void) {
+    int n_inst = g_cap_add.count;
+    if (n_inst == 0) {
+        gpu_compare_report("add", 0.0, 0);
+        return;
+    }
+    SepiaGpuBuf **ab = xcalloc((size_t)n_inst, sizeof(SepiaGpuBuf *));
+    SepiaGpuBuf **bb = xcalloc((size_t)n_inst, sizeof(SepiaGpuBuf *));
+    SepiaGpuBuf **ob = xcalloc((size_t)n_inst, sizeof(SepiaGpuBuf *));
+
+    if (!sepia_gpu_begin()) die("gpu-compare: add: begin failed");
+    for (int i = 0; i < n_inst; i++) {
+        CapAdd *it = &g_cap_add.items[i];
+        ab[i] = sepia_gpu_alloc(sizeof(float) * (size_t)it->n, 0);
+        bb[i] = sepia_gpu_alloc(sizeof(float) * (size_t)it->n, 0);
+        ob[i] = sepia_gpu_alloc(sizeof(float) * (size_t)it->n, 0);
+        if (!ab[i] || !bb[i] || !ob[i]) die("gpu-compare: add: alloc failed");
+        memcpy(sepia_gpu_host_ptr(ab[i]), it->a, sizeof(float) * (size_t)it->n);
+        memcpy(sepia_gpu_host_ptr(bb[i]), it->b, sizeof(float) * (size_t)it->n);
+        if (!sepia_gpu_add(ab[i], bb[i], ob[i], it->n))
+            die("gpu-compare: add: dispatch failed (instance %d)", i);
+    }
+    if (!sepia_gpu_end()) die("gpu-compare: add: end failed");
+
+    double max_rel = 0.0;
+    for (int i = 0; i < n_inst; i++) {
+        CapAdd *it = &g_cap_add.items[i];
+        float *o = (float *)sepia_gpu_host_ptr(ob[i]);
+        for (int j = 0; j < it->n; j++) {
+            double rel = gpu_compare_rel_err(o[j], it->y[j]);
+            if (rel > max_rel) max_rel = rel;
+        }
+        sepia_gpu_free(ab[i]);
+        sepia_gpu_free(bb[i]);
+        sepia_gpu_free(ob[i]);
+    }
+    free(ab);
+    free(bb);
+    free(ob);
+    gpu_compare_report("add", max_rel, n_inst);
+}
+
+static void gpu_compare_softmax(void) {
+    int n_inst = g_cap_softmax.count;
+    if (n_inst == 0) {
+        gpu_compare_report("softmax", 0.0, 0);
+        return;
+    }
+    SepiaGpuBuf **xb = xcalloc((size_t)n_inst, sizeof(SepiaGpuBuf *));
+    SepiaGpuBuf **yb = xcalloc((size_t)n_inst, sizeof(SepiaGpuBuf *));
+
+    if (!sepia_gpu_begin()) die("gpu-compare: softmax: begin failed");
+    for (int i = 0; i < n_inst; i++) {
+        CapSoftmax *it = &g_cap_softmax.items[i];
+        xb[i] = sepia_gpu_alloc(sizeof(float) * (size_t)it->n, 0);
+        yb[i] = sepia_gpu_alloc(sizeof(float) * (size_t)it->n, 0);
+        if (!xb[i] || !yb[i]) die("gpu-compare: softmax: alloc failed");
+        memcpy(sepia_gpu_host_ptr(xb[i]), it->scores, sizeof(float) * (size_t)it->n);
+        if (!sepia_gpu_softmax(xb[i], yb[i], 1, it->n))
+            die("gpu-compare: softmax: dispatch failed (instance %d)", i);
+    }
+    if (!sepia_gpu_end()) die("gpu-compare: softmax: end failed");
+
+    double max_rel = 0.0;
+    for (int i = 0; i < n_inst; i++) {
+        CapSoftmax *it = &g_cap_softmax.items[i];
+        float *y = (float *)sepia_gpu_host_ptr(yb[i]);
+        for (int j = 0; j < it->n; j++) {
+            double rel = gpu_compare_rel_err(y[j], it->y[j]);
+            if (rel > max_rel) max_rel = rel;
+        }
+        sepia_gpu_free(xb[i]);
+        sepia_gpu_free(yb[i]);
+    }
+    free(xb);
+    free(yb);
+    gpu_compare_report("softmax", max_rel, n_inst);
+}
+
+static void gpu_compare_sconv(void) {
+    int n_inst = g_cap_sconv.count;
+    if (n_inst == 0) {
+        gpu_compare_report("sconv", 0.0, 0);
+        return;
+    }
+    SepiaGpuBuf **wb = xcalloc((size_t)n_inst, sizeof(SepiaGpuBuf *));
+    SepiaGpuBuf **hb = xcalloc((size_t)n_inst, sizeof(SepiaGpuBuf *));
+    SepiaGpuBuf **ib = xcalloc((size_t)n_inst, sizeof(SepiaGpuBuf *));
+    SepiaGpuBuf **ob = xcalloc((size_t)n_inst, sizeof(SepiaGpuBuf *));
+
+    if (!sepia_gpu_begin()) die("gpu-compare: sconv: begin failed");
+    for (int i = 0; i < n_inst; i++) {
+        CapSconv *it = &g_cap_sconv.items[i];
+        size_t wn = (size_t)it->C * (size_t)it->K;
+        size_t hn = (size_t)(it->K - 1) * (size_t)it->C;
+        size_t tn = (size_t)it->T * (size_t)it->C;
+        wb[i] = sepia_gpu_alloc(sizeof(float) * wn, 0);
+        hb[i] = sepia_gpu_alloc(sizeof(float) * hn, 0);
+        ib[i] = sepia_gpu_alloc(sizeof(float) * tn, 0);
+        ob[i] = sepia_gpu_alloc(sizeof(float) * tn, 0);
+        if (!wb[i] || !hb[i] || !ib[i] || !ob[i]) die("gpu-compare: sconv: alloc failed");
+        memcpy(sepia_gpu_host_ptr(wb[i]), it->w, sizeof(float) * wn);
+        memcpy(sepia_gpu_host_ptr(hb[i]), it->hist, sizeof(float) * hn);
+        memcpy(sepia_gpu_host_ptr(ib[i]), it->in, sizeof(float) * tn);
+        if (!sepia_gpu_sconv(wb[i], hb[i], ib[i], ob[i], it->C, it->K, it->T))
+            die("gpu-compare: sconv: dispatch failed (instance %d)", i);
+    }
+    if (!sepia_gpu_end()) die("gpu-compare: sconv: end failed");
+
+    double max_rel = 0.0;
+    for (int i = 0; i < n_inst; i++) {
+        CapSconv *it = &g_cap_sconv.items[i];
+        float *o = (float *)sepia_gpu_host_ptr(ob[i]);
+        size_t tn = (size_t)it->T * (size_t)it->C;
+        for (size_t j = 0; j < tn; j++) {
+            double rel = gpu_compare_rel_err(o[j], it->y[j]);
+            if (rel > max_rel) max_rel = rel;
+        }
+        sepia_gpu_free(wb[i]);
+        sepia_gpu_free(hb[i]);
+        sepia_gpu_free(ib[i]);
+        sepia_gpu_free(ob[i]);
+    }
+    free(wb);
+    free(hb);
+    free(ib);
+    free(ob);
+    gpu_compare_report("sconv", max_rel, n_inst);
+}
+
+static void run_gpu_compare_tiny(void) {
+    if (!sepia_gpu_available()) die("gpu-compare-tiny: requires --metal to have initialized the GPU runtime");
+
+    const char *config_path = env_or("SEPIA_CONFIG_PATH", CONFIG_PATH);
+    const char *weights_path = env_or("SEPIA_WEIGHTS_PATH", WEIGHTS_PATH);
+    const char *ref_path = env_or("SEPIA_REF_PATH", REF_PATH);
+
+    Model m = model_load(config_path, weights_path);
+    OracleRef ref = load_oracle_ref(ref_path);
+    int full_len = ref.full_ids.len; /* the tiny oracle's T=32 teacher-forcing prefill */
+
+    Cache *c = cache_create(&m, full_len);
+    float *logits = xmalloc(sizeof(float) * (size_t)full_len * (size_t)m.cfg.unpadded_vocab_size);
+
+    g_opcap = 1;
+    model_forward_chunk(&m, c, ref.full_ids.ids, full_len, 0, logits, NULL);
+    g_opcap = 0;
+
+    free(logits);
+    cache_free(c);
+
+    fprintf(stderr, "gpu-compare-tiny: captured %d rmsnorm, %d matvec, %d silu_mul, %d add, "
+                     "%d softmax, %d sconv instances from a %d-token prefill\n",
+            g_cap_rmsnorm.count, g_cap_matvec.count, g_cap_silu.count, g_cap_add.count,
+            g_cap_softmax.count, g_cap_sconv.count, full_len);
+
+    gpu_compare_rmsnorm();
+    gpu_compare_matvec();
+    gpu_compare_silu_mul();
+    gpu_compare_add();
+    gpu_compare_softmax();
+    gpu_compare_sconv();
+
+    if (g_gpu_compare_failed)
+        die("gpu-compare-tiny: at least one op exceeded the %.0e relative-error tolerance", SEPIA_GPU_COMPARE_TOL);
+    printf("gpu compare ok\n");
+}
+
 /* ================================== main =================================== */
 
 int main(int argc, char **argv) {
@@ -2503,7 +3093,7 @@ int main(int argc, char **argv) {
     const char *smoke_dir = NULL;
     const char *prompt = "The capital of France is";
     int n_gen = 32;
-    int do_real = 0, do_mlock = 0, logits_only = 0, do_metal = 0, do_gpu_selftest = 0;
+    int do_real = 0, do_mlock = 0, logits_only = 0, do_metal = 0, do_gpu_selftest = 0, do_gpu_compare_tiny = 0;
 
     for (int i = 1; i < argc; i++) {
         if (strcmp(argv[i], "--dump-acts") == 0 && i + 1 < argc) {
@@ -2524,12 +3114,15 @@ int main(int argc, char **argv) {
             do_metal = 1;
         } else if (strcmp(argv[i], "--gpu-selftest") == 0) {
             do_gpu_selftest = 1;
+        } else if (strcmp(argv[i], "--gpu-compare-tiny") == 0) {
+            do_gpu_compare_tiny = 1;
         } else {
             fprintf(stderr,
                 "usage: %s [--dump-acts FILE] [--metal]\n"
                 "       %s --smoke DIR\n"
                 "       %s --real [--prompt TEXT] [--n-gen N] [--mlock] [--logits-only] [--metal]\n"
                 "       %s --metal --gpu-selftest\n"
+                "       %s --metal --gpu-compare-tiny\n"
                 "\n"
                 "--real paths default to docs/inkling-config.json, weights/resident-manifest.json,\n"
                 "weights/inkling-ud-q2_k_xl.sepia-index.json, weights/tokenizer.bin -- override with\n"
@@ -2541,8 +3134,11 @@ int main(int argc, char **argv) {
                 "still runs on the CPU path in this build -- init failure is fatal since --metal was\n"
                 "explicitly requested.\n"
                 "--gpu-selftest exercises the zero-copy GPU buffer API (wrap_mmap/alloc/free/host_ptr)\n"
-                "end-to-end against a live device; requires --metal, local-only (needs a Metal GPU).\n",
-                argv[0], argv[0], argv[0], argv[0]);
+                "end-to-end against a live device; requires --metal, local-only (needs a Metal GPU).\n"
+                "--gpu-compare-tiny runs a real tiny-oracle prefill on the CPU, replays each captured\n"
+                "rmsnorm/matvec/silu_mul/add/softmax/sconv instance on the GPU, and reports max relative\n"
+                "error per op kind; requires --metal, local-only (needs a Metal GPU).\n",
+                argv[0], argv[0], argv[0], argv[0], argv[0]);
             return 2;
         }
     }
@@ -2556,6 +3152,11 @@ int main(int argc, char **argv) {
 
     if (do_gpu_selftest) {
         run_gpu_selftest();
+        return 0;
+    }
+
+    if (do_gpu_compare_tiny) {
+        run_gpu_compare_tiny();
         return 0;
     }
 

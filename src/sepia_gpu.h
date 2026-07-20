@@ -60,4 +60,72 @@ uint64_t sepia_gpu_gpu_addr(SepiaGpuBuf *b);
  * actual GPU execution. Returns 1 on success, 0 on failure. */
 int sepia_gpu_selftest_touch(SepiaGpuBuf *buf, size_t n_floats);
 
+/* ------------------------------ batched encoding --------------------------- */
+/* Mirrors ds4's begin/flush/end batching idiom (ds4_metal.m:6414-6613): one
+ * open compute encoder accumulates many dispatches into a single command
+ * buffer, and synchronization only happens where the caller asks for it.
+ * Every sepia_gpu_<op> dispatch function below REQUIRES an active batch
+ * (sepia_gpu_begin having succeeded and not yet been sepia_gpu_end'd) --
+ * calling one with no active batch logs and returns 0, it does not silently
+ * create a one-off command buffer.
+ *
+ *   sepia_gpu_begin()  -- opens a new batch. 0 if one is already open, or on
+ *                         allocation failure.
+ *   sepia_gpu_flush()  -- ends the current encoder, commits the command
+ *                         buffer WITHOUT waiting (fire-and-forget), and
+ *                         immediately opens a fresh batch so dispatching can
+ *                         continue. Use this at a mid-graph point where you
+ *                         want work handed to the GPU but don't need results
+ *                         back yet.
+ *   sepia_gpu_end()    -- ends the current encoder, commits, and BLOCKS on
+ *                         waitUntilCompleted, checking the command buffer's
+ *                         status. This is the only one of the three that
+ *                         synchronizes -- call it once you need the results
+ *                         of everything dispatched since the matching
+ *                         sepia_gpu_begin(). Does not reopen a batch. */
+int sepia_gpu_begin(void);
+int sepia_gpu_flush(void);
+int sepia_gpu_end(void);
+
+/* --------------------------------- ops -------------------------------- */
+/* All of the following require an active batch (sepia_gpu_begin()) and
+ * return 1 on success, 0 on failure (invalid args, no active batch, or a
+ * missing/failed pipeline). f32 in/out/accum throughout; see metal/ops.metal
+ * for the exact per-kernel numerics and src/sepia.c for the CPU oracle each
+ * one is compared against by --gpu-compare-tiny.
+ *
+ * Weight/first-operand buffer first, then the batched/main operand, then
+ * the output, then dims/scalars -- kept consistent across every op below
+ * (rmsnorm's `w` reused per row is the model for this ordering). */
+
+/* y[r,i] = w[i] * (x[r,i] * rsqrt(mean_i(x[r,i]^2) + eps)), r in [0,rows). */
+int sepia_gpu_rmsnorm(SepiaGpuBuf *w, SepiaGpuBuf *x, SepiaGpuBuf *y, int64_t rows, int64_t n, float eps);
+
+/* y[o] = dot(w[o,:], x) for o in [0,out_dim); w is [out_dim,in_dim] row-major
+ * and contiguous (row stride == in_dim*sizeof(float)) -- Task 3's scope is
+ * plain f32 matvec only; strided/interleaved row layouts are a later task's
+ * concern (see the ABI note in docs/superpowers/sdd/task-3-report.md). */
+int sepia_gpu_matvec(SepiaGpuBuf *w, SepiaGpuBuf *x, SepiaGpuBuf *y, int64_t out_dim, int64_t in_dim);
+
+/* z[i] = silu(g[i]) * u[i], silu(v) = v*sigmoid(v) -- matches silu_f/sigmoid_f
+ * in src/sepia.c exactly (no accumulation, so this one is expected near
+ * bit-exact rather than merely within tolerance). */
+int sepia_gpu_silu_mul(SepiaGpuBuf *g, SepiaGpuBuf *u, SepiaGpuBuf *z, int64_t n);
+
+/* out[i] = a[i] + b[i], elementwise. */
+int sepia_gpu_add(SepiaGpuBuf *a, SepiaGpuBuf *b, SepiaGpuBuf *out, int64_t n);
+
+/* Numerically stable softmax, one row at a time: y[r,:] = softmax(x[r,:]),
+ * r in [0,rows) -- max-subtract, exp-sum, normalize, matching the structure
+ * of attn_forward_chunk's inlined stable softmax (src/sepia.c:961-984). y
+ * may alias x (in place). */
+int sepia_gpu_softmax(SepiaGpuBuf *x, SepiaGpuBuf *y, int64_t rows, int64_t n);
+
+/* K-tap depthwise causal conv1d + residual, mirroring sconv_apply
+ * (src/sepia.c:791-806) exactly: out[t,c] = in[t,c] + sum_k w[c,k]*window[t+k],
+ * window = concat(hist[K-1,C], in[T,C]). Does not write an updated history
+ * buffer back out (see the report's ABI notes -- Task 8's concern). */
+int sepia_gpu_sconv(SepiaGpuBuf *w, SepiaGpuBuf *hist, SepiaGpuBuf *in, SepiaGpuBuf *out,
+                     int64_t C, int64_t K, int64_t T);
+
 #endif

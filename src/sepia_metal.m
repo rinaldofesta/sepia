@@ -34,6 +34,13 @@ static id<MTLLibrary> g_library;
 static char g_device_name[256];
 static int g_available;
 
+/* Batched encoding state (Task 3) -- see the sepia_gpu_begin/flush/end
+ * definitions below for the full contract. Declared here (rather than next
+ * to those functions) so sepia_gpu_shutdown, above, can reset them too. */
+static id<MTLCommandBuffer> g_batch_cb;
+static id<MTLComputeCommandEncoder> g_batch_enc;
+static NSMutableDictionary<NSString *, id<MTLComputePipelineState>> *g_pso_cache;
+
 /* Concatenates every *.metal file directly under metal_dir into one
  * translation unit for -newLibraryWithSource:. Sorted for a deterministic
  * build. Returns nil (after logging) if the directory can't be read, a
@@ -137,6 +144,9 @@ void sepia_gpu_shutdown(void) {
     g_device = nil;
     g_device_name[0] = '\0';
     g_available = 0;
+    g_batch_cb = nil;
+    g_batch_enc = nil;
+    g_pso_cache = nil;
 }
 
 const char *sepia_gpu_device_name(void) {
@@ -267,6 +277,317 @@ void *sepia_gpu_host_ptr(SepiaGpuBuf *b) {
 uint64_t sepia_gpu_gpu_addr(SepiaGpuBuf *b) {
     if (!b || !b->buffer) return 0;
     return (uint64_t)[b->buffer gpuAddress];
+}
+
+/* ------------------------------ batched encoding --------------------------- */
+/* g_batch_cb/g_batch_enc mirror ds4's g_batch_cb/g_batch_enc (ds4_metal.m:47-
+ * 48): one open command buffer + one open compute encoder that dispatch
+ * calls append to, until flush (commit, no wait, reopen) or end (commit,
+ * wait, don't reopen). g_pso_cache avoids rebuilding a MTLComputePipelineState
+ * per dispatch call -- the comparison harness calls the same handful of
+ * kernels hundreds of times over a captured instance list. (All three are
+ * declared at the top of the file, with the other globals, so
+ * sepia_gpu_shutdown can reset them.) */
+
+static id<MTLComputeCommandEncoder> sepia_gpu_encoder(void) {
+    if (!g_batch_cb) return nil;
+    if (!g_batch_enc) g_batch_enc = [g_batch_cb computeCommandEncoder];
+    return g_batch_enc;
+}
+
+static id<MTLComputePipelineState> sepia_gpu_pso(NSString *name) {
+    if (!g_pso_cache) g_pso_cache = [NSMutableDictionary new];
+    id<MTLComputePipelineState> pso = g_pso_cache[name];
+    if (pso) return pso;
+
+    id<MTLFunction> fn = [g_library newFunctionWithName:name];
+    if (!fn) {
+        fprintf(stderr, "sepia: metal: kernel function \"%s\" not found\n", name.UTF8String);
+        return nil;
+    }
+    NSError *error = nil;
+    pso = [g_device newComputePipelineStateWithFunction:fn error:&error];
+    if (!pso) {
+        fprintf(stderr, "sepia: metal: pipeline creation failed for \"%s\": %s\n",
+                name.UTF8String, error.localizedDescription.UTF8String);
+        return nil;
+    }
+    g_pso_cache[name] = pso;
+    return pso;
+}
+
+/* Smallest threadgroup width (a power of two, multiple of the 32-wide SIMD
+ * group, capped at 1024) that lets a strided i+=ntg.x loop cover n elements
+ * without excessive over-subscription for the row-reduction kernels
+ * (rmsnorm/matvec/softmax). */
+static NSUInteger sepia_gpu_reduce_width(int64_t n) {
+    NSUInteger w = 32;
+    while (w < (NSUInteger)n && w < 1024) w *= 2;
+    return w;
+}
+
+int sepia_gpu_begin(void) {
+    if (!g_available || !g_queue) {
+        fprintf(stderr, "sepia: metal: begin: GPU not initialized\n");
+        return 0;
+    }
+    if (g_batch_cb) {
+        fprintf(stderr, "sepia: metal: begin: a batch is already active\n");
+        return 0;
+    }
+    @autoreleasepool {
+        g_batch_cb = [g_queue commandBuffer];
+    }
+    if (!g_batch_cb) {
+        fprintf(stderr, "sepia: metal: begin: failed to create a command buffer\n");
+        return 0;
+    }
+    return 1;
+}
+
+int sepia_gpu_flush(void) {
+    if (!g_batch_cb) {
+        fprintf(stderr, "sepia: metal: flush: no active batch\n");
+        return 0;
+    }
+    @autoreleasepool {
+        if (g_batch_enc) {
+            [g_batch_enc endEncoding];
+            g_batch_enc = nil;
+        }
+        [g_batch_cb commit];
+        g_batch_cb = [g_queue commandBuffer];
+    }
+    if (!g_batch_cb) {
+        fprintf(stderr, "sepia: metal: flush: failed to open the next batch\n");
+        return 0;
+    }
+    return 1;
+}
+
+int sepia_gpu_end(void) {
+    if (!g_batch_cb) {
+        fprintf(stderr, "sepia: metal: end: no active batch\n");
+        return 0;
+    }
+    id<MTLCommandBuffer> cb;
+    @autoreleasepool {
+        if (g_batch_enc) {
+            [g_batch_enc endEncoding];
+            g_batch_enc = nil;
+        }
+        cb = g_batch_cb;
+        g_batch_cb = nil;
+        [cb commit];
+    }
+    [cb waitUntilCompleted];
+    if (cb.status != MTLCommandBufferStatusCompleted) {
+        fprintf(stderr, "sepia: metal: end: command buffer failed: %s\n",
+                cb.error ? cb.error.localizedDescription.UTF8String : "unknown error");
+        return 0;
+    }
+    return 1;
+}
+
+/* --------------------------------- op args ---------------------------- */
+/* Mirror the `constant` structs in metal/ops.metal field-for-field (same
+ * types, same order -- ds4's ne/nb ABI convention, ds4_metal.m:3108-3204,
+ * scaled down to what Task 3's contiguous f32 ops actually need: no
+ * per-dim nb0..nb3 generality yet, since every buffer here is a plain
+ * row-major [rows,n] or [out,in] layout. Task 4+'s strided/interleaved
+ * quantized layouts are expected to grow these, not replace them). */
+typedef struct {
+    int32_t ne0;
+    float   eps;
+} sepia_args_rmsnorm;
+
+typedef struct {
+    int32_t  ne0;
+    uint64_t nb1;
+} sepia_args_matvec;
+
+typedef struct {
+    int32_t ne0;
+} sepia_args_softmax;
+
+typedef struct {
+    int32_t C;
+    int32_t K;
+    int32_t T;
+} sepia_args_sconv;
+
+/* --------------------------------- ops ---------------------------------- */
+
+int sepia_gpu_rmsnorm(SepiaGpuBuf *w, SepiaGpuBuf *x, SepiaGpuBuf *y, int64_t rows, int64_t n, float eps) {
+    if (!w || !w->buffer || !x || !x->buffer || !y || !y->buffer || rows <= 0 || n <= 0) {
+        fprintf(stderr, "sepia: metal: rmsnorm: invalid arguments\n");
+        return 0;
+    }
+    @autoreleasepool {
+        id<MTLComputeCommandEncoder> enc = sepia_gpu_encoder();
+        if (!enc) {
+            fprintf(stderr, "sepia: metal: rmsnorm: no active batch (call sepia_gpu_begin first)\n");
+            return 0;
+        }
+        id<MTLComputePipelineState> pso = sepia_gpu_pso(@"sepia_rmsnorm_f32");
+        if (!pso) return 0;
+
+        sepia_args_rmsnorm args = { (int32_t)n, eps };
+        [enc setComputePipelineState:pso];
+        [enc setBytes:&args length:sizeof(args) atIndex:0];
+        [enc setBuffer:w->buffer offset:0 atIndex:1];
+        [enc setBuffer:x->buffer offset:0 atIndex:2];
+        [enc setBuffer:y->buffer offset:0 atIndex:3];
+        [enc setThreadgroupMemoryLength:32 * sizeof(float) atIndex:0];
+
+        NSUInteger tw = sepia_gpu_reduce_width(n);
+        [enc dispatchThreadgroups:MTLSizeMake((NSUInteger)rows, 1, 1)
+             threadsPerThreadgroup:MTLSizeMake(tw, 1, 1)];
+    }
+    return 1;
+}
+
+int sepia_gpu_matvec(SepiaGpuBuf *w, SepiaGpuBuf *x, SepiaGpuBuf *y, int64_t out_dim, int64_t in_dim) {
+    if (!w || !w->buffer || !x || !x->buffer || !y || !y->buffer || out_dim <= 0 || in_dim <= 0) {
+        fprintf(stderr, "sepia: metal: matvec: invalid arguments\n");
+        return 0;
+    }
+    @autoreleasepool {
+        id<MTLComputeCommandEncoder> enc = sepia_gpu_encoder();
+        if (!enc) {
+            fprintf(stderr, "sepia: metal: matvec: no active batch (call sepia_gpu_begin first)\n");
+            return 0;
+        }
+        id<MTLComputePipelineState> pso = sepia_gpu_pso(@"sepia_matvec_f32");
+        if (!pso) return 0;
+
+        sepia_args_matvec args = { (int32_t)in_dim, (uint64_t)(in_dim * (int64_t)sizeof(float)) };
+        [enc setComputePipelineState:pso];
+        [enc setBytes:&args length:sizeof(args) atIndex:0];
+        [enc setBuffer:w->buffer offset:0 atIndex:1];
+        [enc setBuffer:x->buffer offset:0 atIndex:2];
+        [enc setBuffer:y->buffer offset:0 atIndex:3];
+        [enc setThreadgroupMemoryLength:32 * sizeof(float) atIndex:0];
+
+        NSUInteger tw = sepia_gpu_reduce_width(in_dim);
+        [enc dispatchThreadgroups:MTLSizeMake((NSUInteger)out_dim, 1, 1)
+             threadsPerThreadgroup:MTLSizeMake(tw, 1, 1)];
+    }
+    return 1;
+}
+
+int sepia_gpu_silu_mul(SepiaGpuBuf *g, SepiaGpuBuf *u, SepiaGpuBuf *z, int64_t n) {
+    if (!g || !g->buffer || !u || !u->buffer || !z || !z->buffer || n <= 0) {
+        fprintf(stderr, "sepia: metal: silu_mul: invalid arguments\n");
+        return 0;
+    }
+    @autoreleasepool {
+        id<MTLComputeCommandEncoder> enc = sepia_gpu_encoder();
+        if (!enc) {
+            fprintf(stderr, "sepia: metal: silu_mul: no active batch (call sepia_gpu_begin first)\n");
+            return 0;
+        }
+        id<MTLComputePipelineState> pso = sepia_gpu_pso(@"sepia_silu_mul_f32");
+        if (!pso) return 0;
+
+        [enc setComputePipelineState:pso];
+        [enc setBuffer:g->buffer offset:0 atIndex:0];
+        [enc setBuffer:u->buffer offset:0 atIndex:1];
+        [enc setBuffer:z->buffer offset:0 atIndex:2];
+
+        NSUInteger width = pso.threadExecutionWidth;
+        if (width > (NSUInteger)n) width = (NSUInteger)n;
+        [enc dispatchThreads:MTLSizeMake((NSUInteger)n, 1, 1)
+             threadsPerThreadgroup:MTLSizeMake(width, 1, 1)];
+    }
+    return 1;
+}
+
+int sepia_gpu_add(SepiaGpuBuf *a, SepiaGpuBuf *b, SepiaGpuBuf *out, int64_t n) {
+    if (!a || !a->buffer || !b || !b->buffer || !out || !out->buffer || n <= 0) {
+        fprintf(stderr, "sepia: metal: add: invalid arguments\n");
+        return 0;
+    }
+    @autoreleasepool {
+        id<MTLComputeCommandEncoder> enc = sepia_gpu_encoder();
+        if (!enc) {
+            fprintf(stderr, "sepia: metal: add: no active batch (call sepia_gpu_begin first)\n");
+            return 0;
+        }
+        id<MTLComputePipelineState> pso = sepia_gpu_pso(@"sepia_add_f32");
+        if (!pso) return 0;
+
+        [enc setComputePipelineState:pso];
+        [enc setBuffer:a->buffer offset:0 atIndex:0];
+        [enc setBuffer:b->buffer offset:0 atIndex:1];
+        [enc setBuffer:out->buffer offset:0 atIndex:2];
+
+        NSUInteger width = pso.threadExecutionWidth;
+        if (width > (NSUInteger)n) width = (NSUInteger)n;
+        [enc dispatchThreads:MTLSizeMake((NSUInteger)n, 1, 1)
+             threadsPerThreadgroup:MTLSizeMake(width, 1, 1)];
+    }
+    return 1;
+}
+
+int sepia_gpu_softmax(SepiaGpuBuf *x, SepiaGpuBuf *y, int64_t rows, int64_t n) {
+    if (!x || !x->buffer || !y || !y->buffer || rows <= 0 || n <= 0) {
+        fprintf(stderr, "sepia: metal: softmax: invalid arguments\n");
+        return 0;
+    }
+    @autoreleasepool {
+        id<MTLComputeCommandEncoder> enc = sepia_gpu_encoder();
+        if (!enc) {
+            fprintf(stderr, "sepia: metal: softmax: no active batch (call sepia_gpu_begin first)\n");
+            return 0;
+        }
+        id<MTLComputePipelineState> pso = sepia_gpu_pso(@"sepia_softmax_f32");
+        if (!pso) return 0;
+
+        sepia_args_softmax args = { (int32_t)n };
+        [enc setComputePipelineState:pso];
+        [enc setBytes:&args length:sizeof(args) atIndex:0];
+        [enc setBuffer:x->buffer offset:0 atIndex:1];
+        [enc setBuffer:y->buffer offset:0 atIndex:2];
+        [enc setThreadgroupMemoryLength:32 * sizeof(float) atIndex:0];
+
+        NSUInteger tw = sepia_gpu_reduce_width(n);
+        [enc dispatchThreadgroups:MTLSizeMake((NSUInteger)rows, 1, 1)
+             threadsPerThreadgroup:MTLSizeMake(tw, 1, 1)];
+    }
+    return 1;
+}
+
+int sepia_gpu_sconv(SepiaGpuBuf *w, SepiaGpuBuf *hist, SepiaGpuBuf *in, SepiaGpuBuf *out,
+                     int64_t C, int64_t K, int64_t T) {
+    if (!w || !w->buffer || !hist || !hist->buffer || !in || !in->buffer || !out || !out->buffer ||
+        C <= 0 || K <= 0 || T <= 0) {
+        fprintf(stderr, "sepia: metal: sconv: invalid arguments\n");
+        return 0;
+    }
+    @autoreleasepool {
+        id<MTLComputeCommandEncoder> enc = sepia_gpu_encoder();
+        if (!enc) {
+            fprintf(stderr, "sepia: metal: sconv: no active batch (call sepia_gpu_begin first)\n");
+            return 0;
+        }
+        id<MTLComputePipelineState> pso = sepia_gpu_pso(@"sepia_sconv_f32");
+        if (!pso) return 0;
+
+        sepia_args_sconv args = { (int32_t)C, (int32_t)K, (int32_t)T };
+        [enc setComputePipelineState:pso];
+        [enc setBytes:&args length:sizeof(args) atIndex:0];
+        [enc setBuffer:w->buffer offset:0 atIndex:1];
+        [enc setBuffer:hist->buffer offset:0 atIndex:2];
+        [enc setBuffer:in->buffer offset:0 atIndex:3];
+        [enc setBuffer:out->buffer offset:0 atIndex:4];
+
+        NSUInteger tgx = MIN((NSUInteger)C, (NSUInteger)32);
+        NSUInteger tgy = MIN((NSUInteger)T, (NSUInteger)32);
+        [enc dispatchThreads:MTLSizeMake((NSUInteger)C, (NSUInteger)T, 1)
+             threadsPerThreadgroup:MTLSizeMake(tgx, tgy, 1)];
+    }
+    return 1;
 }
 
 int sepia_gpu_selftest_touch(SepiaGpuBuf *buf, size_t n_floats) {
