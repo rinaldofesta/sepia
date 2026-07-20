@@ -66,13 +66,21 @@ src/sepia_gpu_stub.o: src/sepia_gpu_stub.c src/sepia_gpu.h
 # CI (macos-latest ships the toolchain). `metal -c` refuses multiple inputs
 # sharing one -o (mirrors clang -c), hence the per-file loop. Non-Darwin:
 # no Metal toolchain exists, so this is a no-op rather than a hard failure.
+# Darwin machines with only Command Line Tools (no Xcode.app) have the Metal
+# framework but not the offline `metal` compiler -- `xcrun -f metal` detects
+# that so this skips gracefully instead of hard-failing `make ci`; runtime
+# compilation via `--metal` is unaffected either way.
 shadercheck:
 ifeq ($(UNAME_S),Darwin)
-	@for f in metal/*.metal; do \
-		echo "shadercheck: $$f"; \
-		xcrun -sdk macosx metal -c "$$f" -o /dev/null || exit 1; \
-	done
-	@echo "shadercheck ok"
+	@if xcrun -f metal >/dev/null 2>&1; then \
+		for f in metal/*.metal; do \
+			echo "shadercheck: $$f"; \
+			xcrun -sdk macosx metal -c "$$f" -o /dev/null || exit 1; \
+		done; \
+		echo "shadercheck ok"; \
+	else \
+		echo "shadercheck: skipped (no offline Metal compiler; runtime compile covered by --metal)"; \
+	fi
 else
 	@echo "shadercheck: skipped (not Darwin)"
 endif
