@@ -163,16 +163,20 @@ gpuattn: sepia
 	./sepia --metal --gpu-compare-attn
 
 # local-only: needs a live Metal device AND the real 317GB UD-Q2_K_XL weights
-# under weights/ -- Task 9/10's real-model resident-path gate. Reproduces the
-# exact 32-token id sequences P1 recorded on the CPU path (docs/
+# under weights/ -- Task 9/10/11's real-model resident-path gate. Reproduces
+# the exact 32-token id sequences P1 recorded on the CPU path (docs/
 # p1-first-tokens.md) for both prompts, on the --metal GPU path (quantized
 # resident weights read straight off gpu_res_buf; routed experts stream
-# through the GPU-resident LRU expert cache, Task 10). --repeat 2 runs each
+# through the GPU-resident LRU expert cache, Task 10, now overlapped with
+# GPU compute via a loader thread pool, Task 11). --repeat 2 runs each
 # prompt twice in the SAME process (run 1 cold, run 2 warm -- the cache is
 # empty at process start and stays populated across the repeat) and proves
 # double-run determinism at the same time; --verbose-cache reports the
-# hit/miss counts Task 10's gate asks for. Not in ci (needs weights + a live
-# device, same reason gputest/gpucompare/gpuattn/gpuquants aren't).
+# hit/miss counts Task 10's gate asks for. --expert-io-mode {nocache|
+# pagecache} (Task 11) selects the routed-expert pread path for the A/B --
+# not exercised by this default invocation (F_NOCACHE). Not in ci (needs
+# weights + a live device, same reason gputest/gpucompare/gpuattn/gpuquants
+# aren't).
 realmetal: sepia
 	./sepia --metal --real --prompt "The capital of France is" --n-gen 32 --repeat 2 --verbose-cache
 	./sepia --metal --real --prompt "def fibonacci(n):" --n-gen 32 --repeat 2 --verbose-cache
