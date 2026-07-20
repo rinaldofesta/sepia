@@ -6,6 +6,7 @@
 #pragma STDC FP_CONTRACT OFF
 
 #include "quants.h"
+#include "quants_grids.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -175,6 +176,30 @@ static void dequant_q6_k(const void *src, float *dst, int64_t n) {
     }
 }
 
+static void dequant_iq2_xs(const void *src, float *dst, int64_t n) {
+    const uint8_t *p = (const uint8_t *)src;
+    for (int64_t b = 0; b < n / QK_K; b++) {
+        uint16_t dbits; memcpy(&dbits, p, 2);
+        const float d = quants_f16_to_f32(dbits);
+        uint16_t qs[32]; memcpy(qs, p + 2, 64);
+        const uint8_t *scales = p + 66;
+        for (int ib32 = 0; ib32 < 8; ib32++) {
+            float db[2];
+            db[0] = d * (0.5f + (scales[ib32] & 0xF)) * 0.25f;
+            db[1] = d * (0.5f + (scales[ib32] >> 4))  * 0.25f;
+            for (int l = 0; l < 4; l++) {
+                const uint8_t *grid = (const uint8_t *)(iq2xs_grid + (qs[4 * ib32 + l] & 511));
+                const uint8_t signs = ksigns_iq2xs[qs[4 * ib32 + l] >> 9];
+                const float dl = db[l / 2];
+                for (int j = 0; j < 8; j++)
+                    dst[j] = dl * grid[j] * ((signs & kmask_iq2xs[j]) ? -1.0f : 1.0f);
+                dst += 8;
+            }
+        }
+        p += 74;
+    }
+}
+
 void dequantize_row(int t, const void *src, float *dst, int64_t n) {
     if (n % quants_block_size(t) != 0)
         qdie("quants: dequantize_row n=%lld not block-aligned for type %d", (long long)n, t);
@@ -185,6 +210,7 @@ void dequantize_row(int t, const void *src, float *dst, int64_t n) {
     case SEPIA_T_Q4_K: dequant_q4_k(src, dst, n); break;
     case SEPIA_T_Q5_K: dequant_q5_k(src, dst, n); break;
     case SEPIA_T_Q6_K: dequant_q6_k(src, dst, n); break;
+    case SEPIA_T_IQ2_XS: dequant_iq2_xs(src, dst, n); break;
     default: qdie("quants: dequant for ggml type %d not yet implemented", t);
     }
 }
