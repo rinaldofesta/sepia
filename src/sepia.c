@@ -42,6 +42,7 @@
 #include <string.h>
 #include <sys/mman.h>
 #include <sys/stat.h>
+#include <time.h>
 #include <unistd.h>
 
 /* ============================== utilities ============================== */
@@ -539,6 +540,7 @@ static Config config_load(const char *path) {
 }
 
 #include "quants.h"
+#include "tokenizer.h"
 
 /* QTensor: a weight matrix stored quantized on disk (Task 14 loads these
  * in place of the float32 tensors above). Interface only here, above the
@@ -1124,14 +1126,11 @@ static void mlp_moe_forward(const Config *cfg, const LayerWeights *lw, const flo
     free(router_logits);
 }
 
-/* Step 1 placeholder: real_exps is always NULL in oracle mode, so this body
- * is dead code until Task 14 Steps 2-3 replace it with the full streamed
- * (pread + qlinear) implementation, near real_load below. Kept here only so
- * the seam link-completes for the Step 1 gate (`make ci`: oracle self-test). */
-static void real_expert_ffn(const struct RealExperts *re, int expert_idx, const float *x, float *expert_out) {
-    (void)re; (void)expert_idx; (void)x; (void)expert_out;
-    die("real_expert_ffn: not yet implemented (Task 14 Steps 2-3)");
-}
+/* real_expert_ffn's full definition lives in the "real model" section below,
+ * after RealExperts is defined -- the forward declaration near LayerWeights
+ * (and the seam call site in mlp_moe_forward above) is all that's needed
+ * here, since real_exps is always NULL in oracle mode (this branch is never
+ * taken by the self-test). */
 
 /* ============================= decoder layer ============================= */
 /* Pre-norm residual wiring (sec.0/InklingDecoderLayer.forward, verified
@@ -1373,17 +1372,1074 @@ static int run_self_test(const Model *m, const char *ref_path) {
     return (prefill_ok == full_len) && (decode_ok == n_decode);
 }
 
+/* ============================== real model (Task 14) ====================== */
+/* Real-checkpoint loader + streaming MoE forward. Design principle: reuse
+ * the Phase-0-verified forward math (attn_forward_chunk, mlp_dense_forward,
+ * mlp_moe_forward, decoder_layer_forward) completely unchanged. Real mode
+ * only supplies a *different way to fill LayerWeights* each layer -- F32
+ * tensors point straight into the resident.bin mmap, quantized tensors are
+ * dequantized row-by-row into a reusable f32 arena (qrow), and the routed
+ * (non-resident) experts are streamed via the pluggable seam added in
+ * Step 1 (real_expert_ffn). See docs/container.md sec.2-3 and the tensor
+ * mapping table in .superpowers/sdd/task-14-brief.md for the on-disk
+ * conventions this section implements.
+ *
+ * GGUF shape convention (verified directly against the real sidecars,
+ * cross-checked against docs/gguf-inventory-ud-q2_k_xl.md's per-expert
+ * table): for an N-d tensor, shape[0] is the fastest-varying/contiguous
+ * dimension and shape[N-1] the slowest. For every 2D weight matrix this
+ * engine consumes, that means in_dim=shape[0] (contiguous per row),
+ * out_dim=shape[1] (row count) -- exactly the QTensor{out_dim,in_dim}
+ * convention already used above. For the 3D "stacked" shared-expert
+ * tensors (ffn_{gate,up,down}_shexp.weight), shape[2] is the stack count
+ * (2 shared experts), and each stack's bytes are a fully contiguous 2D
+ * matrix in the same [out_dim,in_dim] layout, back to back.
+ */
+
+static char *xstrdup(const char *s) {
+    size_t n = strlen(s) + 1;
+    char *p = xmalloc(n);
+    memcpy(p, s, n);
+    return p;
+}
+
+/* dirname(path) + "/" + suffix. Used to derive the GGUF parts directory
+ * from the index sidecar's own path (weights/inkling-gguf sits alongside
+ * weights/inkling-ud-q2_k_xl.sepia-index.json) and resident.bin's path
+ * from the manifest's, without needing extra CLI flags -- the same
+ * convention serves both --real and --smoke. */
+static char *dirname_join(const char *path, const char *suffix) {
+    const char *slash = strrchr(path, '/');
+    const char *dir = slash ? path : ".";
+    size_t dirlen = slash ? (size_t)(slash - path) : 1;
+    size_t n = dirlen + 1 + strlen(suffix) + 1;
+    char *out = xmalloc(n);
+    memcpy(out, dir, dirlen);
+    out[dirlen] = '/';
+    memcpy(out + dirlen + 1, suffix, strlen(suffix) + 1);
+    return out;
+}
+
+/* Generic (not text_config-scoped) required-field JSON accessors, for the
+ * manifest/index sidecars -- config.json's own json_get_int/json_get_double
+ * above are scoped to a specific "text_config" object and don't fit here. */
+static int64_t json_req_i64(const JsonValue *obj, const char *key, const char *what) {
+    const JsonValue *v = json_get(obj, key);
+    if (json_is_null(v)) die("%s: missing required field '%s'", what, key);
+    return (int64_t)json_num(v, 0);
+}
+static int json_req_int(const JsonValue *obj, const char *key, const char *what) {
+    return (int)json_req_i64(obj, key, what);
+}
+static const char *json_req_str(const JsonValue *obj, const char *key, const char *what) {
+    const JsonValue *v = json_get(obj, key);
+    const char *s = json_str(v, NULL);
+    if (!s) die("%s: missing required string field '%s'", what, key);
+    return s;
+}
+
+/* ------------------------- resident-manifest.json -------------------------- */
+
+typedef struct {
+    char *name;
+    int ggml_type;
+    int64_t shape[4];
+    int n_dims;
+    int64_t offset; /* into res_base */
+    int64_t nbytes;
+} ResidentEntry;
+
+typedef struct {
+    ResidentEntry *entries;
+    size_t count;
+    const uint8_t *res_base;
+    size_t res_size;
+} ResidentTable;
+
+/* Parses resident-manifest.json's "tensors" array into a name-indexed table
+ * (linear array + strcmp lookup -- ~1300 tensors, load-time only, per the
+ * brief). Every entry's [offset,offset+nbytes) is bounds-checked against
+ * res_size, same discipline as st_find's safetensors bounds check above. */
+static ResidentTable manifest_load(const char *path, const void *res_base, size_t res_size) {
+    size_t len;
+    char *buf = read_file(path, &len);
+    JsonValue *root = json_parse(buf, len);
+    const JsonValue *tensors = json_get(root, "tensors");
+    if (!tensors || tensors->type != JSON_ARR) die("%s: missing 'tensors' array", path);
+
+    ResidentTable rt = {0};
+    rt.res_base = (const uint8_t *)res_base;
+    rt.res_size = res_size;
+    rt.count = tensors->arr_count;
+    rt.entries = xcalloc(rt.count, sizeof(ResidentEntry));
+    for (size_t i = 0; i < rt.count; i++) {
+        const JsonValue *t = tensors->arr_items[i];
+        ResidentEntry *e = &rt.entries[i];
+        e->name = xstrdup(json_req_str(t, "name", path));
+        e->ggml_type = json_req_int(t, "ggml_type", path);
+        e->offset = json_req_i64(t, "offset", path);
+        e->nbytes = json_req_i64(t, "nbytes", path);
+        const JsonValue *shape = json_get(t, "shape");
+        if (!shape || shape->type != JSON_ARR || shape->arr_count == 0 || shape->arr_count > 4)
+            die("%s: tensor '%s' has a missing/invalid 'shape' (1-4 dims expected)", path, e->name);
+        e->n_dims = (int)shape->arr_count;
+        for (int d = 0; d < e->n_dims; d++) e->shape[d] = (int64_t)json_num(shape->arr_items[d], 0);
+        if (e->offset < 0 || e->nbytes < 0 || (uint64_t)e->offset + (uint64_t)e->nbytes > (uint64_t)res_size)
+            die("%s: tensor '%s' [%lld,%lld) exceeds resident.bin size %zu bytes",
+                path, e->name, (long long)e->offset, (long long)(e->offset + e->nbytes), res_size);
+    }
+    free(buf);
+    return rt;
+}
+
+static const ResidentEntry *resident_find(const ResidentTable *rt, const char *name) {
+    for (size_t i = 0; i < rt->count; i++)
+        if (strcmp(rt->entries[i].name, name) == 0) return &rt->entries[i];
+    return NULL;
+}
+static const ResidentEntry *resident_get(const ResidentTable *rt, const char *name) {
+    const ResidentEntry *e = resident_find(rt, name);
+    if (!e) die("resident-manifest: missing tensor '%s'", name);
+    return e;
+}
+
+/* F32 resident tensor: direct pointer into res_base, no dequant/copy. */
+static const float *resident_f32(const ResidentTable *rt, const char *name) {
+    const ResidentEntry *e = resident_get(rt, name);
+    if (e->ggml_type != SEPIA_T_F32) die("resident tensor '%s': expected F32, got ggml_type %d", name, e->ggml_type);
+    int64_t numel = 1;
+    for (int d = 0; d < e->n_dims; d++) numel *= e->shape[d];
+    if (e->nbytes != numel * (int64_t)sizeof(float))
+        die("resident tensor '%s': nbytes %lld disagrees with shape (numel=%lld)",
+            name, (long long)e->nbytes, (long long)numel);
+    return (const float *)(rt->res_base + e->offset);
+}
+
+/* 2D weight matrix -> QTensor{out_dim=shape[1], in_dim=shape[0]} (see the
+ * shape-convention note at the top of this section). */
+static QTensor resident_qtensor(const ResidentTable *rt, const char *name) {
+    const ResidentEntry *e = resident_get(rt, name);
+    if (e->n_dims != 2) die("resident tensor '%s': expected 2 dims, got %d", name, e->n_dims);
+    QTensor q;
+    q.ggml_type = e->ggml_type;
+    q.data = rt->res_base + e->offset;
+    q.in_dim = e->shape[0];
+    q.out_dim = e->shape[1];
+    size_t want = quants_row_bytes(e->ggml_type, q.in_dim) * (size_t)q.out_dim;
+    if ((size_t)e->nbytes != want)
+        die("resident tensor '%s': nbytes %lld disagrees with shape/type (want %zu)",
+            name, (long long)e->nbytes, want);
+    return q;
+}
+
+/* 3D tensor with n_stack "experts" stacked along the slowest-varying axis
+ * (shared-expert gate/up/down: ffn_{gate,up,down}_shexp.weight, 2 stacked).
+ * Returns stack index 0's QTensor plus the per-stack byte stride; caller
+ * offsets .data by s*stride for s in [1,n_stack). */
+static QTensor resident_qtensor_stacked(const ResidentTable *rt, const char *name, int n_stack, int64_t *stride_out) {
+    const ResidentEntry *e = resident_get(rt, name);
+    if (e->n_dims != 3) die("resident tensor '%s': expected 3 dims (stacked), got %d", name, e->n_dims);
+    if (e->shape[2] != n_stack)
+        die("resident tensor '%s': stack dim %lld != expected %d", name, (long long)e->shape[2], n_stack);
+    if (e->nbytes % n_stack != 0)
+        die("resident tensor '%s': nbytes %lld not a multiple of %d stacks", name, (long long)e->nbytes, n_stack);
+    QTensor q;
+    q.ggml_type = e->ggml_type;
+    q.data = rt->res_base + e->offset;
+    q.in_dim = e->shape[0];
+    q.out_dim = e->shape[1];
+    int64_t stride = e->nbytes / n_stack;
+    size_t want = quants_row_bytes(e->ggml_type, q.in_dim) * (size_t)q.out_dim;
+    if ((size_t)stride != want)
+        die("resident tensor '%s': per-stack bytes %lld disagrees with shape/type (want %zu)",
+            name, (long long)stride, want);
+    *stride_out = stride;
+    return q;
+}
+
+/* Per-layer resident tensor names are "blk.<layer>.<suffix>", mirroring the
+ * oracle loader's find_layer_tensor above. */
+static const float *real_layer_f32(const ResidentTable *rt, int layer, const char *suffix) {
+    char name[160];
+    int n = snprintf(name, sizeof name, "blk.%d.%s", layer, suffix);
+    if (n < 0 || (size_t)n >= sizeof name) die("tensor name too long for layer %d suffix %s", layer, suffix);
+    return resident_f32(rt, name);
+}
+static QTensor real_layer_qtensor(const ResidentTable *rt, int layer, const char *suffix) {
+    char name[160];
+    int n = snprintf(name, sizeof name, "blk.%d.%s", layer, suffix);
+    if (n < 0 || (size_t)n >= sizeof name) die("tensor name too long for layer %d suffix %s", layer, suffix);
+    return resident_qtensor(rt, name);
+}
+static QTensor real_layer_qtensor_stacked(const ResidentTable *rt, int layer, const char *suffix, int n_stack, int64_t *stride_out) {
+    char name[160];
+    int n = snprintf(name, sizeof name, "blk.%d.%s", layer, suffix);
+    if (n < 0 || (size_t)n >= sizeof name) die("tensor name too long for layer %d suffix %s", layer, suffix);
+    return resident_qtensor_stacked(rt, name, n_stack, stride_out);
+}
+
+/* ------------------------- sepia-index.json (experts) ----------------------- */
+
+typedef struct {
+    int part_idx;
+    int64_t abs_offset;
+    int64_t nbytes;
+    int ggml_type;
+} ExpertSlot;
+
+typedef struct {
+    ExpertSlot *gate, *up, *down; /* [n_experts] each; all NULL if this layer has no MoE entry (dense layer) */
+} MoeLayerIndex;
+
+typedef struct {
+    char **part_files; /* [n_parts], relative to dirname(index_path)/inkling-gguf */
+    int n_parts;
+    int n_experts;      /* n_experts_per_layer, read from the JSON (not hardcoded --
+                          * the real deployment is 256, the smoke fixture is 2) */
+    MoeLayerIndex *by_layer; /* [n_layers_alloc]; dense/missing layers left zeroed */
+    int n_layers_alloc;
+    int64_t max_slab_bytes; /* max nbytes over every gate/up/down/expert entry --
+                              * sizes real_expert_ffn's reusable pread buffers */
+} ExpertIndex;
+
+static int index_find_part(const ExpertIndex *idx, const char *part_file) {
+    for (int i = 0; i < idx->n_parts; i++)
+        if (strcmp(idx->part_files[i], part_file) == 0) return i;
+    return -1;
+}
+
+static void index_parse_slot(const JsonValue *slot_obj, const char *path, int layer, const char *slot_name,
+                              ExpertIndex *idx, ExpertSlot *out /* [n_experts] */) {
+    const JsonValue *experts = json_get(slot_obj, "experts");
+    if (!experts || experts->type != JSON_ARR)
+        die("%s: layer %d slot '%s' missing 'experts' array", path, layer, slot_name);
+    if ((int)experts->arr_count != idx->n_experts)
+        die("%s: layer %d slot '%s' has %zu experts, expected n_experts_per_layer=%d",
+            path, layer, slot_name, experts->arr_count, idx->n_experts);
+    for (int e = 0; e < idx->n_experts; e++) {
+        const JsonValue *ent = experts->arr_items[e];
+        const char *part_file = json_req_str(ent, "part_file", path);
+        int part_idx = index_find_part(idx, part_file);
+        if (part_idx < 0)
+            die("%s: layer %d slot '%s' expert %d references unknown part_file '%s'", path, layer, slot_name, e, part_file);
+        int64_t abs_offset = json_req_i64(ent, "abs_offset", path);
+        int64_t nbytes = json_req_i64(ent, "nbytes", path);
+        int ggml_type = json_req_int(ent, "ggml_type", path);
+        if (abs_offset < 0 || nbytes < 0)
+            die("%s: layer %d slot '%s' expert %d has a negative offset/nbytes", path, layer, slot_name, e);
+        out[e].part_idx = part_idx;
+        out[e].abs_offset = abs_offset;
+        out[e].nbytes = nbytes;
+        out[e].ggml_type = ggml_type;
+        if (nbytes > idx->max_slab_bytes) idx->max_slab_bytes = nbytes;
+    }
+}
+
+/* Parses sepia-index.json's parts[] file list and moe_layers{} object.
+ * Dies if a layer is missing any of gate/up/down, if an "experts" array's
+ * length disagrees with the top-level n_experts_per_layer, or if more than
+ * 8 parts are listed (RealModel.part_fds is fixed-size 8). */
+static ExpertIndex index_load(const char *path) {
+    size_t len;
+    char *buf = read_file(path, &len);
+    JsonValue *root = json_parse(buf, len);
+
+    ExpertIndex idx = {0};
+    idx.n_experts = json_req_int(root, "n_experts_per_layer", path);
+    if (idx.n_experts <= 0) die("%s: n_experts_per_layer must be positive, got %d", path, idx.n_experts);
+
+    const JsonValue *parts = json_get(root, "parts");
+    if (!parts || parts->type != JSON_ARR) die("%s: missing 'parts' array", path);
+    idx.n_parts = (int)parts->arr_count;
+    if (idx.n_parts <= 0 || idx.n_parts > 8) die("%s: 'parts' has %d entries, expected 1-8", path, idx.n_parts);
+    idx.part_files = xcalloc((size_t)idx.n_parts, sizeof(char *));
+    for (int i = 0; i < idx.n_parts; i++)
+        idx.part_files[i] = xstrdup(json_req_str(parts->arr_items[i], "part_file", path));
+
+    const JsonValue *moe_layers = json_get(root, "moe_layers");
+    if (!moe_layers || moe_layers->type != JSON_OBJ) die("%s: missing 'moe_layers' object", path);
+
+    int max_layer = -1;
+    for (size_t i = 0; i < moe_layers->obj_count; i++) {
+        int layer = atoi(moe_layers->obj_keys[i]);
+        if (layer < 0) die("%s: bad moe_layers key '%s'", path, moe_layers->obj_keys[i]);
+        if (layer > max_layer) max_layer = layer;
+    }
+    idx.n_layers_alloc = max_layer + 1;
+    idx.by_layer = xcalloc((size_t)idx.n_layers_alloc, sizeof(MoeLayerIndex));
+
+    for (size_t i = 0; i < moe_layers->obj_count; i++) {
+        int layer = atoi(moe_layers->obj_keys[i]);
+        const JsonValue *kinds = moe_layers->obj_vals[i];
+        MoeLayerIndex *mli = &idx.by_layer[layer];
+        mli->gate = xcalloc((size_t)idx.n_experts, sizeof(ExpertSlot));
+        mli->up   = xcalloc((size_t)idx.n_experts, sizeof(ExpertSlot));
+        mli->down = xcalloc((size_t)idx.n_experts, sizeof(ExpertSlot));
+        const JsonValue *gate_obj = json_get(kinds, "gate");
+        const JsonValue *up_obj   = json_get(kinds, "up");
+        const JsonValue *down_obj = json_get(kinds, "down");
+        if (!gate_obj || !up_obj || !down_obj)
+            die("%s: layer %d is missing gate/up/down (found gate=%d up=%d down=%d)",
+                path, layer, gate_obj != NULL, up_obj != NULL, down_obj != NULL);
+        index_parse_slot(gate_obj, path, layer, "gate", &idx, mli->gate);
+        index_parse_slot(up_obj,   path, layer, "up",   &idx, mli->up);
+        index_parse_slot(down_obj, path, layer, "down", &idx, mli->down);
+    }
+
+    free(buf);
+    return idx;
+}
+
+/* ---------------------------- real model structs ---------------------------- */
+
+/* Per-layer resolved lookups (F32 direct pointers + QTensor descriptors),
+ * resolved once at real_load time by strcmp against the manifest -- NOT
+ * re-resolved on every forward call. real_fill_layer only dequantizes from
+ * these already-resolved descriptors into the per-call arena. */
+typedef struct {
+    const float *attn_norm, *mlp_norm, *q_norm, *k_norm, *rel_proj;
+    const float *k_sconv_w, *v_sconv_w, *attn_sconv_w, *mlp_sconv_w;
+
+    QTensor wq, wk, wv, wr, wo;
+
+    /* dense only */
+    const float *dense_global_scale;
+    QTensor dense_gate, dense_up, dense_w2;
+
+    /* sparse only */
+    const float *router_w, *router_bias, *router_global_scale;
+    QTensor shared_gate0, shared_up0, shared_w2_0; /* stack index 0's slice */
+    int64_t shared_gate_stride, shared_up_stride, shared_w2_stride;
+} RealLayer;
+
+/* Bound to the owning RealModel by real_fill_layer on every call (not by
+ * real_load), which sidesteps a return-by-value hazard: real_load builds
+ * its RealModel on the stack and returns it by value, so any pointer set
+ * up *inside* real_load that points back into that same local (e.g.
+ * "&m.idx") would dangle once the struct is copied out on return.
+ * real_fill_layer instead receives a stable `RealModel *m` (the caller's
+ * settled copy) and rebinds idx/part_fds/cur_layer from it every call --
+ * three redundant pointer writes per layer, correct regardless of how many
+ * times the struct was copied before that. */
+typedef struct RealExperts {
+    const ExpertIndex *idx;
+    const int *part_fds;
+    int hidden, moe_inter;
+    int cur_layer;
+
+    uint8_t *gate_buf, *up_buf, *down_buf; /* reusable pread buffers, sized to idx->max_slab_bytes */
+    float *g_buf, *u_buf, *h_buf;          /* [moe_inter] each */
+    float *row_scratch;                    /* [max(hidden,moe_inter)], qlinear's row-dequant scratch */
+} RealExperts;
+
+typedef struct {
+    Config cfg;
+    Tokenizer *tok;
+
+    void *res_base;
+    size_t res_size;
+
+    ExpertIndex idx;
+    int part_fds[8];
+    int64_t part_sizes[8];
+
+    RealLayer *layers; /* [num_hidden_layers], resolved manifest lookups */
+    QTensor embed, unembed;   /* token_embd.weight (Q5_K), output.weight (Q4_K) */
+    const float *embed_norm, *final_norm;
+
+    float *arena;      /* reusable per-layer f32 dequant scratch, sized to the max across all layers */
+    size_t arena_floats;
+
+    RealExperts real_exps;
+} RealModel;
+
+/* --------------------------------- real_load --------------------------------- */
+
+static RealModel real_load(const char *config_path, const char *manifest_path,
+                            const char *index_path, const char *tokenizer_path) {
+    RealModel m = {0};
+    m.cfg = config_load(config_path);
+    m.tok = tokenizer_load(tokenizer_path);
+    const Config *cfg = &m.cfg;
+
+    /* resident.bin: convention is a sibling of the manifest, matching how
+     * extract_resident.py always writes them together. */
+    char *res_bin_path = dirname_join(manifest_path, "resident.bin");
+    int rfd = open(res_bin_path, O_RDONLY);
+    if (rfd < 0) die("open %s: %s", res_bin_path, strerror(errno));
+    struct stat rst;
+    if (fstat(rfd, &rst) != 0) die("fstat %s: %s", res_bin_path, strerror(errno));
+    m.res_size = (size_t)rst.st_size;
+    m.res_base = mmap(NULL, m.res_size, PROT_READ, MAP_PRIVATE, rfd, 0);
+    if (m.res_base == MAP_FAILED) die("mmap %s: %s", res_bin_path, strerror(errno));
+    close(rfd);
+    free(res_bin_path);
+
+    ResidentTable rt = manifest_load(manifest_path, m.res_base, m.res_size);
+
+    /* GGUF parts: convention is dirname(index_path)/inkling-gguf/<part_file>,
+     * matching where tools/make_index.py's default --weights-dir actually
+     * lives relative to its default --out (both under weights/). */
+    m.idx = index_load(index_path);
+    if (m.idx.n_experts != cfg->n_routed_experts)
+        die("%s: n_experts_per_layer=%d disagrees with config.json's n_routed_experts=%d",
+            index_path, m.idx.n_experts, cfg->n_routed_experts);
+    for (int i = 0; i < cfg->num_hidden_layers; i++) {
+        if (cfg->layer_is_sparse[i] && (i >= m.idx.n_layers_alloc || !m.idx.by_layer[i].gate))
+            die("%s: MoE layer %d (sparse per config.json) missing from the expert index", index_path, i);
+    }
+
+    char *gguf_dir = dirname_join(index_path, "inkling-gguf");
+    for (int i = 0; i < m.idx.n_parts; i++) {
+        char partpath[1024];
+        int n = snprintf(partpath, sizeof partpath, "%s/%s", gguf_dir, m.idx.part_files[i]);
+        if (n < 0 || (size_t)n >= sizeof partpath) die("GGUF part path too long: %s/%s", gguf_dir, m.idx.part_files[i]);
+        int fd = open(partpath, O_RDONLY);
+        if (fd < 0) die("open %s: %s", partpath, strerror(errno));
+        struct stat pst;
+        if (fstat(fd, &pst) != 0) die("fstat %s: %s", partpath, strerror(errno));
+        if (fcntl(fd, F_NOCACHE, 1) != 0) die("fcntl F_NOCACHE %s: %s", partpath, strerror(errno));
+        m.part_fds[i] = fd;
+        m.part_sizes[i] = (int64_t)pst.st_size;
+    }
+    free(gguf_dir);
+
+    /* Bounds-check every streamed expert slot against its part's actual
+     * size -- the streamed-tensor analogue of manifest_load's res_size
+     * check above. */
+    for (int layer = 0; layer < m.idx.n_layers_alloc; layer++) {
+        MoeLayerIndex *mli = &m.idx.by_layer[layer];
+        if (!mli->gate) continue;
+        ExpertSlot *slot_arrays[3] = {mli->gate, mli->up, mli->down};
+        const char *slot_names[3] = {"gate", "up", "down"};
+        for (int s = 0; s < 3; s++) {
+            for (int e = 0; e < m.idx.n_experts; e++) {
+                ExpertSlot *sl = &slot_arrays[s][e];
+                int64_t psize = m.part_sizes[sl->part_idx];
+                if (sl->abs_offset + sl->nbytes > psize)
+                    die("%s: layer %d slot '%s' expert %d: [%lld,%lld) exceeds part %d size %lld bytes",
+                        index_path, layer, slot_names[s], e, (long long)sl->abs_offset,
+                        (long long)(sl->abs_offset + sl->nbytes), sl->part_idx, (long long)psize);
+            }
+        }
+    }
+
+    /* Top-level tensors: no dequant, referenced straight into res_base --
+     * both are consumed row-at-a-time (qrow for embedding lookups, qlinear
+     * for the final logits projection). */
+    m.embed = resident_qtensor(&rt, "token_embd.weight");
+    m.unembed = resident_qtensor(&rt, "output.weight");
+    m.embed_norm = resident_f32(&rt, "token_embd_norm.weight");
+    m.final_norm = resident_f32(&rt, "output_norm.weight");
+    if (m.embed.out_dim != cfg->vocab_size || m.unembed.out_dim != cfg->vocab_size)
+        die("%s: token_embd/output row counts disagree with config.json's vocab_size=%d", manifest_path, cfg->vocab_size);
+
+    /* Per-layer resolution: strcmp-based manifest lookups, done once here
+     * (not on the hot forward path). */
+    m.layers = xcalloc((size_t)cfg->num_hidden_layers, sizeof(RealLayer));
+    for (int i = 0; i < cfg->num_hidden_layers; i++) {
+        RealLayer *rl = &m.layers[i];
+        rl->attn_norm = real_layer_f32(&rt, i, "attn_norm.weight");
+        rl->mlp_norm  = real_layer_f32(&rt, i, "ffn_norm.weight");
+        rl->q_norm    = real_layer_f32(&rt, i, "attn_q_norm.weight");
+        rl->k_norm    = real_layer_f32(&rt, i, "attn_k_norm.weight");
+        rl->rel_proj  = real_layer_f32(&rt, i, "attn_rel_proj.weight");
+        rl->k_sconv_w = real_layer_f32(&rt, i, "shortconv_k.weight");
+        rl->v_sconv_w = real_layer_f32(&rt, i, "shortconv_v.weight");
+        rl->attn_sconv_w = real_layer_f32(&rt, i, "shortconv_attn.weight");
+        rl->mlp_sconv_w  = real_layer_f32(&rt, i, "shortconv_mlp.weight");
+
+        rl->wq = real_layer_qtensor(&rt, i, "attn_q.weight");
+        rl->wk = real_layer_qtensor(&rt, i, "attn_k.weight");
+        rl->wv = real_layer_qtensor(&rt, i, "attn_v.weight");
+        rl->wr = real_layer_qtensor(&rt, i, "attn_r.weight");
+        rl->wo = real_layer_qtensor(&rt, i, "attn_output.weight");
+
+        if (!cfg->layer_is_sparse[i]) {
+            rl->dense_gate = real_layer_qtensor(&rt, i, "ffn_gate.weight");
+            rl->dense_up   = real_layer_qtensor(&rt, i, "ffn_up.weight");
+            rl->dense_w2   = real_layer_qtensor(&rt, i, "ffn_down.weight");
+            rl->dense_global_scale = real_layer_f32(&rt, i, "ffn_gscale.weight");
+        } else {
+            rl->router_w = real_layer_f32(&rt, i, "ffn_gate_inp.weight");
+            rl->router_bias = real_layer_f32(&rt, i, "exp_probs_b.bias");
+            rl->router_global_scale = real_layer_f32(&rt, i, "ffn_gscale.weight");
+            rl->shared_gate0 = real_layer_qtensor_stacked(&rt, i, "ffn_gate_shexp.weight", cfg->n_shared_experts, &rl->shared_gate_stride);
+            rl->shared_up0   = real_layer_qtensor_stacked(&rt, i, "ffn_up_shexp.weight",   cfg->n_shared_experts, &rl->shared_up_stride);
+            rl->shared_w2_0  = real_layer_qtensor_stacked(&rt, i, "ffn_down_shexp.weight", cfg->n_shared_experts, &rl->shared_w2_stride);
+        }
+    }
+
+    /* Arena sizing: max f32 footprint across ALL layers (dense vs MoE
+     * differ; sliding vs global attn dims can too) -- allocate once, reuse
+     * every layer/decode-step. */
+    size_t max_floats = 0;
+    for (int i = 0; i < cfg->num_hidden_layers; i++) {
+        RealLayer *rl = &m.layers[i];
+        size_t f = 0;
+        f += (size_t)rl->wq.out_dim * (size_t)rl->wq.in_dim;
+        f += (size_t)rl->wk.out_dim * (size_t)rl->wk.in_dim;
+        f += (size_t)rl->wv.out_dim * (size_t)rl->wv.in_dim;
+        f += (size_t)rl->wr.out_dim * (size_t)rl->wr.in_dim;
+        f += (size_t)rl->wo.out_dim * (size_t)rl->wo.in_dim;
+        if (!cfg->layer_is_sparse[i]) {
+            f += 2 * (size_t)rl->dense_gate.out_dim * (size_t)rl->dense_gate.in_dim; /* interleaved w13 */
+            f += (size_t)rl->dense_w2.out_dim * (size_t)rl->dense_w2.in_dim;
+        } else {
+            f += (size_t)cfg->n_shared_experts * 2 * (size_t)rl->shared_gate0.out_dim * (size_t)rl->shared_gate0.in_dim;
+            f += (size_t)cfg->n_shared_experts * (size_t)rl->shared_w2_0.out_dim * (size_t)rl->shared_w2_0.in_dim;
+        }
+        if (f > max_floats) max_floats = f;
+    }
+    m.arena_floats = max_floats;
+    m.arena = xmalloc(sizeof(float) * m.arena_floats);
+
+    /* RealExperts: everything except idx/part_fds/cur_layer (rebound per
+     * call by real_fill_layer -- see the RealExperts comment above) can be
+     * set here since these are independent heap allocations, stable
+     * regardless of how many times the enclosing RealModel gets copied. */
+    m.real_exps.hidden = cfg->hidden_size;
+    m.real_exps.moe_inter = cfg->moe_intermediate_size;
+    m.real_exps.cur_layer = -1;
+    size_t slab_cap = (size_t)m.idx.max_slab_bytes;
+    if (slab_cap == 0) slab_cap = 1;
+    m.real_exps.gate_buf = xmalloc(slab_cap);
+    m.real_exps.up_buf   = xmalloc(slab_cap);
+    m.real_exps.down_buf = xmalloc(slab_cap);
+    m.real_exps.g_buf = xmalloc(sizeof(float) * (size_t)cfg->moe_intermediate_size);
+    m.real_exps.u_buf = xmalloc(sizeof(float) * (size_t)cfg->moe_intermediate_size);
+    m.real_exps.h_buf = xmalloc(sizeof(float) * (size_t)cfg->moe_intermediate_size);
+    size_t row_scratch_floats = (size_t)cfg->hidden_size;
+    if ((size_t)cfg->moe_intermediate_size > row_scratch_floats) row_scratch_floats = (size_t)cfg->moe_intermediate_size;
+    m.real_exps.row_scratch = xmalloc(sizeof(float) * row_scratch_floats);
+
+    return m;
+}
+
+/* ----------------------- layer materialization + streaming ------------------ */
+
+/* Dequantizes every row of a resident QTensor into the arena at *cursor,
+ * advancing *cursor and *used; dies on arena overflow. Returns the pointer
+ * to the block just written (the LayerWeights field's value). */
+static const float *real_dequant_all_rows(const QTensor *w, float **cursor, size_t *used, size_t cap, const char *what) {
+    size_t n = (size_t)w->out_dim * (size_t)w->in_dim;
+    if (*used + n > cap) die("real: arena overflow dequantizing '%s' (%zu + %zu > %zu floats)", what, *used, n, cap);
+    float *dst = *cursor;
+    for (int64_t r = 0; r < w->out_dim; r++) qrow(w, r, dst + (size_t)r * (size_t)w->in_dim);
+    *cursor += n;
+    *used += n;
+    return dst;
+}
+
+/* Builds an [n_stack, 2*out_dim, in_dim] interleaved gate/up block (row
+ * 2i=gate_i, 2i+1=up_i per w13_row/model_load's confirmed on-disk
+ * convention) from two separate on-disk tensors, n_stack of them stacked
+ * (dense: n_stack=1, strides unused; shared experts: n_stack=2). */
+static const float *real_dequant_w13_interleaved(const QTensor *gate, const QTensor *up, int n_stack,
+                                                  int64_t gate_stride, int64_t up_stride,
+                                                  float **cursor, size_t *used, size_t cap, const char *what) {
+    int64_t out_dim = gate->out_dim, in_dim = gate->in_dim;
+    size_t n = (size_t)n_stack * 2 * (size_t)out_dim * (size_t)in_dim;
+    if (*used + n > cap) die("real: arena overflow dequantizing '%s' (%zu + %zu > %zu floats)", what, *used, n, cap);
+    float *dst = *cursor;
+    for (int s = 0; s < n_stack; s++) {
+        QTensor gs = *gate; gs.data = (const uint8_t *)gate->data + (size_t)s * (size_t)gate_stride;
+        QTensor us = *up;   us.data = (const uint8_t *)up->data   + (size_t)s * (size_t)up_stride;
+        for (int64_t i = 0; i < out_dim; i++) {
+            qrow(&gs, i, dst + ((size_t)s * 2 * (size_t)out_dim + (size_t)(2 * i)) * (size_t)in_dim);
+            qrow(&us, i, dst + ((size_t)s * 2 * (size_t)out_dim + (size_t)(2 * i + 1)) * (size_t)in_dim);
+        }
+    }
+    *cursor += n;
+    *used += n;
+    return dst;
+}
+
+/* Builds an [n_stack, out_dim, in_dim] concatenation (no interleave -- used
+ * for shared_w2, which oracle mode stores the same way: experts stacked
+ * along the outer axis, each a plain [out_dim,in_dim] matrix). */
+static const float *real_dequant_stacked(const QTensor *base, int n_stack, int64_t stride,
+                                          float **cursor, size_t *used, size_t cap, const char *what) {
+    size_t n = (size_t)n_stack * (size_t)base->out_dim * (size_t)base->in_dim;
+    if (*used + n > cap) die("real: arena overflow dequantizing '%s' (%zu + %zu > %zu floats)", what, *used, n, cap);
+    float *dst = *cursor;
+    for (int s = 0; s < n_stack; s++) {
+        QTensor ss = *base; ss.data = (const uint8_t *)base->data + (size_t)s * (size_t)stride;
+        for (int64_t r = 0; r < base->out_dim; r++)
+            qrow(&ss, r, dst + ((size_t)s * (size_t)base->out_dim + (size_t)r) * (size_t)base->in_dim);
+    }
+    *cursor += n;
+    *used += n;
+    return dst;
+}
+
+/* Fills a transient LayerWeights that decoder_layer_forward can consume
+ * unchanged, from one layer's resident tensors (dequantized fresh into
+ * `arena` this call) plus the streamed-expert seam for sparse layers. */
+static void real_fill_layer(RealModel *m, int layer, float *arena, LayerWeights *lw) {
+    const Config *cfg = &m->cfg;
+    const RealLayer *rl = &m->layers[layer];
+    memset(lw, 0, sizeof(*lw));
+
+    lw->is_sliding = cfg->layer_is_sliding[layer];
+    lw->is_sparse  = cfg->layer_is_sparse[layer];
+    lw->num_heads    = lw->is_sliding ? cfg->swa_num_attention_heads : cfg->num_attention_heads;
+    lw->num_kv_heads = lw->is_sliding ? cfg->swa_num_key_value_heads : cfg->num_key_value_heads;
+    lw->head_dim     = lw->is_sliding ? cfg->swa_head_dim : cfg->head_dim;
+    lw->rel_extent   = lw->is_sliding ? cfg->sliding_window_size : cfg->rel_extent;
+    lw->q_dim  = lw->num_heads * lw->head_dim;
+    lw->kv_dim = lw->num_kv_heads * lw->head_dim;
+    lw->r_dim  = lw->num_heads * cfg->d_rel;
+
+    lw->attn_norm = rl->attn_norm;
+    lw->mlp_norm  = rl->mlp_norm;
+    lw->q_norm    = rl->q_norm;
+    lw->k_norm    = rl->k_norm;
+    lw->rel_proj  = rl->rel_proj;
+    lw->k_sconv_w = rl->k_sconv_w;
+    lw->v_sconv_w = rl->v_sconv_w;
+    lw->attn_sconv_w = rl->attn_sconv_w;
+    lw->mlp_sconv_w  = rl->mlp_sconv_w;
+
+    float *cursor = arena;
+    size_t used = 0;
+    size_t cap = m->arena_floats;
+
+    lw->wq = real_dequant_all_rows(&rl->wq, &cursor, &used, cap, "attn_q.weight");
+    lw->wk = real_dequant_all_rows(&rl->wk, &cursor, &used, cap, "attn_k.weight");
+    lw->wv = real_dequant_all_rows(&rl->wv, &cursor, &used, cap, "attn_v.weight");
+    lw->wr = real_dequant_all_rows(&rl->wr, &cursor, &used, cap, "attn_r.weight");
+    lw->wo = real_dequant_all_rows(&rl->wo, &cursor, &used, cap, "attn_output.weight");
+
+    if (!lw->is_sparse) {
+        lw->dense_w13 = real_dequant_w13_interleaved(&rl->dense_gate, &rl->dense_up, 1, 0, 0,
+                                                      &cursor, &used, cap, "ffn_gate/up.weight");
+        lw->dense_w2 = real_dequant_all_rows(&rl->dense_w2, &cursor, &used, cap, "ffn_down.weight");
+        lw->dense_global_scale = rl->dense_global_scale;
+    } else {
+        lw->router_w = rl->router_w;
+        lw->router_bias = rl->router_bias;
+        lw->router_global_scale = rl->router_global_scale;
+        lw->shared_w13 = real_dequant_w13_interleaved(&rl->shared_gate0, &rl->shared_up0, cfg->n_shared_experts,
+                                                       rl->shared_gate_stride, rl->shared_up_stride,
+                                                       &cursor, &used, cap, "ffn_gate/up_shexp.weight");
+        lw->shared_w2 = real_dequant_stacked(&rl->shared_w2_0, cfg->n_shared_experts, rl->shared_w2_stride,
+                                              &cursor, &used, cap, "ffn_down_shexp.weight");
+
+        /* Rebind + set the current layer on the OWNER's RealExperts (see the
+         * RealExperts comment above for why this can't happen in real_load). */
+        m->real_exps.idx = &m->idx;
+        m->real_exps.part_fds = m->part_fds;
+        m->real_exps.cur_layer = layer;
+        lw->real_exps = &m->real_exps;
+    }
+}
+
+static void pread_exact(int fd, void *buf, size_t n, int64_t offset, const char *what) {
+    ssize_t got = pread(fd, buf, n, offset);
+    if (got < 0) die("pread %s: %s", what, strerror(errno));
+    if ((size_t)got != n) die("pread %s: short read (%zd of %zu bytes)", what, got, n);
+}
+
+/* Full implementation of the seam declared near LayerWeights and stubbed in
+ * Step 1. Streams one selected routed expert's gate/up/down slabs (index
+ * sidecar gives their exact byte ranges), wraps each as a QTensor, and
+ * computes silu(gate)*up -> down_proj with qlinear -- the EXACT same
+ * silu/gating expression as mlp_moe_forward's in-memory branch (the
+ * per-expert weight is applied by the caller, identically for both paths). */
+static void real_expert_ffn(const struct RealExperts *re, int expert_idx, const float *x, float *expert_out) {
+    if (re->cur_layer < 0 || re->cur_layer >= re->idx->n_layers_alloc)
+        die("real: expert_ffn called with no current layer bound (cur_layer=%d)", re->cur_layer);
+    const MoeLayerIndex *mli = &re->idx->by_layer[re->cur_layer];
+    if (!mli->gate) die("real: MoE layer %d has no expert index entry", re->cur_layer);
+    if (expert_idx < 0 || expert_idx >= re->idx->n_experts)
+        die("real: expert %d out of range [0,%d)", expert_idx, re->idx->n_experts);
+
+    const ExpertSlot *ge = &mli->gate[expert_idx];
+    const ExpertSlot *ue = &mli->up[expert_idx];
+    const ExpertSlot *de = &mli->down[expert_idx];
+
+    pread_exact(re->part_fds[ge->part_idx], re->gate_buf, (size_t)ge->nbytes, ge->abs_offset, "expert gate slab");
+    pread_exact(re->part_fds[ue->part_idx], re->up_buf,   (size_t)ue->nbytes, ue->abs_offset, "expert up slab");
+    pread_exact(re->part_fds[de->part_idx], re->down_buf, (size_t)de->nbytes, de->abs_offset, "expert down slab");
+
+    QTensor gate_qt = { ge->ggml_type, re->gate_buf, re->moe_inter, re->hidden };
+    QTensor up_qt   = { ue->ggml_type, re->up_buf,   re->moe_inter, re->hidden };
+    QTensor down_qt = { de->ggml_type, re->down_buf, re->hidden,    re->moe_inter };
+
+    qlinear(&gate_qt, x, re->g_buf, re->row_scratch);
+    qlinear(&up_qt,   x, re->u_buf, re->row_scratch);
+    for (int i = 0; i < re->moe_inter; i++) re->h_buf[i] = silu_f(re->g_buf[i]) * re->u_buf[i];
+    qlinear(&down_qt, re->h_buf, expert_out, re->row_scratch);
+}
+
+/* Cache sized directly from Config (real mode has no permanent LayerWeights
+ * array to read kv_dim off of -- LayerWeights is transient/rebuilt every
+ * layer/call by real_fill_layer). Mirrors cache_create's per-layer kv_dim
+ * formula exactly (model_load's is_sliding ? swa_* : *). */
+static Cache *cache_create_cfg(const Config *cfg, int cap) {
+    Cache *c = xmalloc(sizeof(Cache));
+    c->cap = cap;
+    c->num_layers = cfg->num_hidden_layers;
+    c->layers = xcalloc((size_t)c->num_layers, sizeof(LayerCache));
+    int Km1 = cfg->conv_kernel_size - 1;
+    int hidden = cfg->hidden_size;
+    for (int i = 0; i < c->num_layers; i++) {
+        LayerCache *lc = &c->layers[i];
+        int is_sliding = cfg->layer_is_sliding[i];
+        int kv_dim = is_sliding ? cfg->swa_num_key_value_heads * cfg->swa_head_dim
+                                : cfg->num_key_value_heads * cfg->head_dim;
+        lc->k = xcalloc((size_t)cap * (size_t)kv_dim, sizeof(float));
+        lc->v = xcalloc((size_t)cap * (size_t)kv_dim, sizeof(float));
+        lc->k_hist = xcalloc((size_t)Km1 * (size_t)kv_dim, sizeof(float));
+        lc->v_hist = xcalloc((size_t)Km1 * (size_t)kv_dim, sizeof(float));
+        lc->attn_hist = xcalloc((size_t)Km1 * (size_t)hidden, sizeof(float));
+        lc->mlp_hist = xcalloc((size_t)Km1 * (size_t)hidden, sizeof(float));
+    }
+    return c;
+}
+
+/* Mirrors model_forward_chunk's sequence exactly (embed -> layers ->
+ * final norm -> mup divide -> logits), with real_fill_layer supplying each
+ * layer's transient LayerWeights instead of a permanently-loaded one. */
+static void real_forward_chunk(RealModel *m, Cache *cache, const int *token_ids, int T, int start_pos,
+                                float *logits_out /* [T,unpadded] or NULL */) {
+    const Config *cfg = &m->cfg;
+    int hidden = cfg->hidden_size;
+
+    float *x = xmalloc(sizeof(float) * (size_t)T * (size_t)hidden);
+    float *erow = xmalloc(sizeof(float) * (size_t)hidden);
+    for (int t = 0; t < T; t++) {
+        qrow(&m->embed, token_ids[t], erow);
+        rmsnorm(erow, m->embed_norm, hidden, (float)cfg->rms_norm_eps, x + (size_t)t * hidden);
+    }
+    free(erow);
+
+    LayerWeights lw;
+    for (int l = 0; l < cfg->num_hidden_layers; l++) {
+        real_fill_layer(m, l, m->arena, &lw);
+        decoder_layer_forward(cfg, &lw, &cache->layers[l], x, T, start_pos);
+    }
+
+    float *normed = xmalloc(sizeof(float) * (size_t)T * (size_t)hidden);
+    for (int t = 0; t < T; t++)
+        rmsnorm(x + (size_t)t * hidden, m->final_norm, hidden, (float)cfg->rms_norm_eps, normed + (size_t)t * hidden);
+    free(x);
+
+    if (logits_out) {
+        int unpadded = cfg->unpadded_vocab_size;
+        float mup = (float)cfg->logits_mup_width_multiplier;
+        QTensor unembed_unpadded = m->unembed;
+        unembed_unpadded.out_dim = unpadded; /* only the unpadded rows (architecture-notes.md sec.8) */
+        float *h = xmalloc(sizeof(float) * (size_t)hidden);
+        float *row_scratch = xmalloc(sizeof(float) * (size_t)hidden);
+        for (int t = 0; t < T; t++) {
+            for (int d = 0; d < hidden; d++) h[d] = normed[(size_t)t * hidden + d] / mup;
+            qlinear(&unembed_unpadded, h, logits_out + (size_t)t * unpadded, row_scratch);
+        }
+        free(h);
+        free(row_scratch);
+    }
+    free(normed);
+}
+
+static double elapsed_ms(struct timespec t0, struct timespec t1) {
+    return (double)(t1.tv_sec - t0.tv_sec) * 1000.0 + (double)(t1.tv_nsec - t0.tv_nsec) / 1e6;
+}
+
+#define REAL_MAX_PROMPT_IDS 8192
+
+/* Tokenizes (no BOS prepend -- add_bos_token=false), prefills, then greedily
+ * decodes, printing each token's id, decoded text, and the wall time of the
+ * forward pass that produced the logits it was picked from (prefill time for
+ * the first token, else the previous decode step's). Stops at n_gen or eos. */
+static void real_generate(RealModel *m, const char *prompt, int n_gen) {
+    const Config *cfg = &m->cfg;
+    int unpadded = cfg->unpadded_vocab_size;
+
+    int32_t *ids = xmalloc(sizeof(int32_t) * (size_t)REAL_MAX_PROMPT_IDS);
+    int n_prompt = tokenizer_encode(m->tok, prompt, ids, REAL_MAX_PROMPT_IDS);
+    int *ids32 = xmalloc(sizeof(int) * (size_t)n_prompt);
+    for (int i = 0; i < n_prompt; i++) ids32[i] = (int)ids[i];
+
+    Cache *cache = cache_create_cfg(cfg, n_prompt + n_gen + 8);
+
+    float *logits = xmalloc(sizeof(float) * (size_t)n_prompt * (size_t)unpadded);
+    struct timespec t0, t1;
+    clock_gettime(CLOCK_MONOTONIC, &t0);
+    real_forward_chunk(m, cache, ids32, n_prompt, 0, logits);
+    clock_gettime(CLOCK_MONOTONIC, &t1);
+    double ms = elapsed_ms(t0, t1);
+    free(ids32);
+
+    float *cur = xmalloc(sizeof(float) * (size_t)unpadded);
+    memcpy(cur, logits + (size_t)(n_prompt - 1) * unpadded, sizeof(float) * (size_t)unpadded);
+    free(logits);
+
+    int eos_id = tokenizer_eos_id(m->tok);
+    int pos = n_prompt;
+    char textbuf[256];
+    for (int i = 0; i < n_gen; i++) {
+        int tok = argmax_f(cur, unpadded);
+        tokenizer_decode(m->tok, &tok, 1, textbuf, sizeof textbuf);
+        printf("%d\t%s\t%.1f ms\n", tok, textbuf, ms);
+        fflush(stdout);
+        if (tok == eos_id) break;
+        int next_id = tok;
+        clock_gettime(CLOCK_MONOTONIC, &t0);
+        real_forward_chunk(m, cache, &next_id, 1, pos, cur);
+        clock_gettime(CLOCK_MONOTONIC, &t1);
+        ms = elapsed_ms(t0, t1);
+        pos++;
+    }
+    cache_free(cache);
+    free(ids);
+    free(cur);
+}
+
+/* --logits-only: prefill the prompt, print the top-10 first-decode-step
+ * logits and exit (informational only -- Tasks 15-16 validate correctness). */
+static void real_print_top_logits(RealModel *m, const char *prompt) {
+    const Config *cfg = &m->cfg;
+    int unpadded = cfg->unpadded_vocab_size;
+
+    int32_t *ids = xmalloc(sizeof(int32_t) * (size_t)REAL_MAX_PROMPT_IDS);
+    int n_prompt = tokenizer_encode(m->tok, prompt, ids, REAL_MAX_PROMPT_IDS);
+    int *ids32 = xmalloc(sizeof(int) * (size_t)n_prompt);
+    for (int i = 0; i < n_prompt; i++) ids32[i] = (int)ids[i];
+
+    Cache *cache = cache_create_cfg(cfg, n_prompt);
+    float *logits = xmalloc(sizeof(float) * (size_t)n_prompt * (size_t)unpadded);
+    real_forward_chunk(m, cache, ids32, n_prompt, 0, logits);
+    const float *last = logits + (size_t)(n_prompt - 1) * unpadded;
+
+    int idx[10];
+    float val[10];
+    for (int k = 0; k < 10; k++) { idx[k] = -1; val[k] = -INFINITY; }
+    for (int v = 0; v < unpadded; v++) {
+        float x = last[v];
+        if (x > val[9]) {
+            int p = 9;
+            while (p > 0 && x > val[p - 1]) { val[p] = val[p - 1]; idx[p] = idx[p - 1]; p--; }
+            val[p] = x;
+            idx[p] = v;
+        }
+    }
+    printf("top-10 first-token logits for a %d-token prompt:\n", n_prompt);
+    for (int k = 0; k < 10; k++) printf("  [%d] id=%d logit=%.6f\n", k, idx[k], (double)val[k]);
+
+    free(logits);
+    free(ids32);
+    free(ids);
+    cache_free(cache);
+}
+
+/* ------------------------------ --smoke mode -------------------------------- */
+/* Synthetic, weights-free end-to-end plumbing check (Step 4): loads a
+ * tools/make_smoke_fixture.py-generated manifest/index through the SAME
+ * manifest_load/index_load/resident_qtensor/qlinear code paths as --real,
+ * preads each synthetic expert slab and byte-compares it against
+ * smoke_expected.json's recorded first-8-bytes, then runs the engine's
+ * actual qlinear() on a synthetic resident Q8_0 tensor and compares against
+ * an expected vector, bitwise. */
+static void run_smoke(const char *dir) {
+    char idxpath[1024];
+    int n = snprintf(idxpath, sizeof idxpath, "%s/index.json", dir);
+    if (n < 0 || (size_t)n >= sizeof idxpath) die("smoke: path too long: %s", dir);
+    ExpertIndex idx = index_load(idxpath);
+
+    char resbin_path[1024];
+    n = snprintf(resbin_path, sizeof resbin_path, "%s/resident.bin", dir);
+    if (n < 0 || (size_t)n >= sizeof resbin_path) die("smoke: path too long: %s", dir);
+    int rfd = open(resbin_path, O_RDONLY);
+    if (rfd < 0) die("open %s: %s", resbin_path, strerror(errno));
+    struct stat rst;
+    if (fstat(rfd, &rst) != 0) die("fstat %s: %s", resbin_path, strerror(errno));
+    size_t res_size = (size_t)rst.st_size;
+    void *res_base = mmap(NULL, res_size, PROT_READ, MAP_PRIVATE, rfd, 0);
+    if (res_base == MAP_FAILED) die("mmap %s: %s", resbin_path, strerror(errno));
+    close(rfd);
+
+    char manifest_path[1024];
+    n = snprintf(manifest_path, sizeof manifest_path, "%s/resident-manifest.json", dir);
+    if (n < 0 || (size_t)n >= sizeof manifest_path) die("smoke: path too long: %s", dir);
+    ResidentTable rt = manifest_load(manifest_path, res_base, res_size);
+
+    /* Same dirname(index_path)+"/inkling-gguf" convention real_load uses. */
+    char *gguf_dir = dirname_join(idxpath, "inkling-gguf");
+    int part_fds[8];
+    int64_t part_sizes[8];
+    for (int i = 0; i < idx.n_parts; i++) {
+        char partpath[1024];
+        int pn = snprintf(partpath, sizeof partpath, "%s/%s", gguf_dir, idx.part_files[i]);
+        if (pn < 0 || (size_t)pn >= sizeof partpath) die("smoke: GGUF part path too long");
+        int fd = open(partpath, O_RDONLY);
+        if (fd < 0) die("open %s: %s", partpath, strerror(errno));
+        struct stat pst;
+        if (fstat(fd, &pst) != 0) die("fstat %s: %s", partpath, strerror(errno));
+        part_fds[i] = fd;
+        part_sizes[i] = (int64_t)pst.st_size;
+    }
+    free(gguf_dir);
+
+    char exppath[1024];
+    n = snprintf(exppath, sizeof exppath, "%s/smoke_expected.json", dir);
+    if (n < 0 || (size_t)n >= sizeof exppath) die("smoke: path too long: %s", dir);
+    size_t elen;
+    char *ebuf = read_file(exppath, &elen);
+    JsonValue *eroot = json_parse(ebuf, elen);
+
+    int layer = json_req_int(eroot, "layer", exppath);
+    if (layer < 0 || layer >= idx.n_layers_alloc || !idx.by_layer[layer].gate)
+        die("smoke: expected layer %d not present in the index", layer);
+    MoeLayerIndex *mli = &idx.by_layer[layer];
+
+    const JsonValue *experts = json_get(eroot, "experts");
+    if (!experts || experts->type != JSON_ARR) die("smoke: expected.json missing 'experts'");
+    size_t buf_cap = (size_t)idx.max_slab_bytes > 0 ? (size_t)idx.max_slab_bytes : 1;
+    uint8_t *buf = xmalloc(buf_cap);
+    for (size_t ei = 0; ei < experts->arr_count; ei++) {
+        const JsonValue *eobj = experts->arr_items[ei];
+        int e = json_req_int(eobj, "expert", exppath);
+        const char *slot_names[3] = {"gate", "up", "down"};
+        ExpertSlot *slot_arrays[3] = {mli->gate, mli->up, mli->down};
+        for (int k = 0; k < 3; k++) {
+            const JsonValue *slot = json_get(eobj, slot_names[k]);
+            if (!slot) die("smoke: expected.json expert %d missing slot '%s'", e, slot_names[k]);
+            int64_t exp_offset = json_req_i64(slot, "abs_offset", exppath);
+            int64_t exp_nbytes = json_req_i64(slot, "nbytes", exppath);
+            const char *first8_hex = json_req_str(slot, "first8_hex", exppath);
+            if (strlen(first8_hex) != 16) die("smoke: first8_hex must be 16 hex chars");
+            ExpertSlot *sl = &slot_arrays[k][e];
+            if (sl->abs_offset != exp_offset || sl->nbytes != exp_nbytes)
+                die("smoke: expert %d slot '%s': parsed index (offset=%lld,nbytes=%lld) != expected.json (offset=%lld,nbytes=%lld)",
+                    e, slot_names[k], (long long)sl->abs_offset, (long long)sl->nbytes,
+                    (long long)exp_offset, (long long)exp_nbytes);
+            if (sl->abs_offset + sl->nbytes > part_sizes[sl->part_idx])
+                die("smoke: expert %d slot '%s': slab exceeds part size", e, slot_names[k]);
+            pread_exact(part_fds[sl->part_idx], buf, (size_t)sl->nbytes, sl->abs_offset, slot_names[k]);
+            uint8_t want[8];
+            for (int b = 0; b < 8; b++) {
+                unsigned int byteval;
+                if (sscanf(first8_hex + 2 * b, "%2x", &byteval) != 1) die("smoke: bad hex in first8_hex");
+                want[b] = (uint8_t)byteval;
+            }
+            if (memcmp(buf, want, 8) != 0) die("smoke: expert %d slot '%s': first 8 bytes mismatch", e, slot_names[k]);
+        }
+    }
+    free(buf);
+
+    const JsonValue *resident = json_get(eroot, "resident");
+    if (resident && resident->type == JSON_ARR) {
+        for (size_t i = 0; i < resident->arr_count; i++) {
+            const JsonValue *r = resident->arr_items[i];
+            const char *rname = json_req_str(r, "name", exppath);
+            int64_t roff = json_req_i64(r, "offset", exppath);
+            int64_t rnbytes = json_req_i64(r, "nbytes", exppath);
+            const ResidentEntry *e = resident_get(&rt, rname);
+            if (e->offset != roff || e->nbytes != rnbytes)
+                die("smoke: resident tensor '%s' offset/nbytes mismatch vs expected.json", rname);
+        }
+    }
+
+    const JsonValue *qlin = json_get(eroot, "qlinear");
+    if (!qlin) die("smoke: expected.json missing 'qlinear'");
+    const char *qname = json_req_str(qlin, "tensor_name", exppath);
+    QTensor q = resident_qtensor(&rt, qname);
+    const JsonValue *xarr = json_get(qlin, "x");
+    const JsonValue *yarr = json_get(qlin, "y");
+    if (!xarr || xarr->type != JSON_ARR || (int64_t)xarr->arr_count != q.in_dim)
+        die("smoke: qlinear.x length mismatch");
+    if (!yarr || yarr->type != JSON_ARR || (int64_t)yarr->arr_count != q.out_dim)
+        die("smoke: qlinear.y length mismatch");
+    float *xv = xmalloc(sizeof(float) * (size_t)q.in_dim);
+    for (int64_t i = 0; i < q.in_dim; i++) xv[i] = (float)json_num(xarr->arr_items[i], 0);
+    float *yv = xmalloc(sizeof(float) * (size_t)q.out_dim);
+    float *row_scratch = xmalloc(sizeof(float) * (size_t)q.in_dim);
+    qlinear(&q, xv, yv, row_scratch);
+    for (int64_t v = 0; v < q.out_dim; v++) {
+        float expect = (float)json_num(yarr->arr_items[v], 0);
+        if (yv[v] != expect)
+            die("smoke: qlinear mismatch at row %lld: got %.9g expected %.9g", (long long)v, (double)yv[v], (double)expect);
+    }
+    free(xv);
+    free(yv);
+    free(row_scratch);
+
+    printf("smoke ok\n");
+}
+
 /* ================================== main =================================== */
 
 int main(int argc, char **argv) {
     const char *dump_path = NULL;
+    const char *smoke_dir = NULL;
+    const char *prompt = "The capital of France is";
+    int n_gen = 32;
+    int do_real = 0, do_mlock = 0, logits_only = 0;
+
     for (int i = 1; i < argc; i++) {
         if (strcmp(argv[i], "--dump-acts") == 0 && i + 1 < argc) {
             dump_path = argv[++i];
+        } else if (strcmp(argv[i], "--real") == 0) {
+            do_real = 1;
+        } else if (strcmp(argv[i], "--smoke") == 0 && i + 1 < argc) {
+            smoke_dir = argv[++i];
+        } else if (strcmp(argv[i], "--prompt") == 0 && i + 1 < argc) {
+            prompt = argv[++i];
+        } else if (strcmp(argv[i], "--n-gen") == 0 && i + 1 < argc) {
+            n_gen = atoi(argv[++i]);
+        } else if (strcmp(argv[i], "--mlock") == 0) {
+            do_mlock = 1;
+        } else if (strcmp(argv[i], "--logits-only") == 0) {
+            logits_only = 1;
         } else {
-            fprintf(stderr, "usage: %s [--dump-acts FILE]\n", argv[0]);
+            fprintf(stderr,
+                "usage: %s [--dump-acts FILE]\n"
+                "       %s --smoke DIR\n"
+                "       %s --real [--prompt TEXT] [--n-gen N] [--mlock] [--logits-only]\n"
+                "\n"
+                "--real paths default to docs/inkling-config.json, weights/resident-manifest.json,\n"
+                "weights/inkling-ud-q2_k_xl.sepia-index.json, weights/tokenizer.bin -- override with\n"
+                "the SEPIA_REAL_CONFIG_PATH / SEPIA_REAL_MANIFEST_PATH / SEPIA_REAL_INDEX_PATH /\n"
+                "SEPIA_REAL_TOKENIZER_PATH env vars.\n"
+                "--mlock only makes sense once `extract_resident.py --verify` has confirmed\n"
+                "resident.bin's bytes match its manifest -- not enforceable here, the loader trusts its caller.\n",
+                argv[0], argv[0], argv[0]);
             return 2;
         }
+    }
+
+    if (smoke_dir) {
+        run_smoke(smoke_dir);
+        return 0;
+    }
+
+    if (do_real) {
+        const char *real_config_path = env_or("SEPIA_REAL_CONFIG_PATH", "docs/inkling-config.json");
+        const char *manifest_path = env_or("SEPIA_REAL_MANIFEST_PATH", "weights/resident-manifest.json");
+        const char *index_path = env_or("SEPIA_REAL_INDEX_PATH", "weights/inkling-ud-q2_k_xl.sepia-index.json");
+        const char *tokenizer_path = env_or("SEPIA_REAL_TOKENIZER_PATH", "weights/tokenizer.bin");
+
+        struct timespec t0, t1;
+        clock_gettime(CLOCK_MONOTONIC, &t0);
+        RealModel rm = real_load(real_config_path, manifest_path, index_path, tokenizer_path);
+        clock_gettime(CLOCK_MONOTONIC, &t1);
+        fprintf(stderr, "real: loaded in %.2fs (resident.bin %.2f GB mmap'd, %d GGUF part(s) open)\n",
+                elapsed_ms(t0, t1) / 1000.0, (double)rm.res_size / 1e9, rm.idx.n_parts);
+
+        if (do_mlock) {
+            if (mlock(rm.res_base, rm.res_size) != 0) die("mlock: %s", strerror(errno));
+            fprintf(stderr, "real: mlock'd resident.bin (%zu bytes)\n", rm.res_size);
+        }
+
+        if (logits_only) {
+            real_print_top_logits(&rm, prompt);
+            return 0;
+        }
+
+        real_generate(&rm, prompt, n_gen);
+        return 0;
     }
 
     /* SEPIA_{CONFIG,WEIGHTS,REF}_PATH override the committed toy fixture

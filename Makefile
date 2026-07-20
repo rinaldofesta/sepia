@@ -14,14 +14,17 @@ ci: pycheck tooltests sepia test_quants test_tokenizer
 
 # Tool test suites. Excluded on purpose: tools/test_oracle_determinism.sh
 # (needs the torch venv, absent in CI; re-proven locally whenever the
-# oracle regenerates).
-tooltests: iobench
+# oracle regenerates). `sepia` is a prerequisite (not just built later by
+# `ci`'s own list) so `make tooltests` alone always has a fresh binary for
+# the --smoke line below.
+tooltests: iobench sepia
 	python3 tools/test_gguf_inspect.py
 	python3 tools/test_make_index.py
 	python3 tools/test_extract_resident.py
 	python3 tools/test_export_tokenizer.py
 	bash tools/test_iobench.sh
 	bash tools/test_sepia_malformed.sh
+	python3 tools/make_smoke_fixture.py --out "$${TMPDIR:-/tmp}/sepia-smoke" && ./sepia --smoke "$${TMPDIR:-/tmp}/sepia-smoke"
 	@echo "tooltests ok"
 
 pycheck:
