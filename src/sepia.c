@@ -3183,29 +3183,32 @@ static void run_gpu_compare_tiny(void) {
     printf("gpu compare ok\n");
 }
 
-/* --gpu-quants (local-only, needs --metal): the Task 4/5 gate for the
- * dequant-fused Q8_0/Q4_K/Q5_K/Q6_K Metal matvec kernels. For each SQFX
- * fixture (tools/fixtures/quants/, format documented at tools/test_quants.c's
- * run_dequant_fixture): upload the raw quant blocks, run the standalone
- * debug kernel (sepia_gpu_dequant_rows), and require BITWISE equality
- * against the fixture's expected f32 payload -- dequantization has no
- * accumulation, so the P2 plan's acceptance policy (Global Constraints (b))
- * requires the GPU unpack to match the CPU's dequantize_row exactly, not
- * merely within tolerance. Then, for types with a GPU matvec kernel,
- * reinterprets the same fixture's blocks as a small multi-row matrix (a
- * single row would never exercise the row-stride arithmetic, since row 0
- * always sits at offset 0 regardless of nb1), draws a deterministic random
- * x, and compares sepia_gpu_matvec_q against the CPU qlinear reference at
- * SEPIA_GPU_COMPARE_TOL (the same relative-tolerance gate --gpu-compare-tiny
- * uses). Fixture types without a GPU kernel yet (the IQ family -- Task 6)
- * are skipped with a notice, not a failure, so this mode stays forward-
- * compatible with the already-committed fixtures for those types. */
+/* --gpu-quants (local-only, needs --metal): the Task 4/5/6 gate for the
+ * dequant-fused Q8_0/Q4_K/Q5_K/Q6_K/IQ2_XS/IQ3_XXS/IQ4_XS Metal matvec
+ * kernels. For each SQFX fixture (tools/fixtures/quants/, format documented
+ * at tools/test_quants.c's run_dequant_fixture): upload the raw quant
+ * blocks, run the standalone debug kernel (sepia_gpu_dequant_rows), and
+ * require BITWISE equality against the fixture's expected f32 payload --
+ * dequantization has no accumulation, so the P2 plan's acceptance policy
+ * (Global Constraints (b)) requires the GPU unpack to match the CPU's
+ * dequantize_row exactly, not merely within tolerance. Then, for types with
+ * a GPU matvec kernel, reinterprets the same fixture's blocks as a small
+ * multi-row matrix (a single row would never exercise the row-stride
+ * arithmetic, since row 0 always sits at offset 0 regardless of nb1), draws
+ * a deterministic random x, and compares sepia_gpu_matvec_q against the CPU
+ * qlinear reference at SEPIA_GPU_COMPARE_TOL (the same relative-tolerance
+ * gate --gpu-compare-tiny uses). With Task 6 landed, every committed SQFX
+ * fixture type now has a GPU kernel; gpu_quants_type_has_kernel stays as a
+ * forward-compatible guard (skip-with-notice, not a hard failure) for any
+ * future quant type whose fixture is committed before its kernel lands. */
 
 static int g_gpu_quants_failed = 0;
 
 static int gpu_quants_type_has_kernel(int ggml_type) {
     return ggml_type == SEPIA_T_Q8_0 || ggml_type == SEPIA_T_Q4_K ||
-           ggml_type == SEPIA_T_Q5_K || ggml_type == SEPIA_T_Q6_K;
+           ggml_type == SEPIA_T_Q5_K || ggml_type == SEPIA_T_Q6_K ||
+           ggml_type == SEPIA_T_IQ2_XS || ggml_type == SEPIA_T_IQ3_XXS ||
+           ggml_type == SEPIA_T_IQ4_XS;
 }
 
 static uint32_t gq_rd_u32(FILE *f, const char *path) {

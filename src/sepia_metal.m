@@ -625,6 +625,9 @@ int sepia_gpu_matvec_q(int ggml_type, SepiaGpuBuf *w, size_t w_off, SepiaGpuBuf 
     case SEPIA_T_Q4_K: pso_name = @"sepia_matvec_q4_k"; block = 256; block_bytes = 144; break;
     case SEPIA_T_Q5_K: pso_name = @"sepia_matvec_q5_k"; block = 256; block_bytes = 176; break;
     case SEPIA_T_Q6_K: pso_name = @"sepia_matvec_q6_k"; block = 256; block_bytes = 210; break;
+    case SEPIA_T_IQ2_XS:  pso_name = @"sepia_matvec_iq2_xs";  block = 256; block_bytes = 74;  break;
+    case SEPIA_T_IQ3_XXS: pso_name = @"sepia_matvec_iq3_xxs"; block = 256; block_bytes = 98;  break;
+    case SEPIA_T_IQ4_XS:  pso_name = @"sepia_matvec_iq4_xs";  block = 256; block_bytes = 136; break;
     default:
         fprintf(stderr, "sepia: metal: matvec_q: no GPU kernel for ggml type %d\n", ggml_type);
         return 0;
@@ -674,6 +677,9 @@ int sepia_gpu_dequant_rows(int ggml_type, SepiaGpuBuf *raw, size_t raw_off, Sepi
     case SEPIA_T_Q4_K: pso_name = @"sepia_dequant_rows_q4_k"; block = 256; break;
     case SEPIA_T_Q5_K: pso_name = @"sepia_dequant_rows_q5_k"; block = 256; break;
     case SEPIA_T_Q6_K: pso_name = @"sepia_dequant_rows_q6_k"; block = 256; break;
+    case SEPIA_T_IQ2_XS:  pso_name = @"sepia_dequant_rows_iq2_xs";  block = 256; break;
+    case SEPIA_T_IQ3_XXS: pso_name = @"sepia_dequant_rows_iq3_xxs"; block = 256; break;
+    case SEPIA_T_IQ4_XS:  pso_name = @"sepia_dequant_rows_iq4_xs";  block = 256; break;
     default:
         fprintf(stderr, "sepia: metal: dequant_rows: no GPU kernel for ggml type %d\n", ggml_type);
         return 0;
