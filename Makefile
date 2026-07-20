@@ -18,6 +18,7 @@ tooltests: iobench
 	python3 tools/test_gguf_inspect.py
 	python3 tools/test_make_index.py
 	python3 tools/test_extract_resident.py
+	python3 tools/test_export_tokenizer.py
 	bash tools/test_iobench.sh
 	bash tools/test_sepia_malformed.sh
 	@echo "tooltests ok"
