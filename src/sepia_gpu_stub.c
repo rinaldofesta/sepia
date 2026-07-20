@@ -127,3 +127,22 @@ int sepia_gpu_dequant_rows(int ggml_type, SepiaGpuBuf *raw, size_t raw_off, Sepi
     fprintf(stderr, "sepia: metal: not supported on this platform\n");
     return 0;
 }
+
+int sepia_gpu_rel_project(SepiaGpuBuf *r_vec, SepiaGpuBuf *rel_proj, SepiaGpuBuf *rel_logits,
+                           int64_t T, int64_t H, int64_t d_rel, int64_t rel_extent) {
+    (void)r_vec; (void)rel_proj; (void)rel_logits; (void)T; (void)H; (void)d_rel; (void)rel_extent;
+    fprintf(stderr, "sepia: metal: not supported on this platform\n");
+    return 0;
+}
+
+int sepia_gpu_banded_attn(SepiaGpuBuf *q, SepiaGpuBuf *k, SepiaGpuBuf *v, SepiaGpuBuf *rel_logits,
+                           SepiaGpuBuf *attn_out,
+                           const int64_t *kv_lo, const int64_t *kv_hi, const float *tau,
+                           int64_t T, int64_t H, int64_t Hkv, int64_t Dh, int64_t rel_extent,
+                           int64_t q_pos_base, int64_t kv_dim, float inv_head_dim) {
+    (void)q; (void)k; (void)v; (void)rel_logits; (void)attn_out;
+    (void)kv_lo; (void)kv_hi; (void)tau;
+    (void)T; (void)H; (void)Hkv; (void)Dh; (void)rel_extent; (void)q_pos_base; (void)kv_dim; (void)inv_head_dim;
+    fprintf(stderr, "sepia: metal: not supported on this platform\n");
+    return 0;
+}

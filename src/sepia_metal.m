@@ -712,6 +712,158 @@ int sepia_gpu_dequant_rows(int ggml_type, SepiaGpuBuf *raw, size_t raw_off, Sepi
     return 1;
 }
 
+/* --------------------------- banded attention (Task 7) --------------------- */
+/* Mirror the `constant` structs in metal/banded_attn.metal field-for-field.
+ * sepia_args_banded_attn uses `long`/int64_t fields throughout (Global
+ * Constraints: all index/stride arithmetic 64-bit) except the trailing
+ * scalar float, matching the MSL struct's own field order so both
+ * compilers' natural alignment/padding agree (the same discipline the
+ * existing sepia_args_matvec_q note documents). */
+typedef struct {
+    int32_t H;
+    int32_t d_rel;
+    int32_t rel_extent;
+} sepia_args_rel_project;
+
+typedef struct {
+    int64_t T;
+    int64_t H;
+    int64_t Hkv;
+    int64_t Dh;
+    int64_t rel_extent;
+    int64_t q_pos_base;
+    int64_t kv_dim;
+    float   inv_head_dim;
+} sepia_args_banded_attn;
+
+int sepia_gpu_rel_project(SepiaGpuBuf *r_vec, SepiaGpuBuf *rel_proj, SepiaGpuBuf *rel_logits,
+                           int64_t T, int64_t H, int64_t d_rel, int64_t rel_extent) {
+    if (!r_vec || !r_vec->buffer || !rel_proj || !rel_proj->buffer || !rel_logits || !rel_logits->buffer ||
+        T <= 0 || H <= 0 || d_rel <= 0 || rel_extent <= 0) {
+        fprintf(stderr, "sepia: metal: rel_project: invalid arguments\n");
+        return 0;
+    }
+    @autoreleasepool {
+        id<MTLComputeCommandEncoder> enc = sepia_gpu_encoder();
+        if (!enc) {
+            fprintf(stderr, "sepia: metal: rel_project: no active batch (call sepia_gpu_begin first)\n");
+            return 0;
+        }
+        id<MTLComputePipelineState> pso = sepia_gpu_pso(@"sepia_rel_project_f32");
+        if (!pso) return 0;
+
+        sepia_args_rel_project args = { (int32_t)H, (int32_t)d_rel, (int32_t)rel_extent };
+        [enc setComputePipelineState:pso];
+        [enc setBytes:&args length:sizeof(args) atIndex:0];
+        [enc setBuffer:r_vec->buffer offset:0 atIndex:1];
+        [enc setBuffer:rel_proj->buffer offset:0 atIndex:2];
+        [enc setBuffer:rel_logits->buffer offset:0 atIndex:3];
+
+        NSUInteger tw = sepia_gpu_reduce_width(rel_extent);
+        [enc dispatchThreadgroups:MTLSizeMake((NSUInteger)H, (NSUInteger)T, 1)
+             threadsPerThreadgroup:MTLSizeMake(tw, 1, 1)];
+    }
+    return 1;
+}
+
+/* Smallest multiple of the 32-wide SIMD group that is >= max_n_kv, capped at
+ * 1024 (Apple GPUs' per-threadgroup thread-count ceiling) -- correctness
+ * holds for any width (the per-thread kv-strided loop naturally covers any
+ * n_kv), this only picks how much of the threadgroup's parallelism actually
+ * gets used. */
+static NSUInteger sepia_gpu_attn_width(int64_t max_n_kv) {
+    NSUInteger w = 32;
+    while (w < (NSUInteger)max_n_kv && w < 1024) w *= 2;
+    return w;
+}
+
+int sepia_gpu_banded_attn(SepiaGpuBuf *q, SepiaGpuBuf *k, SepiaGpuBuf *v, SepiaGpuBuf *rel_logits,
+                           SepiaGpuBuf *attn_out,
+                           const int64_t *kv_lo, const int64_t *kv_hi, const float *tau,
+                           int64_t T, int64_t H, int64_t Hkv, int64_t Dh, int64_t rel_extent,
+                           int64_t q_pos_base, int64_t kv_dim, float inv_head_dim) {
+    if (!q || !q->buffer || !k || !k->buffer || !v || !v->buffer || !rel_logits || !rel_logits->buffer ||
+        !attn_out || !attn_out->buffer || !kv_lo || !kv_hi || !tau ||
+        T <= 0 || H <= 0 || Hkv <= 0 || Dh <= 0 || rel_extent <= 0 || kv_dim <= 0) {
+        fprintf(stderr, "sepia: metal: banded_attn: invalid arguments\n");
+        return 0;
+    }
+    if (H % Hkv != 0) {
+        fprintf(stderr, "sepia: metal: banded_attn: H %lld not a multiple of Hkv %lld (GQA group)\n",
+                (long long)H, (long long)Hkv);
+        return 0;
+    }
+    if (Dh > 128) {
+        fprintf(stderr, "sepia: metal: banded_attn: Dh %lld exceeds SEPIA_ATTN_MAX_DH (128)\n", (long long)Dh);
+        return 0;
+    }
+
+    int64_t max_n_kv = 0;
+    for (int64_t t = 0; t < T; t++) {
+        if (kv_hi[t] < kv_lo[t]) {
+            fprintf(stderr, "sepia: metal: banded_attn: kv_hi[%lld]=%lld < kv_lo[%lld]=%lld\n",
+                    (long long)t, (long long)kv_hi[t], (long long)t, (long long)kv_lo[t]);
+            return 0;
+        }
+        int64_t n_kv = kv_hi[t] - kv_lo[t] + 1;
+        if (n_kv > max_n_kv) max_n_kv = n_kv;
+    }
+
+    @autoreleasepool {
+        id<MTLComputeCommandEncoder> enc = sepia_gpu_encoder();
+        if (!enc) {
+            fprintf(stderr, "sepia: metal: banded_attn: no active batch (call sepia_gpu_begin first)\n");
+            return 0;
+        }
+        id<MTLComputePipelineState> pso = sepia_gpu_pso(@"sepia_banded_attn_f32");
+        if (!pso) return 0;
+
+        /* Transient buffers copied immediately from host arrays
+         * (newBufferWithBytes: copies at creation time, so there is no
+         * lifetime hazard even though the batch may not execute until a
+         * later sepia_gpu_end() -- the command buffer retains whatever
+         * buffers get bound via setBuffer: for the duration of its own
+         * execution, exactly like every other buffer in this file). No
+         * public SepiaGpuBuf wrapper needed since callers never touch these
+         * again. */
+        id<MTLBuffer> kv_lo_buf = [g_device newBufferWithBytes:kv_lo
+                                                          length:(NSUInteger)T * sizeof(int64_t)
+                                                         options:MTLResourceStorageModeShared];
+        id<MTLBuffer> kv_hi_buf = [g_device newBufferWithBytes:kv_hi
+                                                          length:(NSUInteger)T * sizeof(int64_t)
+                                                         options:MTLResourceStorageModeShared];
+        id<MTLBuffer> tau_buf = [g_device newBufferWithBytes:tau
+                                                        length:(NSUInteger)T * sizeof(float)
+                                                       options:MTLResourceStorageModeShared];
+        if (!kv_lo_buf || !kv_hi_buf || !tau_buf) {
+            fprintf(stderr, "sepia: metal: banded_attn: failed to upload kv_lo/kv_hi/tau\n");
+            return 0;
+        }
+
+        sepia_args_banded_attn args = { T, H, Hkv, Dh, rel_extent, q_pos_base, kv_dim, inv_head_dim };
+        [enc setComputePipelineState:pso];
+        [enc setBytes:&args length:sizeof(args) atIndex:0];
+        [enc setBuffer:q->buffer offset:0 atIndex:1];
+        [enc setBuffer:k->buffer offset:0 atIndex:2];
+        [enc setBuffer:v->buffer offset:0 atIndex:3];
+        [enc setBuffer:rel_logits->buffer offset:0 atIndex:4];
+        [enc setBuffer:kv_lo_buf offset:0 atIndex:5];
+        [enc setBuffer:kv_hi_buf offset:0 atIndex:6];
+        [enc setBuffer:tau_buf offset:0 atIndex:7];
+        [enc setBuffer:attn_out->buffer offset:0 atIndex:8];
+
+        NSUInteger width = sepia_gpu_attn_width(max_n_kv);
+        NSUInteger nsg = width / 32;
+        [enc setThreadgroupMemoryLength:nsg * sizeof(float) atIndex:0];
+        [enc setThreadgroupMemoryLength:nsg * sizeof(float) atIndex:1];
+        [enc setThreadgroupMemoryLength:nsg * (NSUInteger)Dh * sizeof(float) atIndex:2];
+
+        [enc dispatchThreadgroups:MTLSizeMake((NSUInteger)H, (NSUInteger)T, 1)
+             threadsPerThreadgroup:MTLSizeMake(width, 1, 1)];
+    }
+    return 1;
+}
+
 int sepia_gpu_selftest_touch(SepiaGpuBuf *buf, size_t n_floats) {
     if (!g_available || !g_device || !g_queue || !g_library) {
         fprintf(stderr, "sepia: metal: selftest_touch: GPU not initialized\n");

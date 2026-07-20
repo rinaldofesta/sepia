@@ -159,4 +159,74 @@ int sepia_gpu_matvec_q(int ggml_type, SepiaGpuBuf *w, size_t w_off, SepiaGpuBuf 
  * a dispatch failure. */
 int sepia_gpu_dequant_rows(int ggml_type, SepiaGpuBuf *raw, size_t raw_off, SepiaGpuBuf *out, int64_t n);
 
+/* --------------------------- banded attention (Task 7) --------------------- */
+/* The from-scratch banded flash-attention kernel pair (metal/banded_attn.metal
+ * -- no Metal reference for this op exists anywhere; llama.cpp's PR is
+ * CPU+CUDA only). Mirrors attn_forward_chunk's per-(t,h) inner loop
+ * (src/sepia.c) exactly: dense rel_logits recompute, content dot *
+ * inv_head_dim, band-gated relative-position bias * tau, stable online
+ * softmax, weighted V sum. f32 accumulators throughout (Global Constraints);
+ * see .superpowers/sdd/task-7-report.md for the parallelization-shape and
+ * tau-factorization design writeup.
+ *
+ * Buffer layouts (row-major, contiguous within a row):
+ *   r_vec:      [T, H, d_rel]        -- wr's raw output, no norm applied
+ *   rel_proj:   [d_rel, rel_extent]  -- shared across (t,h) within a layer
+ *   rel_logits: [T, H, rel_extent]   -- kernel 1's output, kernel 2's input
+ *   q:          [T, H, Dh]           -- ALREADY tau-scaled by the caller for
+ *                                        global (non-sliding) layers (see the
+ *                                        tau paragraph below); pass the raw
+ *                                        q unchanged for sliding layers
+ *                                        (tau=1 there is a no-op scale).
+ *   k, v:       [cap, Hkv, Dh]       -- the FULL kv cache, cap >= q_pos_base+T;
+ *                                        windowing is arithmetic (kv_lo/kv_hi
+ *                                        per query token), never a separate
+ *                                        storage slice.
+ *   attn_out:   [T, H, Dh]           -- pre-wo concatenated output
+ *
+ * Tau factorization (the design choice, matching attn_forward_chunk's own
+ * split rather than folding tau into rel_logits): tau multiplies BOTH q and
+ * the rel-position bias in the CPU oracle (src/sepia.c: `q_scaled[d] =
+ * q_vec[d] * tau` and `bias = rel_logits[distance] * tau`). This API mirrors
+ * that split directly -- the CALLER pre-scales q by tau (a single
+ * elementwise multiply, done once per token before upload; Task 9's real
+ * integration is expected to fold this into the per-head norm kernel's
+ * epilogue) and passes tau again to sepia_gpu_banded_attn, which applies it
+ * only to the bias term. The alternative (pre-scaling rel_logits by tau
+ * instead of q) was rejected: it would need a second, per-(t,h) tau-scaled
+ * copy of rel_logits (rel_logits is otherwise position-independent within a
+ * layer) and would still require gating the "distance < rel_extent" test
+ * somewhere -- reproducing the CPU's own factorization is simpler and keeps
+ * rel_logits itself tau-free (bit-comparable across sliding/global layers
+ * and across query tokens with different tau, useful for the "compare
+ * rel_logits first" debug protocol). Pass tau=1.0 uniformly for sliding
+ * (local) layers, where log-scaling never applies.
+ */
+
+/* rel_logits[t,h,r] = sum_d r_vec[t,h,d] * rel_proj[d,r], r in [0,rel_extent).
+ * One threadgroup per (t,h) (T*H total), f32 accum throughout -- the CPU
+ * oracle's own precision pin (src/sepia.c). */
+int sepia_gpu_rel_project(SepiaGpuBuf *r_vec, SepiaGpuBuf *rel_proj, SepiaGpuBuf *rel_logits,
+                           int64_t T, int64_t H, int64_t d_rel, int64_t rel_extent);
+
+/* One threadgroup per (t,h) (T*H total). Per query token t (absolute
+ * position q_pos_base+t), iterates kv in [kv_lo[t],kv_hi[t]] (host-computed
+ * per-token bounds into the FULL k/v cache -- sliding: kv_lo=max(0,q_pos-
+ * window+1); global: kv_lo=0; kv_hi=q_pos always, matching attn_forward_
+ * chunk) with GQA head mapping hk = h/(H/Hkv). f32 online-softmax
+ * accumulation (running max/sum/V-accumulator); see the design doc above
+ * and metal/banded_attn.metal's header comment for the simdgroup-then-
+ * threadgroup reduction shape. kv_lo/kv_hi/tau are plain host arrays of
+ * length T (uploaded into transient GPU buffers internally -- callers do
+ * not need to manage their lifetime beyond this call); every other
+ * dimension is a scalar shared across the whole (T,H) dispatch. Dh must be
+ * <=128 (metal/banded_attn.metal's SEPIA_ATTN_MAX_DH -- both of this
+ * model's real per-layer-type geometries use Dh=128); returns 0 (after
+ * logging) otherwise. */
+int sepia_gpu_banded_attn(SepiaGpuBuf *q, SepiaGpuBuf *k, SepiaGpuBuf *v, SepiaGpuBuf *rel_logits,
+                           SepiaGpuBuf *attn_out,
+                           const int64_t *kv_lo, const int64_t *kv_hi, const float *tau,
+                           int64_t T, int64_t H, int64_t Hkv, int64_t Dh, int64_t rel_extent,
+                           int64_t q_pos_base, int64_t kv_dim, float inv_head_dim);
+
 #endif
