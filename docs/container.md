@@ -107,15 +107,18 @@ and 93.9%), so **the no-repack plan is confirmed**: SEPIA streams each
 expert's gate/up/down tensors directly from the GGUF parts via the index
 sidecar below, no `experts-NN.bin` conversion step.
 
-Flagged for the controller: the 15MiB cell's individual reps ranged
-85.3-104.4%, straddling the 90% line, and the measurement environment
-(concurrent agents + an active 317GB download, no working cache flush)
-was not the clean, isolated condition ssd-bench.md had. The freshest pairs
-(rep 1, closest to the historical baseline) and the physical reasoning
-above both point toward the true disk-bound ratio being at or above what's
-reported here. A rerun in a quieter window (download complete, no
-concurrent agents) would be worth doing to tighten this, but is not judged
-to gate proceeding with the no-repack design.
+Flagged for the controller at the time: the 15MiB cell's individual reps
+ranged 85.3-104.4%, straddling the 90% line, and the measurement
+environment (concurrent agents + an active 317GB download, no working
+cache flush) was not the clean, isolated condition ssd-bench.md had.
+
+**Quiet-disk rerun (2026-07-20, download complete, no concurrent I/O):**
+three interleaved aligned/unaligned pairs at 15MiB, 64 reads, 4 threads,
+F_NOCACHE — aligned 12.64 / 13.33 / 13.89 GB/s (mean 13.29), unaligned-32B
+13.41 / 13.31 / 13.76 GB/s (mean 13.49). Ratio ~101%: unaligned is
+statistically indistinguishable from aligned at expert-slab block sizes.
+The margin concern is retired; the no-repack design stands on clean data
+(raw log: `weights/ab-remeasure-quiet.log`, not committed).
 
 ## 2. The container's three pieces
 
