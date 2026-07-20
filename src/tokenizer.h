@@ -9,8 +9,9 @@ Tokenizer *tokenizer_load(const char *path);            /* dies on any format er
 void       tokenizer_free(Tokenizer *t);
 int32_t    tokenizer_bos_id(const Tokenizer *t);        /* 200006 for real Inkling (== eos) */
 int32_t    tokenizer_eos_id(const Tokenizer *t);
-/* Encode UTF-8 text -> ids. Returns count; dies if > max_ids. Task 9 encodes a
- * single pretoken piece (no splitting); Task 10 adds the pretokenizer pass. */
+/* Encode UTF-8 text -> ids. Returns count; dies if > max_ids. Pretokenizes
+ * with the o200k-family regex scanner (src/unicode_tables.h), then runs BPE
+ * per pretoken piece. */
 int        tokenizer_encode(const Tokenizer *t, const char *text, int32_t *ids, int max_ids);
 /* Append the raw bytes of ids[0..n) into buf (cap bytes incl NUL); dies on overflow. */
 void       tokenizer_decode(const Tokenizer *t, const int32_t *ids, int n, char *buf, size_t cap);

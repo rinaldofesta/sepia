@@ -6,9 +6,10 @@ LDFLAGS ?= -pthread -lm
 #   sepia    (0.4)  CPU reference engine
 #   iobench  (0.5)  SSD microbenchmark
 #   test     (0.4)  oracle self-test
-ci: pycheck tooltests sepia test_quants
+ci: pycheck tooltests sepia test_quants test_tokenizer
 	./sepia
 	./test_quants tools/fixtures/quants/f16.bin tools/fixtures/quants/q8_0.bin tools/fixtures/quants/q4_k.bin tools/fixtures/quants/q5_k.bin tools/fixtures/quants/q6_k.bin tools/fixtures/quants/iq2_xs.bin tools/fixtures/quants/iq3_xxs.bin tools/fixtures/quants/iq4_xs.bin
+	./test_tokenizer tools/fixtures/tokenizer/mini.bin tools/fixtures/tokenizer/mini_cases.json
 	@echo "ci ok"
 
 # Tool test suites. Excluded on purpose: tools/test_oracle_determinism.sh
@@ -44,7 +45,11 @@ iobench: tools/iobench.c
 test_quants: tools/test_quants.c src/quants.c src/quants.h
 	$(CC) $(CFLAGS) -o test_quants tools/test_quants.c src/quants.c $(LDFLAGS)
 
-test_tokenizer: tools/test_tokenizer.c src/tokenizer.c src/tokenizer.h
+test_tokenizer: tools/test_tokenizer.c src/tokenizer.c src/tokenizer.h src/unicode_tables.h
 	$(CC) $(CFLAGS) -o test_tokenizer tools/test_tokenizer.c src/tokenizer.c $(LDFLAGS)
 
-.PHONY: ci pycheck tooltests sepia test iobench test_quants test_tokenizer
+# local-only: needs weights/tokenizer.bin (see tools/export_tokenizer.py)
+tokreal: test_tokenizer
+	./test_tokenizer weights/tokenizer.bin tools/fixtures/tokenizer/real_cases.json
+
+.PHONY: ci pycheck tooltests sepia test iobench test_quants test_tokenizer tokreal

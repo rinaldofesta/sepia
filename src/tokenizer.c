@@ -3,11 +3,17 @@
  * (the GPT-2 byte<->unicode indirection is resolved offline by the
  * exporter), so encode/decode here never touch that mapping. */
 #include "tokenizer.h"
+#include "unicode_tables.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <stdarg.h>
 #include <stdint.h>
+
+/* Hand-coded scanner for the o200k-family pre-tokenizer pattern (llama.cpp's
+ * lookahead formulation). It MUST match docs/tokenizer-pre-regex.txt
+ * byte-for-byte; tokenizer_load enforces this below. */
+static const char SCANNER_REGEX[] = "[^\\r\\n\\p{L}\\p{N}]?((?=[\\p{L}\\p{M}])([^a-z]))*((?=[\\p{L}\\p{M}])([^A-Z]))+(?:'[sS]|'[tT]|'[rR][eE]|'[vV][eE]|'[mM]|'[lL][lL]|'[dD])?|[^\\r\\n\\p{L}\\p{N}]?((?=[\\p{L}\\p{M}])([^a-z]))+((?=[\\p{L}\\p{M}])([^A-Z]))*(?:'[sS]|'[tT]|'[rR][eE]|'[vV][eE]|'[mM]|'[lL][lL]|'[dD])?|\\p{N}{1,3}| ?[^\\s\\p{L}\\p{N}]+[\\r\\n/]*|\\s*[\\r\\n]+|\\s+(?!\\S)|\\s+";
 
 static void tdie(const char *fmt, ...) {
     va_list ap; va_start(ap, fmt);
@@ -55,6 +61,8 @@ Tokenizer *tokenizer_load(const char *path) {
     uint32_t rlen = rd_u32(d + off); off += 4;
     t->regex = tmalloc(rlen + 1);
     memcpy(t->regex, d + off, rlen); t->regex[rlen] = 0; off += rlen;
+    if (strcmp(t->regex, SCANNER_REGEX) != 0)
+        tdie("tokenizer: sidecar regex differs from the scanner's pattern; regenerate or re-port the scanner");
     for (int i = 0; i < 256; i++) { t->byte_token_id[i] = rd_u32(d + off); off += 4; }
     t->tok_off = tmalloc(((size_t)t->vocab + 1) * 4);
     for (uint32_t i = 0; i <= t->vocab; i++) { t->tok_off[i] = rd_u32(d + off); off += 4; }
@@ -138,10 +146,163 @@ int tokenizer_bpe_piece(const Tokenizer *t, const uint8_t *bytes, int n,
     return m;
 }
 
-/* Task 9 placeholder pretokenization: the whole text is one piece.
- * Task 10 replaces this with the regex scanner. */
+/* ---- Pre-tokenizer scanner (SCANNER_REGEX above) ----------------------- */
+
+static uint8_t uc_class(uint32_t cp) {
+    uint32_t lo = 0, hi = uc_n_ranges;
+    while (lo < hi) {
+        uint32_t mid = lo + (hi - lo) / 2;
+        if (cp < uc_ranges[mid].lo) hi = mid;
+        else if (cp > uc_ranges[mid].hi) lo = mid + 1;
+        else return uc_ranges[mid].mask;
+    }
+    return 0;
+}
+
+static int is_letter(int m) { return m & UC_L; }
+static int is_num(int m)    { return m & UC_N; }
+static int is_ws(int m)     { return m & UC_WS; }
+
+/* Decode one UTF-8 codepoint at s[i] (i < n). On malformed/truncated input,
+ * fall back to a single raw byte classified as codepoint 0xFFFD (which maps
+ * to no L/M/N/WS class): the byte still flows into the piece untouched, only
+ * scanner classification treats it as "no class". */
+static int utf8_next(const uint8_t *s, int n, int i, uint32_t *cp) {
+    uint8_t b0 = s[i];
+    if (b0 < 0x80) { *cp = b0; return i + 1; }
+    int len; uint32_t c;
+    if ((b0 & 0xE0) == 0xC0)      { len = 2; c = b0 & 0x1F; }
+    else if ((b0 & 0xF0) == 0xE0) { len = 3; c = b0 & 0x0F; }
+    else if ((b0 & 0xF8) == 0xF0) { len = 4; c = b0 & 0x07; }
+    else { *cp = 0xFFFD; return i + 1; }
+    if (i + len > n) { *cp = 0xFFFD; return i + 1; }
+    for (int k = 1; k < len; k++) {
+        uint8_t bk = s[i + k];
+        if ((bk & 0xC0) != 0x80) { *cp = 0xFFFD; return i + 1; }
+        c = (c << 6) | (uint32_t)(bk & 0x3F);
+    }
+    *cp = c;
+    return i + len;
+}
+
+/* 's 't 're 've 'm 'll 'd, ASCII case-insensitive; returns matched length or 0. */
+static int match_contraction(const uint8_t *s, int n, int i) {
+    if (i >= n || s[i] != '\'' || i + 1 >= n) return 0;
+    int c1 = s[i + 1];
+    int lc1 = (c1 >= 'A' && c1 <= 'Z') ? c1 + 32 : c1;
+    if (lc1 == 's' || lc1 == 't' || lc1 == 'm' || lc1 == 'd') return 2;
+    if (i + 2 < n) {
+        int c2 = s[i + 2];
+        int lc2 = (c2 >= 'A' && c2 <= 'Z') ? c2 + 32 : c2;
+        if ((lc1 == 'r' && lc2 == 'e') || (lc1 == 'v' && lc2 == 'e') || (lc1 == 'l' && lc2 == 'l'))
+            return 3;
+    }
+    return 0;
+}
+
+static int next_pretoken(const uint8_t *s, int n, int i) {
+    uint32_t cp; int j, len;
+    /* Branch 1+2: optional non-[\r\n L N] prefix, then letter run */
+    j = utf8_next(s, n, i, &cp);
+    int m0 = (int)uc_class(cp);
+    int start_letters = i;
+    if (cp != '\r' && cp != '\n' && !is_letter(m0) && !is_num(m0)) start_letters = j;
+    /* Branches 1+2 letter runs: A*B+ | A+B*  (A = letter-or-mark not ASCII a-z,
+     * B = letter-or-mark not ASCII A-Z; A∩B is every non-ASCII letter and mark,
+     * so greedy A-then-B linear runs give the same extent as the regex's
+     * backtracking — the B-empty case falls back to A+). */
+    int a_run = 0, b_run = 0, pos = start_letters;
+    while (pos < n) {
+        int q = utf8_next(s, n, pos, &cp); int mm = (int)uc_class(cp);
+        if (!((mm & (UC_L | UC_M)) && !(cp >= 'a' && cp <= 'z'))) break;
+        a_run++; pos = q;
+    }
+    int after_a = pos;
+    while (pos < n) {
+        int q = utf8_next(s, n, pos, &cp); int mm = (int)uc_class(cp);
+        if (!((mm & (UC_L | UC_M)) && !(cp >= 'A' && cp <= 'Z'))) break;
+        b_run++; pos = q;
+    }
+    if (a_run > 0 || b_run > 0) {
+        int end = (b_run > 0) ? pos : after_a;   /* A*B+ tail present, else A+ only */
+        if (end > start_letters) {
+            len = match_contraction(s, n, end);
+            return end + len - i;
+        }
+    }
+    /* Branch 3: \p{N}{1,3} */
+    if (is_num(m0)) {
+        int cnt = 1, pos3 = j;
+        while (cnt < 3 && pos3 < n) {
+            int q = utf8_next(s, n, pos3, &cp);
+            if (!is_num((int)uc_class(cp))) break;
+            cnt++; pos3 = q;
+        }
+        return pos3 - i;
+    }
+    /* Branch 4: ' '? [^\s L N]+ [\r\n/]* */
+    {
+        int pos4 = i; uint32_t c4;
+        int q4 = utf8_next(s, n, pos4, &c4);
+        if (c4 == ' ' && q4 < n) {
+            uint32_t c5; utf8_next(s, n, q4, &c5);
+            int m5 = (int)uc_class(c5);
+            if (!is_ws(m5) && !is_letter(m5) && !is_num(m5)) pos4 = q4;
+        }
+        int q7 = pos4, got = 0;
+        while (q7 < n) {
+            uint32_t c7; int q8 = utf8_next(s, n, q7, &c7);
+            int m7 = (int)uc_class(c7);
+            if (is_ws(m7) || is_letter(m7) || is_num(m7)) break;
+            got++; q7 = q8;
+        }
+        if (got > 0) {
+            while (q7 < n && (s[q7] == '\r' || s[q7] == '\n' || s[q7] == '/')) q7++;
+            return q7 - i;
+        }
+    }
+    /* Branch 5: \s*[\r\n]+ (never consumes trailing non-newline ws after the
+     * last newline: last_nl tracks the position right after the last \r/\n
+     * seen, while pos5 may run further through trailing plain whitespace). */
+    {
+        int pos5 = i, last_nl = -1;
+        while (pos5 < n) {
+            uint32_t c5; int q = utf8_next(s, n, pos5, &c5);
+            if (c5 == '\r' || c5 == '\n') { last_nl = q; pos5 = q; }
+            else if (is_ws((int)uc_class(c5))) { pos5 = q; }
+            else break;
+        }
+        if (last_nl > 0) return last_nl - i;
+    }
+    /* Branch 6+7: \s+(?!\S) | \s+ : yield all but the last whitespace char
+     * when the run is followed by non-whitespace (give-back), else the whole
+     * run. */
+    {
+        int pos6 = i, ws = 0, prev = i;
+        while (pos6 < n) {
+            uint32_t c6; int q = utf8_next(s, n, pos6, &c6);
+            if (!is_ws((int)uc_class(c6))) break;
+            ws++; prev = pos6; pos6 = q;
+        }
+        if (ws > 0) {
+            if (pos6 < n && ws > 1) return prev - i;
+            return pos6 - i;
+        }
+    }
+    /* Fallback: single codepoint (unmatched by any branch). */
+    return j - i;
+}
+
 int tokenizer_encode(const Tokenizer *t, const char *text, int32_t *ids, int max_ids) {
-    return tokenizer_bpe_piece(t, (const uint8_t *)text, (int)strlen(text), ids, max_ids);
+    const uint8_t *s = (const uint8_t *)text;
+    int n = (int)strlen(text), i = 0, total = 0;
+    while (i < n) {
+        int len = next_pretoken(s, n, i);
+        if (len <= 0) tdie("tokenizer: scanner made no progress at byte %d", i);
+        total += tokenizer_bpe_piece(t, s + i, len, ids + total, max_ids - total);
+        i += len;
+    }
+    return total;
 }
 
 void tokenizer_decode(const Tokenizer *t, const int32_t *ids, int n, char *buf, size_t cap) {
