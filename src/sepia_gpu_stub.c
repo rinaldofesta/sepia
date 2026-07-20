@@ -114,3 +114,16 @@ int sepia_gpu_sconv(SepiaGpuBuf *w, SepiaGpuBuf *hist, SepiaGpuBuf *in, SepiaGpu
     fprintf(stderr, "sepia: metal: not supported on this platform\n");
     return 0;
 }
+
+int sepia_gpu_matvec_q(int ggml_type, SepiaGpuBuf *w, size_t w_off, SepiaGpuBuf *x, SepiaGpuBuf *y,
+                        int64_t out_dim, int64_t in_dim) {
+    (void)ggml_type; (void)w; (void)w_off; (void)x; (void)y; (void)out_dim; (void)in_dim;
+    fprintf(stderr, "sepia: metal: not supported on this platform\n");
+    return 0;
+}
+
+int sepia_gpu_dequant_rows(int ggml_type, SepiaGpuBuf *raw, size_t raw_off, SepiaGpuBuf *out, int64_t n) {
+    (void)ggml_type; (void)raw; (void)raw_off; (void)out; (void)n;
+    fprintf(stderr, "sepia: metal: not supported on this platform\n");
+    return 0;
+}

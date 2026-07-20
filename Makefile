@@ -56,7 +56,9 @@ sepia: src/sepia.c src/quants.c src/quants.h src/tokenizer.c src/tokenizer.h src
 
 # .metal files are listed only as a rebuild trigger for the shim object --
 # they are read at runtime by sepia_gpu_init(), never compiled in here.
-src/sepia_metal.o: src/sepia_metal.m src/sepia_gpu.h $(METAL_SRCS)
+# quants.h is a real #include (Task 4's matvec_q dispatch switches on its
+# SEPIA_T_* type ids), so it belongs in the prerequisite list too.
+src/sepia_metal.o: src/sepia_metal.m src/sepia_gpu.h src/quants.h $(METAL_SRCS)
 	$(CC) $(OBJCFLAGS) -c -o src/sepia_metal.o src/sepia_metal.m
 
 src/sepia_gpu_stub.o: src/sepia_gpu_stub.c src/sepia_gpu.h
@@ -123,4 +125,11 @@ gputest: sepia
 gpucompare: sepia
 	./sepia --metal --gpu-compare-tiny
 
-.PHONY: ci pycheck tooltests sepia test iobench test_quants test_tokenizer tokreal configcheck shadercheck gputest gpucompare
+# local-only: needs a live Metal device; the Task 4 gate for the Q8_0/Q4_K
+# dequant-fused matvec kernels -- bitwise dequant vs the committed SQFX
+# fixtures, plus a tolerance-checked matvec vs CPU qlinear. Not in ci for
+# the same reason gputest/gpucompare aren't (needs a live device).
+gpuquants: sepia
+	./sepia --metal --gpu-quants tools/fixtures/quants/q8_0.bin tools/fixtures/quants/q4_k.bin
+
+.PHONY: ci pycheck tooltests sepia test iobench test_quants test_tokenizer tokreal configcheck shadercheck gputest gpucompare gpuquants

@@ -21,6 +21,7 @@
 #import <Metal/Metal.h>
 
 #include "sepia_gpu.h"
+#include "quants.h"
 
 #include <stdint.h>
 #include <stdio.h>
@@ -595,6 +596,108 @@ int sepia_gpu_sconv(SepiaGpuBuf *w, SepiaGpuBuf *hist, SepiaGpuBuf *in, SepiaGpu
         NSUInteger tgy = MIN((NSUInteger)T, (NSUInteger)32);
         [enc dispatchThreads:MTLSizeMake((NSUInteger)C, (NSUInteger)T, 1)
              threadsPerThreadgroup:MTLSizeMake(tgx, tgy, 1)];
+    }
+    return 1;
+}
+
+/* --------------------------- quantized matvec (Task 4) --------------------- */
+/* Mirrors sepia_args_matvec_q in metal/matvec_q.metal field-for-field: ne0
+ * is in_dim, nb1 is the row stride in bytes -- same ne/nb ABI shape as
+ * Task 3's sepia_args_matvec, just for quantized rows whose stride is
+ * quant-block-derived rather than sizeof(float)*ne0. */
+typedef struct {
+    int32_t  ne0;
+    uint64_t nb1;
+} sepia_args_matvec_q;
+
+int sepia_gpu_matvec_q(int ggml_type, SepiaGpuBuf *w, size_t w_off, SepiaGpuBuf *x, SepiaGpuBuf *y,
+                        int64_t out_dim, int64_t in_dim) {
+    if (!w || !w->buffer || !x || !x->buffer || !y || !y->buffer || out_dim <= 0 || in_dim <= 0) {
+        fprintf(stderr, "sepia: metal: matvec_q: invalid arguments\n");
+        return 0;
+    }
+
+    NSString *pso_name;
+    int64_t block;
+    size_t block_bytes;
+    switch (ggml_type) {
+    case SEPIA_T_Q8_0: pso_name = @"sepia_matvec_q8_0"; block = 32;  block_bytes = 34;  break;
+    case SEPIA_T_Q4_K: pso_name = @"sepia_matvec_q4_k"; block = 256; block_bytes = 144; break;
+    default:
+        fprintf(stderr, "sepia: metal: matvec_q: no GPU kernel for ggml type %d\n", ggml_type);
+        return 0;
+    }
+    if (in_dim % block != 0) {
+        fprintf(stderr,
+                "sepia: metal: matvec_q: in_dim %lld not a multiple of block size %lld (type %d)\n",
+                (long long)in_dim, (long long)block, ggml_type);
+        return 0;
+    }
+
+    @autoreleasepool {
+        id<MTLComputeCommandEncoder> enc = sepia_gpu_encoder();
+        if (!enc) {
+            fprintf(stderr, "sepia: metal: matvec_q: no active batch (call sepia_gpu_begin first)\n");
+            return 0;
+        }
+        id<MTLComputePipelineState> pso = sepia_gpu_pso(pso_name);
+        if (!pso) return 0;
+
+        uint64_t nb1 = (uint64_t)(in_dim / block) * (uint64_t)block_bytes;
+        sepia_args_matvec_q args = { (int32_t)in_dim, nb1 };
+        [enc setComputePipelineState:pso];
+        [enc setBytes:&args length:sizeof(args) atIndex:0];
+        [enc setBuffer:w->buffer offset:w_off atIndex:1];
+        [enc setBuffer:x->buffer offset:0 atIndex:2];
+        [enc setBuffer:y->buffer offset:0 atIndex:3];
+        [enc setThreadgroupMemoryLength:32 * sizeof(float) atIndex:0];
+
+        NSUInteger tw = sepia_gpu_reduce_width(in_dim / block);
+        [enc dispatchThreadgroups:MTLSizeMake((NSUInteger)out_dim, 1, 1)
+             threadsPerThreadgroup:MTLSizeMake(tw, 1, 1)];
+    }
+    return 1;
+}
+
+int sepia_gpu_dequant_rows(int ggml_type, SepiaGpuBuf *raw, size_t raw_off, SepiaGpuBuf *out, int64_t n) {
+    if (!raw || !raw->buffer || !out || !out->buffer || n <= 0) {
+        fprintf(stderr, "sepia: metal: dequant_rows: invalid arguments\n");
+        return 0;
+    }
+
+    NSString *pso_name;
+    int64_t block;
+    switch (ggml_type) {
+    case SEPIA_T_Q8_0: pso_name = @"sepia_dequant_rows_q8_0"; block = 32;  break;
+    case SEPIA_T_Q4_K: pso_name = @"sepia_dequant_rows_q4_k"; block = 256; break;
+    default:
+        fprintf(stderr, "sepia: metal: dequant_rows: no GPU kernel for ggml type %d\n", ggml_type);
+        return 0;
+    }
+    if (n % block != 0) {
+        fprintf(stderr, "sepia: metal: dequant_rows: n %lld not a multiple of block size %lld (type %d)\n",
+                (long long)n, (long long)block, ggml_type);
+        return 0;
+    }
+
+    @autoreleasepool {
+        id<MTLComputeCommandEncoder> enc = sepia_gpu_encoder();
+        if (!enc) {
+            fprintf(stderr, "sepia: metal: dequant_rows: no active batch (call sepia_gpu_begin first)\n");
+            return 0;
+        }
+        id<MTLComputePipelineState> pso = sepia_gpu_pso(pso_name);
+        if (!pso) return 0;
+
+        [enc setComputePipelineState:pso];
+        [enc setBuffer:raw->buffer offset:raw_off atIndex:0];
+        [enc setBuffer:out->buffer offset:0 atIndex:1];
+
+        int64_t nb = n / block;
+        NSUInteger width = pso.threadExecutionWidth;
+        if (width > (NSUInteger)nb) width = (NSUInteger)nb;
+        [enc dispatchThreads:MTLSizeMake((NSUInteger)nb, 1, 1)
+             threadsPerThreadgroup:MTLSizeMake(width, 1, 1)];
     }
     return 1;
 }

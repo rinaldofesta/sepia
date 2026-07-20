@@ -3183,6 +3183,161 @@ static void run_gpu_compare_tiny(void) {
     printf("gpu compare ok\n");
 }
 
+/* --gpu-quants (local-only, needs --metal): the Task 4 gate for the
+ * dequant-fused Q8_0/Q4_K Metal matvec kernels. For each SQFX fixture
+ * (tools/fixtures/quants/, format documented at tools/test_quants.c's
+ * run_dequant_fixture): upload the raw quant blocks, run the standalone
+ * debug kernel (sepia_gpu_dequant_rows), and require BITWISE equality
+ * against the fixture's expected f32 payload -- dequantization has no
+ * accumulation, so the P2 plan's acceptance policy (Global Constraints (b))
+ * requires the GPU unpack to match the CPU's dequantize_row exactly, not
+ * merely within tolerance. Then, for types with a GPU matvec kernel,
+ * reinterprets the same fixture's blocks as a small multi-row matrix (a
+ * single row would never exercise the row-stride arithmetic, since row 0
+ * always sits at offset 0 regardless of nb1), draws a deterministic random
+ * x, and compares sepia_gpu_matvec_q against the CPU qlinear reference at
+ * SEPIA_GPU_COMPARE_TOL (the same relative-tolerance gate --gpu-compare-tiny
+ * uses). Fixture types without a GPU kernel yet (Q5_K, Q6_K, the IQ family
+ * -- Tasks 5-6) are skipped with a notice, not a failure, so this mode
+ * stays forward-compatible with the already-committed fixtures for those
+ * types. */
+
+static int g_gpu_quants_failed = 0;
+
+static int gpu_quants_type_has_kernel(int ggml_type) {
+    return ggml_type == SEPIA_T_Q8_0 || ggml_type == SEPIA_T_Q4_K;
+}
+
+static uint32_t gq_rd_u32(FILE *f, const char *path) {
+    uint8_t b[4];
+    if (fread(b, 1, 4, f) != 4) die("gpu-quants: short read in %s", path);
+    return (uint32_t)b[0] | ((uint32_t)b[1] << 8) | ((uint32_t)b[2] << 16) | ((uint32_t)b[3] << 24);
+}
+
+/* How many rows the fixture's blocks get split into for the matvec check --
+ * 4 if n_blocks divides evenly by 4 (both committed fixtures do: q8_0.bin
+ * has 64 blocks, q4_k.bin has 16), otherwise falls back to 1 row so any
+ * SQFX fixture is still usable, just without row-stride coverage. */
+#define SEPIA_GPU_QUANTS_ROWS 4
+
+static void run_gpu_quants_fixture(const char *path) {
+    FILE *f = fopen(path, "rb");
+    if (!f) die("gpu-quants: cannot open %s", path);
+    uint32_t magic = gq_rd_u32(f, path);
+    if (magic != 0x58465153u) {
+        fprintf(stderr, "gpu-quants: %s: not an SQFX fixture (magic 0x%08x), skipping\n", path, magic);
+        fclose(f);
+        return;
+    }
+    uint32_t ver = gq_rd_u32(f, path);
+    if (ver != 1) die("gpu-quants: %s: bad SQFX version %u", path, ver);
+    uint32_t type = gq_rd_u32(f, path);
+    uint32_t n_blocks = gq_rd_u32(f, path);
+    uint32_t block_elems = gq_rd_u32(f, path);
+    uint32_t block_bytes = gq_rd_u32(f, path);
+
+    if (!gpu_quants_type_has_kernel((int)type)) {
+        printf("gpu-quants: %-40s type %2u: no GPU kernel yet, skipping\n", path, type);
+        fclose(f);
+        return;
+    }
+    if ((int64_t)block_elems != quants_block_size((int)type) ||
+        (size_t)block_bytes != quants_type_size((int)type))
+        die("gpu-quants: %s: size table mismatch (type %u: fixture %u/%u, code %lld/%zu)",
+            path, type, block_elems, block_bytes,
+            (long long)quants_block_size((int)type), quants_type_size((int)type));
+
+    size_t raw_sz = (size_t)n_blocks * block_bytes;
+    int64_t n = (int64_t)n_blocks * block_elems;
+    uint8_t *raw = xmalloc(raw_sz);
+    float *expect = xmalloc((size_t)n * sizeof(float));
+    if (fread(raw, 1, raw_sz, f) != raw_sz || fread(expect, sizeof(float), (size_t)n, f) != (size_t)n)
+        die("gpu-quants: %s: truncated fixture", path);
+    fclose(f);
+
+    /* --- bitwise dequant check (sepia_dequant_rows_<type>) --- */
+    SepiaGpuBuf *raw_buf = sepia_gpu_alloc(raw_sz, 0);
+    SepiaGpuBuf *dq_buf = sepia_gpu_alloc((size_t)n * sizeof(float), 0);
+    if (!raw_buf || !dq_buf) die("gpu-quants: %s: alloc failed", path);
+    memcpy(sepia_gpu_host_ptr(raw_buf), raw, raw_sz);
+
+    if (!sepia_gpu_begin()) die("gpu-quants: %s: begin failed (dequant)", path);
+    if (!sepia_gpu_dequant_rows((int)type, raw_buf, 0, dq_buf, n))
+        die("gpu-quants: %s: dequant_rows dispatch failed", path);
+    if (!sepia_gpu_end()) die("gpu-quants: %s: end failed (dequant)", path);
+
+    float *got = (float *)sepia_gpu_host_ptr(dq_buf);
+    int fails = 0;
+    for (int64_t i = 0; i < n; i++) {
+        if (memcmp(&got[i], &expect[i], sizeof(float)) != 0) {
+            if (fails < 5) {
+                uint32_t gb, eb;
+                memcpy(&gb, &got[i], 4);
+                memcpy(&eb, &expect[i], 4);
+                fprintf(stderr, "  %s elem %lld: got %.9g (0x%08x) expect %.9g (0x%08x)\n",
+                        path, (long long)i, (double)got[i], gb, (double)expect[i], eb);
+            }
+            fails++;
+        }
+    }
+    printf("gpu-quants: %-40s type %2u  %5u blocks  dequant %s\n", path, type, n_blocks, fails ? "FAIL" : "ok");
+    if (fails) g_gpu_quants_failed = 1;
+    sepia_gpu_free(dq_buf);
+
+    /* --- matvec tolerance check --- */
+    uint32_t out_dim = SEPIA_GPU_QUANTS_ROWS;
+    while (out_dim > 1 && n_blocks % out_dim != 0) out_dim--;
+    int64_t in_dim = (int64_t)(n_blocks / out_dim) * (int64_t)block_elems;
+
+    QTensor w = { (int)type, raw, (int64_t)out_dim, in_dim };
+    float *x = xmalloc((size_t)in_dim * sizeof(float));
+    unsigned seed = 20260720u ^ type;
+    for (int64_t i = 0; i < in_dim; i++)
+        x[i] = ((float)rand_r(&seed) / (float)RAND_MAX) * 2.0f - 1.0f;
+    float *row_scratch = xmalloc((size_t)in_dim * sizeof(float));
+    float *cpu_y = xmalloc((size_t)out_dim * sizeof(float));
+    qlinear(&w, x, cpu_y, row_scratch);
+
+    SepiaGpuBuf *x_buf = sepia_gpu_alloc((size_t)in_dim * sizeof(float), 0);
+    SepiaGpuBuf *y_buf = sepia_gpu_alloc((size_t)out_dim * sizeof(float), 0);
+    if (!x_buf || !y_buf) die("gpu-quants: %s: matvec alloc failed", path);
+    memcpy(sepia_gpu_host_ptr(x_buf), x, (size_t)in_dim * sizeof(float));
+
+    if (!sepia_gpu_begin()) die("gpu-quants: %s: matvec begin failed", path);
+    if (!sepia_gpu_matvec_q((int)type, raw_buf, 0, x_buf, y_buf, (int64_t)out_dim, in_dim))
+        die("gpu-quants: %s: matvec_q dispatch failed", path);
+    if (!sepia_gpu_end()) die("gpu-quants: %s: matvec end failed", path);
+
+    float *gpu_y = (float *)sepia_gpu_host_ptr(y_buf);
+    double scale = 0.0;
+    for (uint32_t j = 0; j < out_dim; j++) scale = fmax(scale, fabs((double)cpu_y[j]));
+    double max_rel = 0.0;
+    for (uint32_t j = 0; j < out_dim; j++) {
+        double rel = gpu_compare_rel_err(gpu_y[j], cpu_y[j], scale);
+        if (rel > max_rel) max_rel = rel;
+    }
+    printf("gpu-quants: %-40s type %2u  matvec %ux%-6lld max_rel_err %.3e  %s\n",
+           path, type, out_dim, (long long)in_dim, max_rel,
+           max_rel <= SEPIA_GPU_COMPARE_TOL ? "ok" : "FAIL");
+    if (max_rel > SEPIA_GPU_COMPARE_TOL) g_gpu_quants_failed = 1;
+
+    sepia_gpu_free(raw_buf);
+    sepia_gpu_free(x_buf);
+    sepia_gpu_free(y_buf);
+    free(raw);
+    free(expect);
+    free(x);
+    free(row_scratch);
+    free(cpu_y);
+}
+
+static void run_gpu_quants(char **paths, int n_paths) {
+    if (!sepia_gpu_available()) die("gpu-quants: requires --metal to have initialized the GPU runtime");
+    for (int i = 0; i < n_paths; i++) run_gpu_quants_fixture(paths[i]);
+    if (g_gpu_quants_failed) die("gpu-quants: at least one fixture failed");
+    printf("gpu-quants ok\n");
+}
+
 /* ================================== main =================================== */
 
 int main(int argc, char **argv) {
@@ -3191,6 +3346,9 @@ int main(int argc, char **argv) {
     const char *prompt = "The capital of France is";
     int n_gen = 32;
     int do_real = 0, do_mlock = 0, logits_only = 0, do_metal = 0, do_gpu_selftest = 0, do_gpu_compare_tiny = 0;
+    int do_gpu_quants = 0;
+    char **gpu_quants_paths = NULL;
+    int gpu_quants_n = 0;
 
     for (int i = 1; i < argc; i++) {
         if (strcmp(argv[i], "--dump-acts") == 0 && i + 1 < argc) {
@@ -3213,6 +3371,11 @@ int main(int argc, char **argv) {
             do_gpu_selftest = 1;
         } else if (strcmp(argv[i], "--gpu-compare-tiny") == 0) {
             do_gpu_compare_tiny = 1;
+        } else if (strcmp(argv[i], "--gpu-quants") == 0) {
+            do_gpu_quants = 1;
+            gpu_quants_paths = &argv[i + 1];
+            gpu_quants_n = argc - (i + 1);
+            i = argc; /* the rest of argv is fixture paths, not flags */
         } else {
             fprintf(stderr,
                 "usage: %s [--dump-acts FILE] [--metal]\n"
@@ -3220,6 +3383,7 @@ int main(int argc, char **argv) {
                 "       %s --real [--prompt TEXT] [--n-gen N] [--mlock] [--logits-only] [--metal]\n"
                 "       %s --metal --gpu-selftest\n"
                 "       %s --metal --gpu-compare-tiny\n"
+                "       %s --metal --gpu-quants FIXTURE.bin [FIXTURE.bin ...]\n"
                 "\n"
                 "--real paths default to docs/inkling-config.json, weights/resident-manifest.json,\n"
                 "weights/inkling-ud-q2_k_xl.sepia-index.json, weights/tokenizer.bin -- override with\n"
@@ -3234,8 +3398,11 @@ int main(int argc, char **argv) {
                 "end-to-end against a live device; requires --metal, local-only (needs a Metal GPU).\n"
                 "--gpu-compare-tiny runs a real tiny-oracle prefill on the CPU, replays each captured\n"
                 "rmsnorm/matvec/silu_mul/add/softmax/sconv instance on the GPU, and reports max relative\n"
-                "error per op kind; requires --metal, local-only (needs a Metal GPU).\n",
-                argv[0], argv[0], argv[0], argv[0], argv[0]);
+                "error per op kind; requires --metal, local-only (needs a Metal GPU).\n"
+                "--gpu-quants runs each SQFX fixture's dequant kernel bitwise against its expected f32\n"
+                "payload, plus a tolerance-checked matvec vs CPU qlinear; requires --metal, local-only\n"
+                "(needs a Metal GPU).\n",
+                argv[0], argv[0], argv[0], argv[0], argv[0], argv[0]);
             return 2;
         }
     }
@@ -3254,6 +3421,12 @@ int main(int argc, char **argv) {
 
     if (do_gpu_compare_tiny) {
         run_gpu_compare_tiny();
+        return 0;
+    }
+
+    if (do_gpu_quants) {
+        if (gpu_quants_n == 0) die("gpu-quants: at least one fixture path required");
+        run_gpu_quants(gpu_quants_paths, gpu_quants_n);
         return 0;
     }
 

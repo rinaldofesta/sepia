@@ -128,4 +128,35 @@ int sepia_gpu_softmax(SepiaGpuBuf *x, SepiaGpuBuf *y, int64_t rows, int64_t n);
 int sepia_gpu_sconv(SepiaGpuBuf *w, SepiaGpuBuf *hist, SepiaGpuBuf *in, SepiaGpuBuf *out,
                      int64_t C, int64_t K, int64_t T);
 
+/* ------------------------------ quantized matvec --------------------------- */
+/* Task 4+: dequant-fused matvec over GGML-quantized weight rows -- the CPU
+ * oracle for both is qlinear (dequantize_row per row, double-accumulated
+ * dot, src/sepia.c). `ggml_type` is one of the SEPIA_T_* constants from
+ * src/quants.h (this header intentionally doesn't include quants.h, to keep
+ * the GPU symbol surface decoupled from the quant-format module -- callers
+ * already include both, e.g. sepia.c). `w_off` is a byte offset into `w`
+ * (e.g. a tensor's offset within one wrapped resident.bin buffer); the
+ * weight rows starting there must be row-major [out_dim,in_dim] quantized
+ * blocks, contiguous per row (row stride = (in_dim/block_size)*block_bytes
+ * for the type), in_dim a multiple of the type's block size -- same
+ * contract as the CPU qlinear. Returns 0 (after logging) for an unsupported
+ * ggml_type, invalid args, or a dispatch failure -- callers decide whether
+ * that is fatal. f32 accumulation throughout (metal/matvec_q.metal has the
+ * exact per-type unpack, cross-checked bitwise against src/quants.c's
+ * dequant_* functions by --gpu-quants). */
+int sepia_gpu_matvec_q(int ggml_type, SepiaGpuBuf *w, size_t w_off, SepiaGpuBuf *x, SepiaGpuBuf *y,
+                        int64_t out_dim, int64_t in_dim);
+
+/* Standalone dequantization debug kernel (--gpu-quants): unpacks `n`
+ * elements' worth of quantized blocks (n a multiple of the type's block
+ * size -- exactly dequantize_row's own contract) starting at byte offset
+ * `raw_off` into `raw`, writing `n` floats to `out`. Shares its per-type
+ * unpack code with sepia_gpu_matvec_q (metal/matvec_q.metal) so the two
+ * cannot drift apart -- this is what lets --gpu-quants gate the matvec
+ * kernel's unpack correctness bitwise via the standalone kernel, and only
+ * needs a relative-tolerance check on the dot-product/reduction itself.
+ * Returns 0 (after logging) for an unsupported ggml_type, invalid args, or
+ * a dispatch failure. */
+int sepia_gpu_dequant_rows(int ggml_type, SepiaGpuBuf *raw, size_t raw_off, SepiaGpuBuf *out, int64_t n);
+
 #endif
