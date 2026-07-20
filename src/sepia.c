@@ -2778,11 +2778,26 @@ static void run_gpu_selftest(void) {
 
 static int g_gpu_compare_failed = 0;
 
-static double gpu_compare_rel_err(float got, float want) {
+/* `scale` is the op kind's own dynamic range (max |expected value| across
+ * every captured instance of that op), computed once per op kind below.
+ * Plain |a-b|/max(|b|,eps) with a tiny FIXED eps still blows up near a
+ * legitimate zero-crossing: e.g. one observed matvec instance (wo, a
+ * cancellation-heavy dot product) has CPU=-1.31933007e-06,
+ * GPU=-1.31875277e-06 -- an excellent 5.77e-10 absolute difference (float32
+ * rounding noise at the scale of the ~64 summed terms) that a 1e-6 floor
+ * reports as 4.4e-4 relative error, OVER the gate, purely because the true
+ * value happens to sit near zero. Scaling the floor to a small fraction of
+ * the op's own typical magnitude (rather than a fixed constant) is the
+ * standard fix for this (ggml's test-backend-ops does the equivalent):
+ * elements far below the op's dynamic range are judged on absolute
+ * closeness, not relative, while large-magnitude elements are still held to
+ * the full relative tolerance. */
+#define SEPIA_GPU_COMPARE_REL_FLOOR_FRAC 1e-3
+
+static double gpu_compare_rel_err(float got, float want, double scale) {
     double diff = fabs((double)got - (double)want);
-    double denom = fmax(fabs((double)want), 1e-6); /* absolute floor: avoids a near-zero
-                                                     * CPU target blowing up an otherwise
-                                                     * tiny absolute difference */
+    double floor = fmax(1e-6, SEPIA_GPU_COMPARE_REL_FLOOR_FRAC * scale);
+    double denom = fmax(fabs((double)want), floor);
     return diff / denom;
 }
 
@@ -2815,12 +2830,17 @@ static void gpu_compare_rmsnorm(void) {
     }
     if (!sepia_gpu_end()) die("gpu-compare: rmsnorm: end failed");
 
+    double scale = 0.0;
+    for (int i = 0; i < n_inst; i++) {
+        CapRmsnorm *it = &g_cap_rmsnorm.items[i];
+        for (int j = 0; j < it->n; j++) scale = fmax(scale, fabs((double)it->y[j]));
+    }
     double max_rel = 0.0;
     for (int i = 0; i < n_inst; i++) {
         CapRmsnorm *it = &g_cap_rmsnorm.items[i];
         float *y = (float *)sepia_gpu_host_ptr(yb[i]);
         for (int j = 0; j < it->n; j++) {
-            double rel = gpu_compare_rel_err(y[j], it->y[j]);
+            double rel = gpu_compare_rel_err(y[j], it->y[j], scale);
             if (rel > max_rel) max_rel = rel;
         }
         sepia_gpu_free(xb[i]);
@@ -2858,14 +2878,29 @@ static void gpu_compare_matvec(void) {
     }
     if (!sepia_gpu_end()) die("gpu-compare: matvec: end failed");
 
+    double scale = 0.0;
+    for (int i = 0; i < n_inst; i++) {
+        CapMatvec *it = &g_cap_matvec.items[i];
+        for (int j = 0; j < it->out_dim; j++) scale = fmax(scale, fabs((double)it->y[j]));
+    }
     double max_rel = 0.0;
+    int worst_i = -1, worst_j = -1;
     for (int i = 0; i < n_inst; i++) {
         CapMatvec *it = &g_cap_matvec.items[i];
         float *y = (float *)sepia_gpu_host_ptr(yb[i]);
         for (int j = 0; j < it->out_dim; j++) {
-            double rel = gpu_compare_rel_err(y[j], it->y[j]);
-            if (rel > max_rel) max_rel = rel;
+            double rel = gpu_compare_rel_err(y[j], it->y[j], scale);
+            if (rel > max_rel) { max_rel = rel; worst_i = i; worst_j = j; }
         }
+    }
+    if (getenv("SEPIA_GPU_COMPARE_DEBUG") && worst_i >= 0) {
+        CapMatvec *it = &g_cap_matvec.items[worst_i];
+        float *y = (float *)sepia_gpu_host_ptr(yb[worst_i]);
+        fprintf(stderr, "matvec debug: worst instance %d (out_dim=%d in_dim=%d) at j=%d: gpu=%.9g cpu=%.9g absdiff=%.3e\n",
+                worst_i, it->out_dim, it->in_dim, worst_j, (double)y[worst_j], (double)it->y[worst_j],
+                fabs((double)y[worst_j] - (double)it->y[worst_j]));
+    }
+    for (int i = 0; i < n_inst; i++) {
         sepia_gpu_free(wb[i]);
         sepia_gpu_free(xb[i]);
         sepia_gpu_free(yb[i]);
@@ -2900,12 +2935,17 @@ static void gpu_compare_silu_mul(void) {
     }
     if (!sepia_gpu_end()) die("gpu-compare: silu_mul: end failed");
 
+    double scale = 0.0;
+    for (int i = 0; i < n_inst; i++) {
+        CapSiluMul *it = &g_cap_silu.items[i];
+        for (int j = 0; j < it->n; j++) scale = fmax(scale, fabs((double)it->y[j]));
+    }
     double max_rel = 0.0;
     for (int i = 0; i < n_inst; i++) {
         CapSiluMul *it = &g_cap_silu.items[i];
         float *z = (float *)sepia_gpu_host_ptr(zb[i]);
         for (int j = 0; j < it->n; j++) {
-            double rel = gpu_compare_rel_err(z[j], it->y[j]);
+            double rel = gpu_compare_rel_err(z[j], it->y[j], scale);
             if (rel > max_rel) max_rel = rel;
         }
         sepia_gpu_free(gb[i]);
@@ -2942,12 +2982,17 @@ static void gpu_compare_add(void) {
     }
     if (!sepia_gpu_end()) die("gpu-compare: add: end failed");
 
+    double scale = 0.0;
+    for (int i = 0; i < n_inst; i++) {
+        CapAdd *it = &g_cap_add.items[i];
+        for (int j = 0; j < it->n; j++) scale = fmax(scale, fabs((double)it->y[j]));
+    }
     double max_rel = 0.0;
     for (int i = 0; i < n_inst; i++) {
         CapAdd *it = &g_cap_add.items[i];
         float *o = (float *)sepia_gpu_host_ptr(ob[i]);
         for (int j = 0; j < it->n; j++) {
-            double rel = gpu_compare_rel_err(o[j], it->y[j]);
+            double rel = gpu_compare_rel_err(o[j], it->y[j], scale);
             if (rel > max_rel) max_rel = rel;
         }
         sepia_gpu_free(ab[i]);
@@ -2981,12 +3026,17 @@ static void gpu_compare_softmax(void) {
     }
     if (!sepia_gpu_end()) die("gpu-compare: softmax: end failed");
 
+    double scale = 0.0;
+    for (int i = 0; i < n_inst; i++) {
+        CapSoftmax *it = &g_cap_softmax.items[i];
+        for (int j = 0; j < it->n; j++) scale = fmax(scale, fabs((double)it->y[j]));
+    }
     double max_rel = 0.0;
     for (int i = 0; i < n_inst; i++) {
         CapSoftmax *it = &g_cap_softmax.items[i];
         float *y = (float *)sepia_gpu_host_ptr(yb[i]);
         for (int j = 0; j < it->n; j++) {
-            double rel = gpu_compare_rel_err(y[j], it->y[j]);
+            double rel = gpu_compare_rel_err(y[j], it->y[j], scale);
             if (rel > max_rel) max_rel = rel;
         }
         sepia_gpu_free(xb[i]);
@@ -3027,13 +3077,19 @@ static void gpu_compare_sconv(void) {
     }
     if (!sepia_gpu_end()) die("gpu-compare: sconv: end failed");
 
+    double scale = 0.0;
+    for (int i = 0; i < n_inst; i++) {
+        CapSconv *it = &g_cap_sconv.items[i];
+        size_t tn = (size_t)it->T * (size_t)it->C;
+        for (size_t j = 0; j < tn; j++) scale = fmax(scale, fabs((double)it->y[j]));
+    }
     double max_rel = 0.0;
     for (int i = 0; i < n_inst; i++) {
         CapSconv *it = &g_cap_sconv.items[i];
         float *o = (float *)sepia_gpu_host_ptr(ob[i]);
         size_t tn = (size_t)it->T * (size_t)it->C;
         for (size_t j = 0; j < tn; j++) {
-            double rel = gpu_compare_rel_err(o[j], it->y[j]);
+            double rel = gpu_compare_rel_err(o[j], it->y[j], scale);
             if (rel > max_rel) max_rel = rel;
         }
         sepia_gpu_free(wb[i]);

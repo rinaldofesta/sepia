@@ -114,4 +114,13 @@ configcheck:
 gputest: sepia
 	./sepia --metal --gpu-selftest
 
-.PHONY: ci pycheck tooltests sepia test iobench test_quants test_tokenizer tokreal configcheck shadercheck gputest
+# local-only: needs a live Metal device and the committed tiny oracle fixture
+# (tools/oracle/tiny/, already required by the plain self-test) -- the Task 3
+# dev-loop gate. Drives one real T=32 prefill on the CPU, replays every
+# captured rmsnorm/matvec/silu_mul/add/softmax/sconv instance on the GPU, and
+# dies loudly if any op kind's worst instance exceeds the 2e-4 relative-error
+# tolerance. Not in ci for the same reason gputest isn't (needs a live device).
+gpucompare: sepia
+	./sepia --metal --gpu-compare-tiny
+
+.PHONY: ci pycheck tooltests sepia test iobench test_quants test_tokenizer tokreal configcheck shadercheck gputest gpucompare
