@@ -154,10 +154,17 @@ Phase 0 checklist and docs/container.md section 6.
   from the full model cross-checked against the pinned llama.cpp
   PR-branch build on the same GGUF (text-exact both test prompts,
   id-exact on one). Full results: docs/p1-first-tokens.md.
-- P2: Metal kernels (banded flash attention first), expert LRU plus
-  pinned store, F_NOCACHE streaming. First tok/s number. Then the
-  routing-predictability experiment: is Inkling's next-layer routing
-  predictable like GLM-5.2's 71.6%? Published either way.
+- P2 (Metal path + first tok/s number: done): Metal kernels (banded flash
+  attention, dequant-fused matvec, MoE routing) replace the scalar CPU
+  path; routed experts served from an LRU-streamed, per-slot-mlocked GPU
+  cache with async prefetch overlap; both P1 prompts still exact-sequence
+  on the GPU path. Measured throughput ~1.39-1.57 tok/s steady-state
+  (cold and warm) — the floor of, not comfortably inside, the 1.5-3 tok/s
+  target below, and now compute-bound rather than I/O-bound (falls short
+  of even the cold pure-I/O ceiling despite good cache hit rates). Full
+  results: docs/p2-perf.md. Still open: the routing-predictability
+  experiment (is Inkling's next-layer routing predictable like GLM-5.2's
+  71.6%? published either way) and phase close-out (Tasks 13-14).
 - P3: learning cache (`.sepia_usage`), confidence-ramped auto-pin (at
   most half the expert budget, colibri's rule), heat-based re-pin with
   hysteresis, PILOT prefetch if P2 says yes.

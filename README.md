@@ -8,7 +8,7 @@
 
 SEPIA is an inference engine that runs [Inkling](https://huggingface.co/thinkingmachines/Inkling) (Thinking Machines' 975B-parameter MoE, 41B active) on a Mac with 128GB of unified memory, by streaming experts from SSD. One model, one machine class, correctness proven before speed.
 
-Current state: the engine reproduces Inkling's forward pass token-exactly against the transformers reference, on CPU, gated in CI on every push. P1 is done: it now generates real greedy tokens from the full 317GB weights, cross-checked against a llama.cpp build on the same GGUF (text-exact on both test prompts, id-exact on one). Correctness only, not speed yet — ~29-31s/token steady on the scalar CPU path; P2 is where speed is addressed. Full results: [docs/p1-first-tokens.md](docs/p1-first-tokens.md).
+Current state: the engine reproduces Inkling's forward pass token-exactly against the transformers reference, on CPU, gated in CI on every push. P1 is done: it now generates real greedy tokens from the full 317GB weights, cross-checked against a llama.cpp build on the same GGUF (text-exact on both test prompts, id-exact on one). P2's Metal path and first honest tok/s number are done too: resident weights, banded attention, and MoE routing moved to Metal, with routed experts served from an LRU-streamed, mlocked GPU cache and async prefetch overlap. Real measured throughput: ~1.39-1.57 tok/s steady-state on both P1 prompts, cold and warm (down from P1's ~29-31s/token, i.e. ~0.6-0.7s/token now) — at the floor of the project's original 1.5-3 tok/s target, and the binding constraint is now GPU compute, not disk I/O (measured tok/s falls short of even the cold, 0%-hit pure-I/O ceiling). P2's routing-predictability experiment (PILOT) and phase close-out are still open. Full results: [docs/p2-perf.md](docs/p2-perf.md); P1's correctness baseline: [docs/p1-first-tokens.md](docs/p1-first-tokens.md).
 
 ## Why this exists
 
@@ -61,6 +61,11 @@ Numbers from this machine class (MacBook Pro M5 Max, 128GB), commands and full t
 | cold decode read volume | ~7.1GB/token | 6 experts x 64 MoE layers |
 | pure-I/O ceiling, 75% expert hit rate | ~7.5 tok/s | [DESIGN.md](docs/DESIGN.md) (bandwidth: [ssd-bench](docs/ssd-bench.md)) |
 | pure-I/O ceiling, fully cold | ~1.9 tok/s | [DESIGN.md](docs/DESIGN.md) (bandwidth: [ssd-bench](docs/ssd-bench.md)) |
+| P1 steady-state, scalar CPU path | ~29-31s/token | [p1-first-tokens](docs/p1-first-tokens.md) |
+| P2 steady-state, Metal + GPU expert cache, cold | 1.386-1.456 tok/s | [p2-perf](docs/p2-perf.md) |
+| P2 steady-state, Metal + GPU expert cache, warm | 1.427-1.573 tok/s | [p2-perf](docs/p2-perf.md) |
+| P2 256-token plateau, cumulative expert-cache hit rate | ~82-84% | [p2-perf](docs/p2-perf.md) |
+| P2 peak RSS (256-token run) | 64.31GB | [p2-perf](docs/p2-perf.md) |
 
 The measurements have already overruled the plan twice. The repack died: a per-expert container copy was the design until the benchmark showed three small preads cost the same as one large one, so SEPIA streams experts straight from the GGUF through an [index sidecar](docs/container.md). And the target stayed honest: 1.5-3 tok/s for first real decode, under a ceiling that says I/O will not be the bottleneck.
 
@@ -69,7 +74,7 @@ The measurements have already overruled the plan twice. The repack died: a per-e
 Phase 0 (done): oracle, token-exact CPU engine, SSD ground truth, GGUF inventory, container tooling. Everything above.
 
 - P1 (done): 7 dequant types bit-exact vs gguf-py fixtures (CI-gated); C tokenizer exact vs HF tokenizers (mini 9/9, real 25/25, ~8300-string stress sweep, zero mismatches) and vs llama-tokenize (7/7); first real greedy tokens deterministic on both test prompts, cross-checked against the pinned llama.cpp draft-PR build (text-exact both prompts, id-exact on prompt 1); ~29-31s/token steady on the scalar CPU path, correctness-only. Full results: [docs/p1-first-tokens.md](docs/p1-first-tokens.md)
-- P2: Metal kernels, expert LRU + pinned store, first real tok/s; the routing-predictability experiment (colibri measured 71.6% one-layer-ahead predictability on GLM-5.2; whether Inkling routes as predictably is open, and a negative result gets published too)
+- P2 (Metal path + first tok/s number: done): resident weights, banded attention, and MoE routing on Metal; routed experts served from an LRU-streamed, mlocked GPU cache with async prefetch overlap; both P1 prompts still exact-sequence on GPU. Measured throughput ~1.39-1.57 tok/s steady-state (cold and warm) — at the floor of the 1.5-3 tok/s target, and now compute-bound rather than I/O-bound (falls short of even the cold pure-I/O ceiling despite good cache hit rates). Full results: [docs/p2-perf.md](docs/p2-perf.md). Routing-predictability experiment (PILOT) and phase close-out still open.
 - P3: learning cache: routing history persisted across sessions, confidence-ramped auto-pin, prefetch if P2 says yes
 - P4: MTP speculation from the dedicated 10.5GB `mtp.safetensors` shard, quantized in-house at 8-bit or better
 - P5: OpenAI + Anthropic compatible server, per-request effort dial, agent integrations
@@ -88,7 +93,7 @@ Full design with the reasoning behind each phase: [docs/DESIGN.md](docs/DESIGN.m
 
 ## Known limits
 
-- Real-weight decode is correctness-only and slow: ~29-31s/token on the scalar CPU path (P1, [docs/p1-first-tokens.md](docs/p1-first-tokens.md)); P2's Metal path is where speed gets addressed
+- P2's Metal path reaches ~1.39-1.57 tok/s steady-state (down from P1's ~29-31s/token on the scalar CPU path, [docs/p1-first-tokens.md](docs/p1-first-tokens.md)), at the floor of the 1.5-3 tok/s target, not comfortably inside it; GPU compute, not disk I/O, is now the binding constraint ([docs/p2-perf.md](docs/p2-perf.md))
 - Attention log-scaling past 128K positions is implemented per spec but untestable at oracle scale
 - The 15MiB unaligned-read margin, once 93.9% under concurrent load, re-measured at ~101% on a quiet disk (2026-07-20); the margin concern is retired ([docs/container.md](docs/container.md))
 - Multimodal input and MTP are out of scope until P4+; text in, text out
