@@ -85,6 +85,15 @@ using namespace metal;
 // implementation to maintain.
 static inline float sepia_tg_reduce_sum(float val, threadgroup float *shmem, ushort tiisg, ushort sgitg);
 
+// iq2xs_grid / iq3xxs_grid / ksigns_iq2xs / kmask_iq2xs / kvalues_iq4nl are
+// defined in metal/00_quants_grids.metal (generated); declarations keep this
+// file per-file-compilable.
+extern constant ulong iq2xs_grid[512];
+extern constant uint  iq3xxs_grid[256];
+extern constant uchar ksigns_iq2xs[128];
+extern constant uchar kmask_iq2xs[8];
+extern constant char  kvalues_iq4nl[16];
+
 // ---------------------------------------------------------------------------
 // Block layouts (byte-identical to src/quants.c; QK8_0=32, QK_K=256).
 

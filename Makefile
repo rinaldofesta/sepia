@@ -65,20 +65,32 @@ src/sepia_gpu_stub.o: src/sepia_gpu_stub.c src/sepia_gpu.h
 	$(CC) $(CFLAGS) -c -o src/sepia_gpu_stub.o src/sepia_gpu_stub.c
 
 # Offline Metal shader syntax/type check -- no device needed, so it runs in
-# CI (macos-latest ships the toolchain). `metal -c` refuses multiple inputs
-# sharing one -o (mirrors clang -c), hence the per-file loop. Non-Darwin:
-# no Metal toolchain exists, so this is a no-op rather than a hard failure.
-# Darwin machines with only Command Line Tools (no Xcode.app) have the Metal
-# framework but not the offline `metal` compiler -- `xcrun -f metal` detects
-# that so this skips gracefully instead of hard-failing `make ci`; runtime
-# compilation via `--metal` is unaffected either way.
+# CI (macos-latest ships the toolchain). Compiles the SAME translation unit
+# sepia_gpu_load_source builds at runtime: metal/*.metal concatenated in
+# sorted order (plain glob order in sh is already lexicographic, matching
+# that loader's `sortedArrayUsingSelector:@selector(compare:)`) into one temp
+# file, then `metal -c` on that single file -- not per-file, since some
+# files (e.g. matvec_q.metal) reference `constant` tables defined in another
+# file (00_quants_grids.metal) and only compile standalone thanks to their
+# own `extern constant` forward declarations; checking the concatenated TU
+# is what actually matches what ships. Non-Darwin: no Metal toolchain
+# exists, so this is a no-op rather than a hard failure. Darwin machines
+# with only Command Line Tools (no Xcode.app) have the Metal framework but
+# not the offline `metal` compiler -- `xcrun -f metal` detects that so this
+# skips gracefully instead of hard-failing `make ci`; runtime compilation
+# via `--metal` is unaffected either way.
 shadercheck:
 ifeq ($(UNAME_S),Darwin)
 	@if xcrun -f metal >/dev/null 2>&1; then \
+		tmp="$${TMPDIR:-/tmp}/sepia_shadercheck_$$$$.metal"; \
+		rm -f "$$tmp"; \
 		for f in metal/*.metal; do \
-			echo "shadercheck: $$f"; \
-			xcrun -sdk macosx metal -c "$$f" -o /dev/null || exit 1; \
+			echo "shadercheck: concatenating $$f"; \
+			cat "$$f" >> "$$tmp"; \
 		done; \
+		xcrun -sdk macosx metal -c "$$tmp" -o /dev/null; rc=$$?; \
+		rm -f "$$tmp"; \
+		if [ "$$rc" -ne 0 ]; then exit 1; fi; \
 		echo "shadercheck ok"; \
 	else \
 		echo "shadercheck: skipped (no offline Metal compiler; runtime compile covered by --metal)"; \
