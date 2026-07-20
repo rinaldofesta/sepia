@@ -52,4 +52,9 @@ test_tokenizer: tools/test_tokenizer.c src/tokenizer.c src/tokenizer.h src/unico
 tokreal: test_tokenizer
 	./test_tokenizer weights/tokenizer.bin tools/fixtures/tokenizer/real_cases.json
 
-.PHONY: ci pycheck tooltests sepia test iobench test_quants test_tokenizer tokreal
+# local-only: verifies docs/inkling-config.json against GGUF part 1 metadata
+# (needs weights/inkling-gguf/..., not fetched in ci)
+configcheck:
+	python3 tools/check_inkling_config.py
+
+.PHONY: ci pycheck tooltests sepia test iobench test_quants test_tokenizer tokreal configcheck
