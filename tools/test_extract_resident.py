@@ -317,5 +317,69 @@ class ManifestDurabilityTests(unittest.TestCase):
         self.assertEqual(os.path.getsize(self.bin_path), manifest2["resident_bin_size"])
 
 
+class VerifyTests(unittest.TestCase):
+    """--verify re-reads every manifest-recorded tensor's bytes straight
+    from resident.bin and re-hashes them against the manifest's stored
+    sha256 -- the trust check the P1 loader needs before mlock'ing
+    resident.bin (progress.md's mlock note)."""
+
+    def setUp(self):
+        self.fixture = _build_fixture_files()
+        self.inventory = _inventory_from_fixture(self.fixture)
+        self.tmpdir = tempfile.mkdtemp()
+        self.weights_dir = os.path.join(self.tmpdir, "weights")
+        self.inventory_path = os.path.join(self.tmpdir, "inventory.json")
+        self.bin_path = os.path.join(self.tmpdir, "resident.bin")
+        self.manifest_path = os.path.join(self.tmpdir, "resident-manifest.json")
+        with open(self.inventory_path, "w") as f:
+            json.dump(self.inventory, f)
+        for part_file in self.fixture:
+            path = os.path.join(self.weights_dir, part_file)
+            os.makedirs(os.path.dirname(path), exist_ok=True)
+            with open(path, "wb") as f:
+                f.write(self.fixture[part_file][0])
+        er.run_extract(self.weights_dir, self.inventory_path, self.bin_path, self.manifest_path, 0)
+        with open(self.manifest_path) as f:
+            self.manifest = json.load(f)
+
+    def _verify(self):
+        stdout = io.StringIO()
+        with mock.patch("sys.stdout", stdout):
+            rc = er.main(["--verify", "--out-bin", self.bin_path, "--out-manifest", self.manifest_path])
+        return rc, stdout.getvalue()
+
+    def test_verify_ok_after_normal_extraction(self):
+        rc, out = self._verify()
+        self.assertEqual(rc, 0)
+        self.assertIn("verify OK 4/4", out)
+
+    def test_verify_flags_flipped_byte_and_names_tensor(self):
+        target = self.manifest["tensors"][0]
+        with open(self.bin_path, "r+b") as f:
+            f.seek(target["offset"])
+            byte = f.read(1)
+            f.seek(target["offset"])
+            f.write(bytes([byte[0] ^ 0xFF]))
+
+        rc, out = self._verify()
+
+        self.assertEqual(rc, 1)
+        self.assertIn(target["name"], out)
+
+    def test_verify_flags_short_read_on_truncated_bin(self):
+        # tensors are appended in extraction order with strictly increasing
+        # offsets, so the last manifest entry is also the last region in
+        # the file -- truncating one byte short of its end cuts only it.
+        target = self.manifest["tensors"][-1]
+        with open(self.bin_path, "r+b") as f:
+            f.truncate(target["offset"] + target["nbytes"] - 1)
+
+        rc, out = self._verify()
+
+        self.assertEqual(rc, 1)
+        self.assertIn("short read", out)
+        self.assertIn(target["name"], out)
+
+
 if __name__ == "__main__":
     unittest.main()

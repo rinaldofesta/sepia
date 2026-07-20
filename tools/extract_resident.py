@@ -42,6 +42,7 @@ Python 3 stdlib only.
 Usage:
     python3 tools/extract_resident.py
     python3 tools/extract_resident.py --min-free-gb 100
+    python3 tools/extract_resident.py --verify
 """
 import argparse
 import datetime
@@ -253,6 +254,43 @@ def _print_summary(manifest, newly_extracted):
         print("pending parts: none -- resident extraction is complete")
 
 
+def verify(manifest_path, bin_path):
+    """Re-reads every manifest-recorded tensor's bytes straight from
+    bin_path and re-hashes them against the manifest's stored sha256 --
+    the trust check the P1 loader needs before it mlocks resident.bin.
+    Does not extract or modify anything. Prints one line per tensor that
+    fails (short read, or a sha256 mismatch) plus a summary line, and
+    returns 0 if every tensor matched or 1 if any did not."""
+    if not os.path.exists(manifest_path):
+        raise ExtractError(f"no manifest at {manifest_path!r} -- nothing to verify")
+    if not os.path.exists(bin_path):
+        raise ExtractError(f"no resident.bin at {bin_path!r} -- nothing to verify")
+    with open(manifest_path) as f:
+        manifest = json.load(f)
+    tensors = manifest.get("tensors", [])
+
+    bad = 0
+    with open(bin_path, "rb") as f:
+        for t in tensors:
+            f.seek(t["offset"])
+            data = f.read(t["nbytes"])
+            if len(data) != t["nbytes"]:
+                print(f"verify FAIL {t['name']}: short read ({len(data)}/{t['nbytes']} bytes)")
+                bad += 1
+                continue
+            digest = hashlib.sha256(data).hexdigest()
+            if digest != t["sha256"]:
+                print(f"verify FAIL {t['name']}: sha256 {digest} != manifest {t['sha256']}")
+                bad += 1
+
+    n = len(tensors)
+    if bad:
+        print(f"verify: {bad}/{n} tensors FAILED")
+        return 1
+    print(f"verify OK {n}/{n}")
+    return 0
+
+
 def _build_arg_parser():
     p = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     p.add_argument("--weights-dir", default=DEFAULT_WEIGHTS_DIR)
@@ -261,11 +299,20 @@ def _build_arg_parser():
     p.add_argument("--out-manifest", default=DEFAULT_OUT_MANIFEST)
     p.add_argument("--min-free-gb", type=float, default=DEFAULT_MIN_FREE_GB,
                     help=f"abort before writing if free disk space is below this (default {DEFAULT_MIN_FREE_GB}GB)")
+    p.add_argument("--verify", action="store_true",
+                    help="re-hash every manifest tensor's bytes in --out-bin against its "
+                         "recorded sha256 and exit 0/1; does not extract anything")
     return p
 
 
 def main(argv=None):
     args = _build_arg_parser().parse_args(argv)
+    if args.verify:
+        try:
+            return verify(args.out_manifest, args.out_bin)
+        except ExtractError as exc:
+            print(f"error: {exc}", file=sys.stderr)
+            return 1
     try:
         manifest, newly_extracted = run_extract(
             args.weights_dir, args.inventory, args.out_bin, args.out_manifest, args.min_free_gb
