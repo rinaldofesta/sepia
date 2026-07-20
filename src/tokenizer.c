@@ -200,35 +200,79 @@ static int match_contraction(const uint8_t *s, int n, int i) {
     return 0;
 }
 
-static int next_pretoken(const uint8_t *s, int n, int i) {
-    uint32_t cp; int j, len;
-    /* Branch 1+2: optional non-[\r\n L N] prefix, then letter run */
-    j = utf8_next(s, n, i, &cp);
-    int m0 = (int)uc_class(cp);
-    int start_letters = i;
-    if (cp != '\r' && cp != '\n' && !is_letter(m0) && !is_num(m0)) start_letters = j;
-    /* Branches 1+2 letter runs: A*B+ | A+B*  (A = letter-or-mark not ASCII a-z,
-     * B = letter-or-mark not ASCII A-Z; A∩B is every non-ASCII letter and mark,
-     * so greedy A-then-B linear runs give the same extent as the regex's
-     * backtracking — the B-empty case falls back to A+). */
-    int a_run = 0, b_run = 0, pos = start_letters;
+/* A = letter-or-mark not ASCII a-z, B = letter-or-mark not ASCII A-Z. Every
+ * non-ASCII letter/mark is in BOTH classes (only ASCII A-Z is A-only, only
+ * ASCII a-z is B-only). Scan the maximal A run from `start`, then the
+ * maximal B run right after it; report enough to decide both alt1 (A*B+)
+ * and alt2 (A+B*) from this starting position. */
+static void scan_ab(const uint8_t *s, int n, int start,
+                    int *a_run, int *after_a, int *b_run, int *last_both, int *end_ab) {
+    uint32_t cp; int pos = start;
+    *a_run = 0; *last_both = -1;
     while (pos < n) {
         int q = utf8_next(s, n, pos, &cp); int mm = (int)uc_class(cp);
         if (!((mm & (UC_L | UC_M)) && !(cp >= 'a' && cp <= 'z'))) break;
-        a_run++; pos = q;
+        if (cp >= 0x80) *last_both = pos;
+        (*a_run)++; pos = q;
     }
-    int after_a = pos;
+    *after_a = pos;
+    *b_run = 0;
     while (pos < n) {
         int q = utf8_next(s, n, pos, &cp); int mm = (int)uc_class(cp);
         if (!((mm & (UC_L | UC_M)) && !(cp >= 'A' && cp <= 'Z'))) break;
-        b_run++; pos = q;
+        (*b_run)++; pos = q;
     }
-    if (a_run > 0 || b_run > 0) {
-        int end = (b_run > 0) ? pos : after_a;   /* A*B+ tail present, else A+ only */
-        if (end > start_letters) {
-            len = match_contraction(s, n, end);
-            return end + len - i;
-        }
+    *end_ab = pos;
+}
+
+/* alt1 = A*B+ from `start`: greedy A* immediately followed by B+ succeeds
+ * without backtrack; if nothing after the A run is B-class, real backtracking
+ * regex still gives back characters of the greedy A* one at a time until it
+ * exposes a non-ASCII (both-class) char to start B+ from instead — last_both
+ * (rightmost such char) replicates that without actual backtracking. Returns
+ * the match end, or -1 if alt1 cannot match at all from `start`. */
+static int alt1_end(const uint8_t *s, int n, int start) {
+    int a_run, after_a, b_run, last_both, end_ab;
+    scan_ab(s, n, start, &a_run, &after_a, &b_run, &last_both, &end_ab);
+    if (b_run > 0) return end_ab;
+    if (last_both >= 0) { uint32_t cp; return utf8_next(s, n, last_both, &cp); }
+    return -1;
+}
+
+/* alt2 = A+B* from `start`: A+ (>=1) takes the maximal A run (no backtrack
+ * needed — B* has no minimum, so it just extends over whatever B run
+ * follows). Returns the match end, or -1 if there's no A run at all. */
+static int alt2_end(const uint8_t *s, int n, int start) {
+    int a_run, after_a, b_run, last_both, end_ab;
+    scan_ab(s, n, start, &a_run, &after_a, &b_run, &last_both, &end_ab);
+    (void)after_a; (void)last_both;
+    if (a_run == 0) return -1;
+    return end_ab;
+}
+
+static int next_pretoken(const uint8_t *s, int n, int i) {
+    uint32_t cp; int j, len;
+    /* Branch 1+2: optional non-[\r\n L N] prefix, then letter run. The `?`
+     * prefix is itself backtracked by the real regex: try consuming it
+     * first (greedy), and only if alt1 fails completely with the prefix
+     * consumed does it retry alt1 without the prefix — only then does it
+     * move on to try alt2 (again prefix-first, then prefix-less). A bare
+     * combining mark is the case that needs all four attempts: it is
+     * prefix-eligible (only \p{L}\p{N} are excluded from the prefix class,
+     * not \p{M}) but also A/B-eligible itself, so "mark then ASCII-upper
+     * letter, then something neither A nor B" must NOT merge the two -
+     * confirmed against the reference tokenizer's pre_tokenize_str. */
+    j = utf8_next(s, n, i, &cp);
+    int m0 = (int)uc_class(cp);
+    int prefix_ok = (cp != '\r' && cp != '\n' && !is_letter(m0) && !is_num(m0));
+    int end = -1;
+    if (prefix_ok) end = alt1_end(s, n, j);
+    if (end < 0) end = alt1_end(s, n, i);
+    if (end < 0 && prefix_ok) end = alt2_end(s, n, j);
+    if (end < 0) end = alt2_end(s, n, i);
+    if (end >= 0) {
+        len = match_contraction(s, n, end);
+        return end + len - i;
     }
     /* Branch 3: \p{N}{1,3} */
     if (is_num(m0)) {
