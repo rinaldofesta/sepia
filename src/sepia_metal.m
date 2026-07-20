@@ -36,7 +36,16 @@ static int g_available;
 
 /* Batched encoding state (Task 3) -- see the sepia_gpu_begin/flush/end
  * definitions below for the full contract. Declared here (rather than next
- * to those functions) so sepia_gpu_shutdown, above, can reset them too. */
+ * to those functions) so sepia_gpu_shutdown, above, can reset them too.
+ *
+ * Thread-safety: this entire module is single-thread-only -- g_device,
+ * g_queue, g_library, g_batch_cb, g_batch_enc, and g_pso_cache are plain
+ * globals with no locking, and every sepia_gpu_* entry point assumes it is
+ * called from the one thread that owns them. Task 11's planned loader
+ * pthread must never touch any of this state or call into this file: it
+ * only preads expert bytes into host memory and signals a shared event --
+ * all Metal API calls (encoding, PSO lookups, buffer/queue access) stay on
+ * the single thread that already does so today. */
 static id<MTLCommandBuffer> g_batch_cb;
 static id<MTLComputeCommandEncoder> g_batch_enc;
 static NSMutableDictionary<NSString *, id<MTLComputePipelineState>> *g_pso_cache;

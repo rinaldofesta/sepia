@@ -876,10 +876,13 @@ static void cache_free(Cache *c) {
  * read back by the CPU forward pass itself, so with g_opcap==0 (every other
  * mode: the self-test, --real, --dump-acts, --smoke) every function in this
  * file computes byte-identical results to before this section existed. The
- * harness (run_gpu_compare_tiny, near main()) drives one T=32 prefill
- * through the UNMODIFIED model_forward_chunk with g_opcap set, then replays
- * each captured instance through the matching sepia_gpu_* kernel and
- * reports max-relative-error per op kind.
+ * harness (run_gpu_compare_tiny, near main()) drives one T=32 prefill plus
+ * one incremental T=1 decode step (continuing the same cache, so its sconv
+ * instances see nonzero history -- the prefill alone only ever sees the
+ * cache's zero-initialized history) through the UNMODIFIED
+ * model_forward_chunk with g_opcap set, then replays each captured instance
+ * through the matching sepia_gpu_* kernel and reports max-relative-error per
+ * op kind.
  *
  * g_opcap_selected_layer restricts the per-layer op kinds (matvec, sconv,
  * softmax, silu_mul, and the per-layer rmsnorm sites) to layer 0 and the
@@ -1323,8 +1326,13 @@ static void mlp_moe_forward(const Config *cfg, const LayerWeights *lw, const flo
     free(g_vec);
     free(u_vec);
 
+    float *shared_out = g_opcap_selected_layer ? xmalloc(sizeof(float) * (size_t)hidden) : NULL;
     for (int s = 0; s < n_shared; s++) {
         float gamma = weights[topk + s];
+        /* No cap_push_silu_mul here (intentional, unlike the routed branch
+         * above): h[i] below folds *gamma into the activation itself, so it
+         * isn't the same computation sepia_silu_mul_f32 implements -- see
+         * task-3-report.md's "Comparison-harness op scope" note. */
         for (int i = 0; i < moe_inter; i++) {
             float g = dotf(w13_row(lw->shared_w13, s, two_inter, hidden, 0, i), x, hidden);
             float u = dotf(w13_row(lw->shared_w13, s, two_inter, hidden, 1, i), x, hidden);
@@ -1338,9 +1346,20 @@ static void mlp_moe_forward(const Config *cfg, const LayerWeights *lw, const flo
         }
         for (int d = 0; d < hidden; d++) {
             const float *row = lw->shared_w2 + ((size_t)s * hidden + (size_t)d) * moe_inter;
-            out[d] += dotf(row, h, moe_inter);
+            float v = dotf(row, h, moe_inter);
+            if (g_opcap_selected_layer) shared_out[d] = v;
+            out[d] += v;
         }
+        /* shared_w2 is the same contiguous row-major [hidden,moe_inter]
+         * family as experts_w2 above (both are plain down-projections),
+         * just previously uncaptured -- shared_out holds the pure Wx result
+         * (before accumulating into out) so the capture matches what
+         * sepia_gpu_matvec actually computes. */
+        if (g_opcap_selected_layer)
+            cap_push_matvec(lw->shared_w2 + (size_t)s * (size_t)hidden * (size_t)moe_inter, h,
+                             hidden, moe_inter, shared_out);
     }
+    free(shared_out);
 
     free(h);
     free(weights);
@@ -2778,8 +2797,15 @@ static void run_gpu_selftest(void) {
 
 static int g_gpu_compare_failed = 0;
 
-/* `scale` is the op kind's own dynamic range (max |expected value| across
- * every captured instance of that op), computed once per op kind below.
+/* `scale` is a captured INSTANCE's own dynamic range (max |expected value|
+ * across that one (input,output) pair's output tensor), computed once per
+ * instance below -- NOT pooled across every instance of the op kind. Pooling
+ * across, e.g., all 448 matvec instances (wq/wo/router/experts families
+ * alike) would let a large-magnitude family (e.g. router_w) loosen the floor
+ * for a small-magnitude family (e.g. one expert's down-proj), which is
+ * strictly looser than judging each instance against its own scale; per-
+ * instance is what ggml's test-backend-ops does (each test case supplies its
+ * own reference tensor's range), and this matches that convention exactly.
  * Plain |a-b|/max(|b|,eps) with a tiny FIXED eps still blows up near a
  * legitimate zero-crossing: e.g. one observed matvec instance (wo, a
  * cancellation-heavy dot product) has CPU=-1.31933007e-06,
@@ -2789,7 +2815,7 @@ static int g_gpu_compare_failed = 0;
  * value happens to sit near zero. Scaling the floor to a small fraction of
  * the op's own typical magnitude (rather than a fixed constant) is the
  * standard fix for this (ggml's test-backend-ops does the equivalent):
- * elements far below the op's dynamic range are judged on absolute
+ * elements far below the instance's dynamic range are judged on absolute
  * closeness, not relative, while large-magnitude elements are still held to
  * the full relative tolerance. */
 #define SEPIA_GPU_COMPARE_REL_FLOOR_FRAC 1e-3
@@ -2830,14 +2856,11 @@ static void gpu_compare_rmsnorm(void) {
     }
     if (!sepia_gpu_end()) die("gpu-compare: rmsnorm: end failed");
 
-    double scale = 0.0;
-    for (int i = 0; i < n_inst; i++) {
-        CapRmsnorm *it = &g_cap_rmsnorm.items[i];
-        for (int j = 0; j < it->n; j++) scale = fmax(scale, fabs((double)it->y[j]));
-    }
     double max_rel = 0.0;
     for (int i = 0; i < n_inst; i++) {
         CapRmsnorm *it = &g_cap_rmsnorm.items[i];
+        double scale = 0.0;
+        for (int j = 0; j < it->n; j++) scale = fmax(scale, fabs((double)it->y[j]));
         float *y = (float *)sepia_gpu_host_ptr(yb[i]);
         for (int j = 0; j < it->n; j++) {
             double rel = gpu_compare_rel_err(y[j], it->y[j], scale);
@@ -2878,15 +2901,12 @@ static void gpu_compare_matvec(void) {
     }
     if (!sepia_gpu_end()) die("gpu-compare: matvec: end failed");
 
-    double scale = 0.0;
-    for (int i = 0; i < n_inst; i++) {
-        CapMatvec *it = &g_cap_matvec.items[i];
-        for (int j = 0; j < it->out_dim; j++) scale = fmax(scale, fabs((double)it->y[j]));
-    }
     double max_rel = 0.0;
     int worst_i = -1, worst_j = -1;
     for (int i = 0; i < n_inst; i++) {
         CapMatvec *it = &g_cap_matvec.items[i];
+        double scale = 0.0;
+        for (int j = 0; j < it->out_dim; j++) scale = fmax(scale, fabs((double)it->y[j]));
         float *y = (float *)sepia_gpu_host_ptr(yb[i]);
         for (int j = 0; j < it->out_dim; j++) {
             double rel = gpu_compare_rel_err(y[j], it->y[j], scale);
@@ -2935,14 +2955,11 @@ static void gpu_compare_silu_mul(void) {
     }
     if (!sepia_gpu_end()) die("gpu-compare: silu_mul: end failed");
 
-    double scale = 0.0;
-    for (int i = 0; i < n_inst; i++) {
-        CapSiluMul *it = &g_cap_silu.items[i];
-        for (int j = 0; j < it->n; j++) scale = fmax(scale, fabs((double)it->y[j]));
-    }
     double max_rel = 0.0;
     for (int i = 0; i < n_inst; i++) {
         CapSiluMul *it = &g_cap_silu.items[i];
+        double scale = 0.0;
+        for (int j = 0; j < it->n; j++) scale = fmax(scale, fabs((double)it->y[j]));
         float *z = (float *)sepia_gpu_host_ptr(zb[i]);
         for (int j = 0; j < it->n; j++) {
             double rel = gpu_compare_rel_err(z[j], it->y[j], scale);
@@ -2982,14 +2999,11 @@ static void gpu_compare_add(void) {
     }
     if (!sepia_gpu_end()) die("gpu-compare: add: end failed");
 
-    double scale = 0.0;
-    for (int i = 0; i < n_inst; i++) {
-        CapAdd *it = &g_cap_add.items[i];
-        for (int j = 0; j < it->n; j++) scale = fmax(scale, fabs((double)it->y[j]));
-    }
     double max_rel = 0.0;
     for (int i = 0; i < n_inst; i++) {
         CapAdd *it = &g_cap_add.items[i];
+        double scale = 0.0;
+        for (int j = 0; j < it->n; j++) scale = fmax(scale, fabs((double)it->y[j]));
         float *o = (float *)sepia_gpu_host_ptr(ob[i]);
         for (int j = 0; j < it->n; j++) {
             double rel = gpu_compare_rel_err(o[j], it->y[j], scale);
@@ -3026,14 +3040,11 @@ static void gpu_compare_softmax(void) {
     }
     if (!sepia_gpu_end()) die("gpu-compare: softmax: end failed");
 
-    double scale = 0.0;
-    for (int i = 0; i < n_inst; i++) {
-        CapSoftmax *it = &g_cap_softmax.items[i];
-        for (int j = 0; j < it->n; j++) scale = fmax(scale, fabs((double)it->y[j]));
-    }
     double max_rel = 0.0;
     for (int i = 0; i < n_inst; i++) {
         CapSoftmax *it = &g_cap_softmax.items[i];
+        double scale = 0.0;
+        for (int j = 0; j < it->n; j++) scale = fmax(scale, fabs((double)it->y[j]));
         float *y = (float *)sepia_gpu_host_ptr(yb[i]);
         for (int j = 0; j < it->n; j++) {
             double rel = gpu_compare_rel_err(y[j], it->y[j], scale);
@@ -3077,17 +3088,13 @@ static void gpu_compare_sconv(void) {
     }
     if (!sepia_gpu_end()) die("gpu-compare: sconv: end failed");
 
-    double scale = 0.0;
-    for (int i = 0; i < n_inst; i++) {
-        CapSconv *it = &g_cap_sconv.items[i];
-        size_t tn = (size_t)it->T * (size_t)it->C;
-        for (size_t j = 0; j < tn; j++) scale = fmax(scale, fabs((double)it->y[j]));
-    }
     double max_rel = 0.0;
     for (int i = 0; i < n_inst; i++) {
         CapSconv *it = &g_cap_sconv.items[i];
-        float *o = (float *)sepia_gpu_host_ptr(ob[i]);
         size_t tn = (size_t)it->T * (size_t)it->C;
+        double scale = 0.0;
+        for (size_t j = 0; j < tn; j++) scale = fmax(scale, fabs((double)it->y[j]));
+        float *o = (float *)sepia_gpu_host_ptr(ob[i]);
         for (size_t j = 0; j < tn; j++) {
             double rel = gpu_compare_rel_err(o[j], it->y[j], scale);
             if (rel > max_rel) max_rel = rel;
@@ -3114,21 +3121,55 @@ static void run_gpu_compare_tiny(void) {
     Model m = model_load(config_path, weights_path);
     OracleRef ref = load_oracle_ref(ref_path);
     int full_len = ref.full_ids.len; /* the tiny oracle's T=32 teacher-forcing prefill */
+    int unpadded = m.cfg.unpadded_vocab_size;
 
-    Cache *c = cache_create(&m, full_len);
-    float *logits = xmalloc(sizeof(float) * (size_t)full_len * (size_t)m.cfg.unpadded_vocab_size);
+    /* +1 of capacity: the T=32 prefill below fills positions [0,full_len),
+     * then one incremental T=1 decode step (finding 2's fix) continues the
+     * SAME cache at start_pos=full_len, writing k/v for that one extra
+     * position -- mirrors run_self_test's prefill-then-decode shape. */
+    Cache *c = cache_create(&m, full_len + 1);
+    float *logits = xmalloc(sizeof(float) * (size_t)full_len * (size_t)unpadded);
 
     g_opcap = 1;
     model_forward_chunk(&m, c, ref.full_ids.ids, full_len, 0, logits, NULL);
+
+    /* The prefill above is the cache's first-ever chunk, so every sconv
+     * hist buffer it captures is all-zero (cache_create zero-inits them) --
+     * that branch of sepia_gpu_sconv was never exercised with real history.
+     * Continue the SAME cache with one incremental decode step (T=1,
+     * start_pos=full_len, true greedy: feed the prefill's own last-position
+     * prediction forward, same convention as run_self_test's decode loop)
+     * so the sconv instances captured from THIS step see the nonzero
+     * history the prefill just built up. */
+    int next_id = argmax_f(logits + (size_t)(full_len - 1) * unpadded, unpadded);
+    float *decode_logits = xmalloc(sizeof(float) * (size_t)unpadded);
+    model_forward_chunk(&m, c, &next_id, 1, full_len, decode_logits, NULL);
+    free(decode_logits);
     g_opcap = 0;
 
     free(logits);
     cache_free(c);
 
     fprintf(stderr, "gpu-compare-tiny: captured %d rmsnorm, %d matvec, %d silu_mul, %d add, "
-                     "%d softmax, %d sconv instances from a %d-token prefill\n",
+                     "%d softmax, %d sconv instances from a %d-token prefill + 1-token decode step\n",
             g_cap_rmsnorm.count, g_cap_matvec.count, g_cap_silu.count, g_cap_add.count,
             g_cap_softmax.count, g_cap_sconv.count, full_len);
+
+    /* Regression guard for the history coverage this fix adds: if every
+     * captured sconv instance ever went back to all-zero hist (e.g. a
+     * future edit stops running the decode step above), fail loudly here
+     * rather than silently losing that branch's coverage again. */
+    int sconv_hist_nonzero = 0;
+    for (int i = 0; i < g_cap_sconv.count && !sconv_hist_nonzero; i++) {
+        CapSconv *it = &g_cap_sconv.items[i];
+        size_t hn = (size_t)(it->K - 1) * (size_t)it->C;
+        for (size_t j = 0; j < hn; j++) {
+            if (it->hist[j] != 0.0f) { sconv_hist_nonzero = 1; break; }
+        }
+    }
+    if (g_cap_sconv.count > 0 && !sconv_hist_nonzero)
+        die("gpu-compare-tiny: no captured sconv instance has nonzero history "
+            "(decode-step coverage regressed)");
 
     gpu_compare_rmsnorm();
     gpu_compare_matvec();
