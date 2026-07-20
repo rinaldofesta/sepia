@@ -34,6 +34,7 @@
 #include <errno.h>
 #include <fcntl.h>
 #include <math.h>
+#include <pthread.h>
 #include <stdarg.h>
 #include <stdbool.h>
 #include <stdint.h>
@@ -2280,6 +2281,15 @@ typedef struct {
 
     uint64_t hits, misses;
     int verbose;                 /* --verbose-cache */
+
+    /* Task 11 A/B: 0 (default) = the part_fds were opened with F_NOCACHE
+     * (direct I/O, bypassing the page cache -- SEPIA's own measured 13.3GB/s
+     * and ~2x-buffered result, docs/ssd-bench.md); 1 = the fds are plain
+     * buffered fds and expert_cache_get fires an F_RDADVISE readahead hint
+     * per region before handing the read to the loader pool (ds4's
+     * alternative). Set once at expert_store_init from --expert-io-mode;
+     * read-only afterward. */
+    int io_pagecache;
 } ExpertGpuStore;
 
 /* Doubly-linked-list splice: detach slot `idx` from wherever it sits in the
@@ -2368,9 +2378,10 @@ static void expert_slot_mlock_once(ExpertGpuStore *st, ExpertCacheSlot *sl, void
  * real_load's own `m.idx`/`m.part_fds` addresses do not survive its
  * return-by-value. */
 static void expert_store_init(ExpertGpuStore *st, const ExpertIndex *idx, size_t budget_bytes,
-                               int num_experts_per_tok, int verbose) {
+                               int num_experts_per_tok, int verbose, int io_pagecache) {
     memset(st, 0, sizeof(*st));
     st->verbose = verbose;
+    st->io_pagecache = io_pagecache;
     st->n_layers_alloc = idx->n_layers_alloc;
     st->n_experts = idx->n_experts;
 
@@ -2453,6 +2464,12 @@ static void expert_store_shutdown(ExpertGpuStore *st) {
     free(st->table);
     memset(st, 0, sizeof(*st));
 }
+
+/* Forward declaration: the Task 11 loader thread pool is defined further
+ * down (near expert_cache_get, its main consumer), but real_load (below)
+ * starts it right after expert_store_init -- see the pool's own definition
+ * for the full design. */
+static void expert_loader_pool_start(void);
 
 typedef struct {
     Config cfg;
@@ -2622,7 +2639,8 @@ static void real_gpu_layer_build(RealModel *m, int layer) {
 
 static RealModel real_load(const char *config_path, const char *manifest_path,
                             const char *index_path, const char *tokenizer_path,
-                            size_t expert_cache_budget_bytes, int verbose_cache) {
+                            size_t expert_cache_budget_bytes, int verbose_cache,
+                            int expert_io_pagecache) {
     RealModel m = {0};
     m.cfg = config_load(config_path);
     m.tok = tokenizer_load(tokenizer_path);
@@ -2664,7 +2682,12 @@ static RealModel real_load(const char *config_path, const char *manifest_path,
         if (fd < 0) die("open %s: %s", partpath, strerror(errno));
         struct stat pst;
         if (fstat(fd, &pst) != 0) die("fstat %s: %s", partpath, strerror(errno));
-        if (fcntl(fd, F_NOCACHE, 1) != 0) die("fcntl F_NOCACHE %s: %s", partpath, strerror(errno));
+        /* Task 11 A/B: pagecache mode leaves this fd's default (buffered,
+         * page-cache-backed) I/O policy alone -- expert_cache_get fires an
+         * F_RDADVISE readahead hint per region instead (ds4's alternative).
+         * Default stays F_NOCACHE (direct I/O) per Global Constraints. */
+        if (!expert_io_pagecache && fcntl(fd, F_NOCACHE, 1) != 0)
+            die("fcntl F_NOCACHE %s: %s", partpath, strerror(errno));
         m.part_fds[i] = fd;
         m.part_sizes[i] = (int64_t)pst.st_size;
     }
@@ -2814,7 +2837,16 @@ static RealModel real_load(const char *config_path, const char *manifest_path,
          * many times the enclosing RealModel gets copied, so reading VALUE
          * fields off &m.idx here (never storing that address itself) is
          * safe despite real_load's own return-by-value. */
-        expert_store_init(&m.expert_store, &m.idx, expert_cache_budget_bytes, cfg->num_experts_per_tok, verbose_cache);
+        expert_store_init(&m.expert_store, &m.idx, expert_cache_budget_bytes, cfg->num_experts_per_tok,
+                           verbose_cache, expert_io_pagecache);
+
+        /* Task 11: the loader thread pool (persistent, created once here --
+         * see its own header comment further down for the full design). A
+         * process-wide singleton: safe because real_load itself only ever
+         * runs once per process (main() calls it exactly once on the
+         * --real path), matching m.expert_store's own once-per-process
+         * lifetime. */
+        expert_loader_pool_start();
     }
 
     return m;
@@ -2977,17 +3009,219 @@ static void real_expert_ffn(const struct RealExperts *re, int expert_idx, const 
     qlinear(&down_qt, re->h_buf, expert_out, re->row_scratch);
 }
 
-/* Task 10: (layer,expert) -> resident GPU slot, installing on a miss.
- * Pure CPU/IO work (same F_NOCACHE fds/index sidecar real_expert_ffn reads
- * above) -- callers must not have a GPU batch open when calling this (the
- * real-model GPU path always resolves every selected expert's slot in the
- * gap between a sync and the next sepia_gpu_begin(), matching real_expert_
- * ffn's own call site conventions). `idx`/`part_fds` are explicit
+/* ==================== Task 11: expert loader thread pool ================= *
+ * A small, persistent pool of pthread workers that do ONLY blocking file I/O
+ * (pread into a cache slot's slab memory) and never touch Metal -- src/
+ * sepia_metal.m's own thread-safety comment (Task 3) requires this: g_device/
+ * g_queue/g_batch_cb/g_batch_enc/g_pso_cache are plain globals with no
+ * locking, single-thread-only. This pool lives entirely in sepia.c and never
+ * calls a single sepia_gpu_* entry point. The main thread hands off work by
+ * pushing a job onto a mutex-protected queue and signaling a "work available"
+ * condvar; a worker pulls the job, preads it, then signals a "job done"
+ * condvar the main thread blocks on (pthread_cond_wait only -- no polling,
+ * no spin, matching the Global Constraints threading rule).
+ *
+ * Design choice: MTLSharedEvent vs a plain condvar handoff. The plan
+ * mentions MTLSharedEvent as one way to let a loader-thread-side "install
+ * done" signal interact with GPU encode ordering. This implementation does
+ * NOT use it: the loader thread would still have to relay its completion
+ * back to the main thread for the main thread to do the actual Metal-side
+ * signal/encode (since the loader thread must never touch Metal), which
+ * means a plain pthread condvar handoff is required either way -- adding
+ * MTLSharedEvent on top would only buy a way for the GPU itself to block on
+ * a future value, which nothing here needs: the main thread already has a
+ * concrete synchronous point (right before it encodes the dispatch that
+ * reads a given expert's slot) where it needs to know "is this data ready
+ * yet", and a plain blocking wait against the job's own `done` flag answers
+ * that with no extra machinery. Simpler and equally correct; see the task
+ * report for the write-up this comment summarizes.
+ *
+ * Job granularity: one job == one expert's gate+up+down reads (all three
+ * must land before that expert's matvec_q dispatches are safe to encode).
+ * Queue capacity is bounded to SEPIA_MOE_MAX_TOPK -- at most one sparse
+ * layer's worth of misses is ever in flight at a time (real_mlp_moe_forward_
+ * gpu always drains every job it submits, via expert_loader_wait, before
+ * that layer's SYNC #2 returns -- see its own comments). */
+#define SEPIA_LOADER_THREADS 4     /* docs/ssd-bench.md's own finding: F_NOCACHE
+                                     * throughput on this machine saturates at
+                                     * 4 concurrent requests (11.7/13.3/13.4
+                                     * GB/s at threads=1/8/16) -- more workers
+                                     * would add contention, not throughput. */
+#define SEPIA_LOADER_QUEUE_CAP SEPIA_MOE_MAX_TOPK
+
+typedef struct {
+    int fd;
+    void *dst;
+    size_t nbytes;
+    int64_t offset;
+    const char *what;
+} LoaderRead;
+
+/* Stack-allocated by the caller (real_mlp_moe_forward_gpu keeps an array of
+ * these, one per topk slot, alive for the whole duration of its own call --
+ * see the comment there) -- the pool only ever stores POINTERS to these, so
+ * no heap allocation/ownership question exists here. */
+typedef struct ExpertLoadJob {
+    LoaderRead reads[3];
+    int n_reads;
+    int done;      /* 0 = queued/in-progress, 1 = complete; read/written only
+                     * under g_loader_pool.mu, so no atomic/volatile needed. */
+} ExpertLoadJob;
+
+typedef struct {
+    pthread_mutex_t mu;
+    pthread_cond_t cv_work;   /* workers wait on this while the queue is empty */
+    pthread_cond_t cv_done;   /* waiters (expert_loader_wait) wait on this */
+    ExpertLoadJob *queue[SEPIA_LOADER_QUEUE_CAP];
+    int qhead, qtail, qcount;
+    int shutdown;
+    pthread_t workers[SEPIA_LOADER_THREADS];
+    int started;
+} ExpertLoaderPool;
+
+static ExpertLoaderPool g_loader_pool;
+
+/* ds4's page-cache A/B alternative (Global Constraints; Task 11 A/Bs this
+ * against the F_NOCACHE default): a best-effort hint that lets the kernel
+ * start reading this exact byte range asynchronously well before the actual
+ * pread happens. Fired from the MAIN thread at slot-resolution time (see
+ * expert_cache_get below), NOT from the worker that will eventually perform
+ * the read -- that's a deliberate choice: it gives the kernel a real head
+ * start across however long it takes this token's OTHER selected experts to
+ * finish resolving plus however long the job sits in the queue before a
+ * worker picks it up, mirroring ds4's own timing (readahead hint issued at
+ * cache-miss-detected time, well before the actual read). No-op when
+ * F_RDADVISE isn't defined (non-Darwin) or in F_NOCACHE mode (direct I/O
+ * bypasses the page cache the hint would warm, so there's nothing to hint).
+ * Return value ignored on purpose -- exactly like ds4's own (void) cast: a
+ * missed hint only costs a slower first read, never incorrect data. */
+static void expert_readahead_hint(int fd, int64_t offset, size_t nbytes) {
+#if defined(F_RDADVISE)
+    struct radvisory ra;
+    ra.ra_offset = (off_t)offset;
+    ra.ra_count = (int)nbytes; /* bounded well under INT_MAX -- Task 10's own
+                                 * max_slab_bytes arithmetic puts this in the
+                                 * low tens of MB at most */
+    (void)fcntl(fd, F_RDADVISE, &ra);
+#else
+    (void)fd; (void)offset; (void)nbytes;
+#endif
+}
+
+static void expert_load_job_run(ExpertLoadJob *job) {
+    for (int i = 0; i < job->n_reads; i++) {
+        const LoaderRead *r = &job->reads[i];
+        pread_exact(r->fd, r->dst, r->nbytes, r->offset, r->what);
+    }
+}
+
+static void *expert_loader_worker_main(void *arg) {
+    ExpertLoaderPool *pool = (ExpertLoaderPool *)arg;
+    for (;;) {
+        pthread_mutex_lock(&pool->mu);
+        while (pool->qcount == 0 && !pool->shutdown) pthread_cond_wait(&pool->cv_work, &pool->mu);
+        if (pool->qcount == 0 && pool->shutdown) {
+            pthread_mutex_unlock(&pool->mu);
+            return NULL;
+        }
+        ExpertLoadJob *job = pool->queue[pool->qhead];
+        pool->qhead = (pool->qhead + 1) % SEPIA_LOADER_QUEUE_CAP;
+        pool->qcount--;
+        pthread_mutex_unlock(&pool->mu);
+
+        /* The actual blocking file I/O -- the ONLY thing this thread ever
+         * does. No sepia_gpu_* call is reachable from here. */
+        expert_load_job_run(job);
+
+        pthread_mutex_lock(&pool->mu);
+        job->done = 1;
+        pthread_cond_broadcast(&pool->cv_done);
+        pthread_mutex_unlock(&pool->mu);
+    }
+}
+
+/* Created once, at --metal --real startup (real_load, right after
+ * expert_store_init). Idempotent (a second call is a no-op) so it stays
+ * safe even if a future caller adds another real_load path. */
+static void expert_loader_pool_start(void) {
+    if (g_loader_pool.started) return;
+    memset(&g_loader_pool, 0, sizeof(g_loader_pool));
+    if (pthread_mutex_init(&g_loader_pool.mu, NULL) != 0) die("metal: loader-pool: mutex init failed");
+    if (pthread_cond_init(&g_loader_pool.cv_work, NULL) != 0) die("metal: loader-pool: cv_work init failed");
+    if (pthread_cond_init(&g_loader_pool.cv_done, NULL) != 0) die("metal: loader-pool: cv_done init failed");
+    for (int i = 0; i < SEPIA_LOADER_THREADS; i++) {
+        if (pthread_create(&g_loader_pool.workers[i], NULL, expert_loader_worker_main, &g_loader_pool) != 0)
+            die("metal: loader-pool: pthread_create failed for worker %d", i);
+    }
+    g_loader_pool.started = 1;
+}
+
+/* Signals shutdown, wakes every worker (broadcast -- they're all blocked on
+ * cv_work), joins them, then tears the pool down. Called once at process
+ * exit, alongside expert_store_shutdown. */
+static void expert_loader_pool_shutdown(void) {
+    if (!g_loader_pool.started) return;
+    pthread_mutex_lock(&g_loader_pool.mu);
+    g_loader_pool.shutdown = 1;
+    pthread_cond_broadcast(&g_loader_pool.cv_work);
+    pthread_mutex_unlock(&g_loader_pool.mu);
+    for (int i = 0; i < SEPIA_LOADER_THREADS; i++) pthread_join(g_loader_pool.workers[i], NULL);
+    pthread_mutex_destroy(&g_loader_pool.mu);
+    pthread_cond_destroy(&g_loader_pool.cv_work);
+    pthread_cond_destroy(&g_loader_pool.cv_done);
+    memset(&g_loader_pool, 0, sizeof(g_loader_pool));
+}
+
+/* Queues `job` (caller-owned storage, see the ExpertLoadJob comment) and
+ * returns immediately -- does NOT wait for it to run. */
+static void expert_loader_submit(ExpertLoadJob *job) {
+    job->done = 0;
+    pthread_mutex_lock(&g_loader_pool.mu);
+    if (g_loader_pool.qcount >= SEPIA_LOADER_QUEUE_CAP)
+        die("metal: loader-pool: queue overflow (>%d in-flight jobs)", SEPIA_LOADER_QUEUE_CAP);
+    g_loader_pool.queue[g_loader_pool.qtail] = job;
+    g_loader_pool.qtail = (g_loader_pool.qtail + 1) % SEPIA_LOADER_QUEUE_CAP;
+    g_loader_pool.qcount++;
+    pthread_cond_signal(&g_loader_pool.cv_work);
+    pthread_mutex_unlock(&g_loader_pool.mu);
+}
+
+/* Blocks (pthread_cond_wait, no polling) until `job` is done. A job that
+ * finished before this call returns immediately (the while-loop re-checks
+ * job->done itself, so no lost-wakeup window exists between submit and
+ * wait). Safe to call on a job that's already done. */
+static void expert_loader_wait(ExpertLoadJob *job) {
+    pthread_mutex_lock(&g_loader_pool.mu);
+    while (!job->done) pthread_cond_wait(&g_loader_pool.cv_done, &g_loader_pool.mu);
+    pthread_mutex_unlock(&g_loader_pool.mu);
+}
+
+/* Task 10/11: (layer,expert) -> resident GPU slot, installing on a miss.
+ * Slot BOOKKEEPING (table/LRU/safe_gen/mlock) is still done synchronously,
+ * right here, on the caller's thread -- only the miss install's gate/up/
+ * down byte copy is deferred to the loader pool (Task 11). Callers must not
+ * have a GPU batch open when calling this (matching real_expert_ffn's own
+ * call site convention) -- the resolve phase (this function, called once
+ * per selected expert) always finishes before real_mlp_moe_forward_gpu
+ * opens its routed-expert dispatch batch. `idx`/`part_fds` are explicit
  * parameters (not stored on `st`) for the same return-by-value safety
  * reason RealExperts documents: the caller always passes its own stable
- * RealModel's &m->idx/m->part_fds. */
+ * RealModel's &m->idx/m->part_fds.
+ *
+ * `job_storage` is caller-owned scratch (one ExpertLoadJob per topk slot,
+ * kept alive on the caller's stack for the whole call -- see real_mlp_moe_
+ * forward_gpu). On a HIT, `*out_job` is set to NULL: the data is already
+ * resident, nothing to wait for, and the caller must not touch
+ * `job_storage` (it and its returned slot are otherwise independent). On a
+ * MISS, `*out_job` is set to `job_storage` itself (already submitted to the
+ * loader pool by the time this function returns) -- the caller MUST call
+ * expert_loader_wait(*out_job) before reading (or encoding a GPU dispatch
+ * that reads) this slot's memory, but may defer that wait arbitrarily to
+ * overlap it with other work in the meantime; that deferral is the whole
+ * point of Task 11. */
 static ExpertCacheSlot *expert_cache_get(ExpertGpuStore *st, const ExpertIndex *idx, const int *part_fds,
-                                          int layer, int expert) {
+                                          int layer, int expert, ExpertLoadJob *job_storage,
+                                          ExpertLoadJob **out_job) {
     if (layer < 0 || layer >= st->n_layers_alloc || expert < 0 || expert >= st->n_experts)
         die("metal: expert-cache: (layer=%d,expert=%d) out of range", layer, expert);
     const MoeLayerIndex *mli = &idx->by_layer[layer];
@@ -3008,6 +3242,7 @@ static ExpertCacheSlot *expert_cache_get(ExpertGpuStore *st, const ExpertIndex *
         sl->safe_gen = st->gen_completed + 1;
         expert_cache_lru_unlink(st, slot_idx);
         expert_cache_lru_push_head(st, slot_idx);
+        *out_job = NULL;
         return sl;
     }
     st->misses++;
@@ -3025,9 +3260,25 @@ static ExpertCacheSlot *expert_cache_get(ExpertGpuStore *st, const ExpertIndex *
     uint8_t *up_dst   = (uint8_t *)slab_base + sl->base_off + st->region_bytes;
     uint8_t *down_dst = (uint8_t *)slab_base + sl->base_off + 2 * st->region_bytes;
 
-    pread_exact(part_fds[ge->part_idx], gate_dst, (size_t)ge->nbytes, ge->abs_offset, "expert gate slab (gpu cache)");
-    pread_exact(part_fds[ue->part_idx], up_dst,   (size_t)ue->nbytes, ue->abs_offset, "expert up slab (gpu cache)");
-    pread_exact(part_fds[de->part_idx], down_dst, (size_t)de->nbytes, de->abs_offset, "expert down slab (gpu cache)");
+    if (st->io_pagecache) {
+        expert_readahead_hint(part_fds[ge->part_idx], ge->abs_offset, (size_t)ge->nbytes);
+        expert_readahead_hint(part_fds[ue->part_idx], ue->abs_offset, (size_t)ue->nbytes);
+        expert_readahead_hint(part_fds[de->part_idx], de->abs_offset, (size_t)de->nbytes);
+    }
+
+    /* Task 11: hand the actual byte copy to the loader pool instead of
+     * pread'ing synchronously here -- the caller decides when it actually
+     * needs to wait (right before encoding a dispatch that reads this
+     * slot). */
+    job_storage->n_reads = 3;
+    job_storage->reads[0] = (LoaderRead){part_fds[ge->part_idx], gate_dst, (size_t)ge->nbytes, ge->abs_offset,
+                                          "expert gate slab (gpu cache)"};
+    job_storage->reads[1] = (LoaderRead){part_fds[ue->part_idx], up_dst,   (size_t)ue->nbytes, ue->abs_offset,
+                                          "expert up slab (gpu cache)"};
+    job_storage->reads[2] = (LoaderRead){part_fds[de->part_idx], down_dst, (size_t)de->nbytes, de->abs_offset,
+                                          "expert down slab (gpu cache)"};
+    expert_loader_submit(job_storage);
+    *out_job = job_storage;
 
     sl->ggml_type_gate = ge->ggml_type;
     sl->ggml_type_up   = ue->ggml_type;
@@ -3036,9 +3287,17 @@ static ExpertCacheSlot *expert_cache_get(ExpertGpuStore *st, const ExpertIndex *
     sl->expert = expert;
     /* This slot's first GPU read is encoded in the batch the caller opens
      * right after this function returns -- that batch completes under
-     * generation gen_completed+1, so it isn't safe to evict until then. */
+     * generation gen_completed+1, so it isn't safe to evict until then.
+     * Unaffected by making the byte copy itself async: the copy is
+     * guaranteed complete (expert_loader_wait) before that dispatch is even
+     * encoded, and eviction only ever runs on this same host thread, never
+     * concurrently with the copy. */
     sl->safe_gen = st->gen_completed + 1;
 
+    /* mlock just pins whatever physical pages currently back this VA range
+     * -- it has no ordering dependency on the (now-deferred) byte copy, so
+     * doing it here, before the loader pool has necessarily finished
+     * writing, is exactly as correct as doing it after. */
     expert_slot_mlock_once(st, sl, slab_base);
 
     st->table[table_idx] = new_idx;
@@ -3468,6 +3727,38 @@ static void real_mlp_dense_forward_gpu(RealModel *m, const RealLayerGpu *g, int 
  * SYNC #2 (further down) publishes the routed-expert down-projections for
  * the final weighted mix. See the inline "SYNC #1"/"SYNC #2" comments at
  * their call sites for the exact boundaries. */
+/* One routed expert's gate/up/silu/down dispatch chain, factored out so both
+ * the hit-pass and the miss-pass below (Task 11) share the exact same
+ * dispatch code. xt/gbuf/ubuf/hbuf are the caller's scratch buffers, reused
+ * across every expert exactly like the shared-expert loop above SYNC #1
+ * already does -- safe across a sepia_gpu_flush() command-buffer boundary
+ * (used between the two passes) because Metal's default hazard tracking
+ * orders access to a given MTLBuffer across command buffers committed to
+ * one queue, not just within a single encoder; command buffers submitted to
+ * the same MTLCommandQueue are also guaranteed to execute in commit order.
+ * That combination is exactly the contract sepia_gpu_flush()'s own header
+ * doc describes ("commits... WITHOUT waiting... opens a fresh batch so
+ * dispatching can continue") -- this is simply the first real caller to
+ * exercise it. */
+static void real_mlp_moe_dispatch_routed(RealModel *m, const ExpertCacheSlot *sl, SepiaGpuBuf *xt,
+                                          SepiaGpuBuf *gbuf, SepiaGpuBuf *ubuf, SepiaGpuBuf *hbuf,
+                                          int moe_inter, int hidden, SepiaGpuBuf **out_row, int j) {
+    SepiaGpuBuf *slab = m->expert_store.slabs[sl->slab_idx];
+    size_t off_gate = sl->base_off;
+    size_t off_up   = sl->base_off + m->expert_store.region_bytes;
+    size_t off_down = sl->base_off + 2 * m->expert_store.region_bytes;
+
+    if (!sepia_gpu_matvec_q(sl->ggml_type_gate, slab, off_gate, xt, gbuf, moe_inter, hidden))
+        die("metal: real: routed[%d] gate matvec_q dispatch failed", j);
+    if (!sepia_gpu_matvec_q(sl->ggml_type_up, slab, off_up, xt, ubuf, moe_inter, hidden))
+        die("metal: real: routed[%d] up matvec_q dispatch failed", j);
+    if (!sepia_gpu_silu_mul(gbuf, ubuf, hbuf, moe_inter))
+        die("metal: real: routed[%d] silu_mul dispatch failed", j);
+    *out_row = real_gpu_scratch((size_t)hidden);
+    if (!sepia_gpu_matvec_q(sl->ggml_type_down, slab, off_down, hbuf, *out_row, hidden, moe_inter))
+        die("metal: real: routed[%d] down matvec_q dispatch failed", j);
+}
+
 static void real_mlp_moe_forward_gpu(RealModel *m, const RealLayerGpu *g, const Config *cfg, int layer,
                                       SepiaGpuBuf *x_multi, int64_t t, int hidden, float *out_row) {
     SepiaGpuBuf *gres = (SepiaGpuBuf *)m->gpu_res_buf;
@@ -3516,40 +3807,65 @@ static void real_mlp_moe_forward_gpu(RealModel *m, const RealLayerGpu *g, const 
     float *weights = xmalloc(sizeof(float) * (size_t)n_sel);
     moe_route_select(cfg, &fake_lw, router_logits, topk_idx, weights);
 
-    /* Task 10: routed experts now stream through the GPU-resident LRU cache
+    /* Task 10/11: routed experts stream through the GPU-resident LRU cache
      * (m->expert_store) instead of real_expert_ffn's per-call CPU
      * pread+qlinear -- real_expert_ffn itself is unchanged and still serves
-     * CPU real mode. Resolve every selected expert's slot (installing on a
-     * miss) BEFORE opening a new batch: pread/mlock/evict is pure CPU/IO
-     * work that must not straddle an open encoder. */
+     * CPU real mode. Resolve every selected expert's slot BEFORE opening a
+     * new batch: table/LRU/safe_gen/mlock bookkeeping is pure CPU work that
+     * must not straddle an open encoder. Task 11: a miss's actual byte copy
+     * is no longer done here -- expert_cache_get hands it to the loader
+     * thread pool and returns immediately with pending[j] set to the
+     * in-flight job (NULL for a hit, meaning the data is already resident).
+     * jobs[]/pending[] live on THIS call's stack for its whole duration --
+     * every job this call submits is drained (expert_loader_wait) before
+     * this function returns, so their lifetime is never in question. */
     if (topk > SEPIA_MOE_MAX_TOPK)
         die("metal: real: num_experts_per_tok=%d exceeds the GPU expert-cache dispatch's compiled bound (%d)",
             topk, SEPIA_MOE_MAX_TOPK);
     ExpertCacheSlot *cslot[SEPIA_MOE_MAX_TOPK];
+    ExpertLoadJob jobs[SEPIA_MOE_MAX_TOPK];
+    ExpertLoadJob *pending[SEPIA_MOE_MAX_TOPK];
     for (int j = 0; j < topk; j++)
-        cslot[j] = expert_cache_get(&m->expert_store, &m->idx, m->part_fds, layer, topk_idx[j]);
+        cslot[j] = expert_cache_get(&m->expert_store, &m->idx, m->part_fds, layer, topk_idx[j],
+                                     &jobs[j], &pending[j]);
 
     if (!sepia_gpu_begin()) die("metal: real: failed to open the routed-expert dispatch batch");
     SepiaGpuBuf *routed_raw[SEPIA_MOE_MAX_TOPK];
-    for (int j = 0; j < topk; j++) {
-        const ExpertCacheSlot *sl = cslot[j];
-        SepiaGpuBuf *slab = m->expert_store.slabs[sl->slab_idx];
-        size_t off_gate = sl->base_off;
-        size_t off_up   = sl->base_off + m->expert_store.region_bytes;
-        size_t off_down = sl->base_off + 2 * m->expert_store.region_bytes;
 
-        if (!sepia_gpu_matvec_q(sl->ggml_type_gate, slab, off_gate, xt, gbuf, moe_inter, hidden))
-            die("metal: real: routed[%d] gate matvec_q dispatch failed", j);
-        if (!sepia_gpu_matvec_q(sl->ggml_type_up, slab, off_up, xt, ubuf, moe_inter, hidden))
-            die("metal: real: routed[%d] up matvec_q dispatch failed", j);
-        if (!sepia_gpu_silu_mul(gbuf, ubuf, hbuf, moe_inter))
-            die("metal: real: routed[%d] silu_mul dispatch failed", j);
-        routed_raw[j] = real_gpu_scratch((size_t)hidden);
-        if (!sepia_gpu_matvec_q(sl->ggml_type_down, slab, off_down, hbuf, routed_raw[j], hidden, moe_inter))
-            die("metal: real: routed[%d] down matvec_q dispatch failed", j);
+    /* Pass 1: encode every HIT's dispatch now -- its data is already
+     * resident, nothing to wait for. This is the GPU work the plan wants
+     * running WHILE the loader threads stream in the misses below. */
+    for (int j = 0; j < topk; j++) {
+        if (pending[j] != NULL) continue; /* miss -- deferred to pass 2 */
+        real_mlp_moe_dispatch_routed(m, cslot[j], xt, gbuf, ubuf, hbuf, moe_inter, hidden, &routed_raw[j], j);
     }
+    /* Commit pass 1 WITHOUT waiting (fire-and-forget) so the GPU actually
+     * starts executing the hit-batch concurrently with the still-in-flight
+     * loader-thread preads below -- this is the actual overlap: without this
+     * flush, nothing would be committed (and the GPU would sit idle) until
+     * AFTER the wait loop below finishes, defeating the whole point. Safe
+     * (and cheap) even when pass 1 encoded nothing, e.g. an all-miss step. */
+    if (!sepia_gpu_flush()) die("metal: real: routed-expert hit-batch flush failed");
+
+    /* Pass 2: block on each miss's own pread completion, one at a time,
+     * only right before encoding ITS dispatch -- a hit or an
+     * already-finished prefetch never waits (per-job wait, not "wait for
+     * everything"). expert_loader_wait blocks on pthread_cond_wait only --
+     * no polling, matching the Global Constraints threading rule. */
+    for (int j = 0; j < topk; j++) {
+        if (pending[j] == NULL) continue;
+        expert_loader_wait(pending[j]);
+        real_mlp_moe_dispatch_routed(m, cslot[j], xt, gbuf, ubuf, hbuf, moe_inter, hidden, &routed_raw[j], j);
+    }
+
     /* ---- SYNC #2: routed-expert down-projections readable off this
-     * batch's completion. ---- */
+     * batch's completion. This single end() call also covers pass 1's
+     * already-flushed command buffer: MTLCommandQueue executes command
+     * buffers submitted to it strictly in commit order, so waiting on the
+     * LAST one's completion transitively guarantees every earlier one
+     * (including pass 1's) has also completed -- gen_completed only needs
+     * to advance once here for every slot this call touched (hit or miss)
+     * to be correctly "safe through this generation". ---- */
     if (!real_gpu_end(m)) die("metal: real: routed-expert readback sync failed");
 
     for (int d = 0; d < hidden; d++) out_row[d] = 0.0f;
@@ -5686,6 +6002,11 @@ int main(int argc, char **argv) {
     double expert_cache_gb = 64.0;
     int verbose_cache = 0;
     int n_repeat = 1;
+    /* Task 11 A/B: default stays F_NOCACHE (direct I/O) per Global
+     * Constraints -- SEPIA's own measured 13.3GB/s and ~2x-buffered result
+     * (docs/ssd-bench.md). --expert-io-mode pagecache switches to ds4's
+     * alternative (buffered reads + F_RDADVISE readahead hints) for the A/B. */
+    int expert_io_pagecache = 0;
 
     for (int i = 1; i < argc; i++) {
         if (strcmp(argv[i], "--dump-acts") == 0 && i + 1 < argc) {
@@ -5716,6 +6037,11 @@ int main(int argc, char **argv) {
             verbose_cache = 1;
         } else if (strcmp(argv[i], "--repeat") == 0 && i + 1 < argc) {
             n_repeat = atoi(argv[++i]);
+        } else if (strcmp(argv[i], "--expert-io-mode") == 0 && i + 1 < argc) {
+            const char *mode = argv[++i];
+            if (strcmp(mode, "nocache") == 0) expert_io_pagecache = 0;
+            else if (strcmp(mode, "pagecache") == 0) expert_io_pagecache = 1;
+            else die("--expert-io-mode: unknown mode '%s' (expected nocache or pagecache)", mode);
         } else if (strcmp(argv[i], "--gpu-quants") == 0) {
             do_gpu_quants = 1;
             gpu_quants_paths = &argv[i + 1];
@@ -5759,7 +6085,10 @@ int main(int argc, char **argv) {
                 "LRU-evicted routed-expert cache (Task 10); default 64 GB. --verbose-cache prints\n"
                 "per-step cache hit/miss counts. --repeat N (--real only) repeats generation N times\n"
                 "in the SAME process (same RealModel/expert cache) -- run 1 is cold, runs 2+ are warm;\n"
-                "also proves double-run determinism when the token sequence matches across runs.\n",
+                "also proves double-run determinism when the token sequence matches across runs.\n"
+                "--expert-io-mode {nocache|pagecache} (--metal --real only) selects the routed-expert\n"
+                "pread path (Task 11 A/B): nocache (default) is F_NOCACHE direct I/O; pagecache is ds4's\n"
+                "alternative (buffered reads + an F_RDADVISE readahead hint per region).\n",
                 argv[0], argv[0], argv[0], argv[0], argv[0], argv[0], argv[0]);
             return 2;
         }
@@ -5809,7 +6138,7 @@ int main(int argc, char **argv) {
         struct timespec t0, t1;
         clock_gettime(CLOCK_MONOTONIC, &t0);
         RealModel rm = real_load(real_config_path, manifest_path, index_path, tokenizer_path,
-                                  expert_cache_budget_bytes, verbose_cache);
+                                  expert_cache_budget_bytes, verbose_cache, expert_io_pagecache);
         clock_gettime(CLOCK_MONOTONIC, &t1);
         fprintf(stderr, "real: loaded in %.2fs (resident.bin %.2f GB mmap'd, %d GGUF part(s) open)\n",
                 elapsed_ms(t0, t1) / 1000.0, (double)rm.res_size / 1e9, rm.idx.n_parts);
@@ -5828,7 +6157,10 @@ int main(int argc, char **argv) {
         if (logits_only) {
             if (do_metal) real_print_top_logits_gpu(&rm, prompt);
             else real_print_top_logits(&rm, prompt);
-            if (do_metal) expert_store_shutdown(&rm.expert_store);
+            if (do_metal) {
+                expert_store_shutdown(&rm.expert_store);
+                expert_loader_pool_shutdown();
+            }
             return 0;
         }
 
@@ -5844,7 +6176,10 @@ int main(int argc, char **argv) {
             if (n_repeat > 1)
                 fprintf(stderr, "sepia: real: === run %d/%d wall %.2fs ===\n", r + 1, n_repeat, elapsed_ms(r0, r1) / 1000.0);
         }
-        if (do_metal) expert_store_shutdown(&rm.expert_store);
+        if (do_metal) {
+            expert_store_shutdown(&rm.expert_store);
+            expert_loader_pool_shutdown();
+        }
         return 0;
     }
 
