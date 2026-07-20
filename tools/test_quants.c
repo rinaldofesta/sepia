@@ -1,6 +1,6 @@
-/* Runs every tools/fixtures/quants/*.bin fixture: dequantize raw blocks,
- * require BITWISE equality with the expected f32 payload. Usage:
- *   ./test_quants tools/fixtures/quants/f16.bin [more.bin ...] */
+/* Runs quant dequant fixtures (files under tools/fixtures/quants): dequantize
+ * raw blocks, require BITWISE equality with the expected f32 payload. Usage:
+ *   ./test_quants tools/fixtures/quants/f16.bin [more fixtures ...] */
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>

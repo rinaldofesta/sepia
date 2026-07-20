@@ -15,7 +15,8 @@ from gguf.quants import dequantize, quantize
 
 OUT_DIR = Path(__file__).resolve().parent / "fixtures" / "quants"
 MAGIC = 0x58465153  # "SQFX"
-N_BLOCKS = 64
+N_BLOCKS = 64      # 1- and 32-element block types (f16, q8_0)
+N_BLOCKS_K = 16    # QK_K=256-element superblock types — keeps committed total <200KB
 SEED = 20260720
 
 QUANTIZABLE = [T.Q8_0]                        # the only container type gguf-py can quantize
@@ -69,9 +70,10 @@ def main():
 
     for qt, patch_offs in RAW_BYTES.items():
         blk, tsz = GGML_QUANT_SIZES[qt]
-        raw = rng.integers(0, 256, size=(N_BLOCKS, tsz), dtype=np.uint8)
+        nb = N_BLOCKS if blk <= 32 else N_BLOCKS_K
+        raw = rng.integers(0, 256, size=(nb, tsz), dtype=np.uint8)
         for off in patch_offs:
-            d = finite_f16_bits(rng, N_BLOCKS).view(np.uint8).reshape(N_BLOCKS, 2)
+            d = finite_f16_bits(rng, nb).view(np.uint8).reshape(nb, 2)
             raw[:, off:off + 2] = d
         raw = raw.reshape(-1).tobytes()
         expect = dequantize(np.frombuffer(raw, dtype=np.uint8), qt).astype(np.float32)
