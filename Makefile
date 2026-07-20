@@ -2,11 +2,28 @@ CC      ?= cc
 CFLAGS  ?= -O2 -std=c11 -Wall -Wextra
 LDFLAGS ?= -pthread -lm
 
+UNAME_S := $(shell uname -s)
+
+# GPU runtime: an Objective-C/Metal shim on Darwin, a symbol-compatible
+# no-op stub everywhere else (src/sepia_gpu.h is the shared contract).
+# METAL_LDFLAGS is appended in the `sepia` recipe below, never merged into
+# LDFLAGS itself -- that would silently push `-framework ...` onto every
+# other target's link line and defeat the `?=` default for non-Darwin/non-
+# Metal builds.
+ifeq ($(UNAME_S),Darwin)
+OBJCFLAGS ?= -O2 -fobjc-arc -Wall -Wextra
+METAL_LDFLAGS = -framework Metal -framework Foundation
+METAL_SRCS := $(wildcard metal/*.metal)
+GPU_OBJ := src/sepia_metal.o
+else
+GPU_OBJ := src/sepia_gpu_stub.o
+endif
+
 # Targets grow with the phases:
 #   sepia    (0.4)  CPU reference engine
 #   iobench  (0.5)  SSD microbenchmark
 #   test     (0.4)  oracle self-test
-ci: pycheck tooltests sepia test_quants test_tokenizer
+ci: pycheck tooltests sepia test_quants test_tokenizer shadercheck
 	./sepia
 	./test_quants tools/fixtures/quants/f16.bin tools/fixtures/quants/q8_0.bin tools/fixtures/quants/q4_k.bin tools/fixtures/quants/q5_k.bin tools/fixtures/quants/q6_k.bin tools/fixtures/quants/iq2_xs.bin tools/fixtures/quants/iq3_xxs.bin tools/fixtures/quants/iq4_xs.bin tools/fixtures/quants/qlinear_q8_0.bin
 	./test_tokenizer tools/fixtures/tokenizer/mini.bin tools/fixtures/tokenizer/mini_cases.json
@@ -34,8 +51,31 @@ pycheck:
 		echo "pycheck: no python tools yet"; \
 	fi
 
-sepia: src/sepia.c src/quants.c src/quants.h src/tokenizer.c src/tokenizer.h
-	$(CC) $(CFLAGS) -o sepia src/sepia.c src/quants.c src/tokenizer.c $(LDFLAGS)
+sepia: src/sepia.c src/quants.c src/quants.h src/tokenizer.c src/tokenizer.h src/sepia_gpu.h $(GPU_OBJ)
+	$(CC) $(CFLAGS) -o sepia src/sepia.c src/quants.c src/tokenizer.c $(GPU_OBJ) $(LDFLAGS) $(METAL_LDFLAGS)
+
+# .metal files are listed only as a rebuild trigger for the shim object --
+# they are read at runtime by sepia_gpu_init(), never compiled in here.
+src/sepia_metal.o: src/sepia_metal.m src/sepia_gpu.h $(METAL_SRCS)
+	$(CC) $(OBJCFLAGS) -c -o src/sepia_metal.o src/sepia_metal.m
+
+src/sepia_gpu_stub.o: src/sepia_gpu_stub.c src/sepia_gpu.h
+	$(CC) $(CFLAGS) -c -o src/sepia_gpu_stub.o src/sepia_gpu_stub.c
+
+# Offline Metal shader syntax/type check -- no device needed, so it runs in
+# CI (macos-latest ships the toolchain). `metal -c` refuses multiple inputs
+# sharing one -o (mirrors clang -c), hence the per-file loop. Non-Darwin:
+# no Metal toolchain exists, so this is a no-op rather than a hard failure.
+shadercheck:
+ifeq ($(UNAME_S),Darwin)
+	@for f in metal/*.metal; do \
+		echo "shadercheck: $$f"; \
+		xcrun -sdk macosx metal -c "$$f" -o /dev/null || exit 1; \
+	done
+	@echo "shadercheck ok"
+else
+	@echo "shadercheck: skipped (not Darwin)"
+endif
 
 test: sepia
 	./sepia
@@ -60,4 +100,4 @@ tokreal: test_tokenizer
 configcheck:
 	python3 tools/check_inkling_config.py
 
-.PHONY: ci pycheck tooltests sepia test iobench test_quants test_tokenizer tokreal configcheck
+.PHONY: ci pycheck tooltests sepia test iobench test_quants test_tokenizer tokreal configcheck shadercheck

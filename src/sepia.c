@@ -540,6 +540,7 @@ static Config config_load(const char *path) {
 }
 
 #include "quants.h"
+#include "sepia_gpu.h"
 #include "tokenizer.h"
 
 /* QTensor: a weight matrix stored quantized on disk (Task 14 loads these
@@ -2388,7 +2389,7 @@ int main(int argc, char **argv) {
     const char *smoke_dir = NULL;
     const char *prompt = "The capital of France is";
     int n_gen = 32;
-    int do_real = 0, do_mlock = 0, logits_only = 0;
+    int do_real = 0, do_mlock = 0, logits_only = 0, do_metal = 0;
 
     for (int i = 1; i < argc; i++) {
         if (strcmp(argv[i], "--dump-acts") == 0 && i + 1 < argc) {
@@ -2405,21 +2406,33 @@ int main(int argc, char **argv) {
             do_mlock = 1;
         } else if (strcmp(argv[i], "--logits-only") == 0) {
             logits_only = 1;
+        } else if (strcmp(argv[i], "--metal") == 0) {
+            do_metal = 1;
         } else {
             fprintf(stderr,
-                "usage: %s [--dump-acts FILE]\n"
+                "usage: %s [--dump-acts FILE] [--metal]\n"
                 "       %s --smoke DIR\n"
-                "       %s --real [--prompt TEXT] [--n-gen N] [--mlock] [--logits-only]\n"
+                "       %s --real [--prompt TEXT] [--n-gen N] [--mlock] [--logits-only] [--metal]\n"
                 "\n"
                 "--real paths default to docs/inkling-config.json, weights/resident-manifest.json,\n"
                 "weights/inkling-ud-q2_k_xl.sepia-index.json, weights/tokenizer.bin -- override with\n"
                 "the SEPIA_REAL_CONFIG_PATH / SEPIA_REAL_MANIFEST_PATH / SEPIA_REAL_INDEX_PATH /\n"
                 "SEPIA_REAL_TOKENIZER_PATH env vars.\n"
                 "--mlock only makes sense once `extract_resident.py --verify` has confirmed\n"
-                "resident.bin's bytes match its manifest -- not enforceable here, the loader trusts its caller.\n",
+                "resident.bin's bytes match its manifest -- not enforceable here, the loader trusts its caller.\n"
+                "--metal initializes the Metal GPU runtime (metal/*.metal); the forward pass itself\n"
+                "still runs on the CPU path in this build -- init failure is fatal since --metal was\n"
+                "explicitly requested.\n",
                 argv[0], argv[0], argv[0]);
             return 2;
         }
+    }
+
+    if (do_metal) {
+        if (!sepia_gpu_init("metal")) {
+            die("metal: initialization failed (see above)");
+        }
+        fprintf(stderr, "sepia: metal: initialized (%s)\n", sepia_gpu_device_name());
     }
 
     if (smoke_dir) {
