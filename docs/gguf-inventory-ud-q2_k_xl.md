@@ -160,9 +160,15 @@ bos_token_id = tokenizer.ggml.eos_token_id = 200006`,
 `tokenizer.ggml.add_bos_token = False`, plus a full `tokenizer.
 chat_template` (the Jinja template also visible via the HF API's `gguf.
 chat_template` field). `inkling.unpadded_vocab_size = 200058` differs
-from `inkling.vocab_size = 201024` -- the padding delta (966) is worth
+from `inkling.vocab_size = 201024` -- ~~the padding delta (966) is worth
 checking against the tokenizer's real special-token count when the oracle
-work reads the tokenizer, not assumed away.
+work reads the tokenizer, not assumed away~~ resolved in P1: `tools/
+export_tokenizer.py` measured `n_special = 1026` from part 1 (tokens with
+`token_type != 1`). The padding delta (966) and `n_special` (1026) are
+different quantities by construction -- the delta counts unused id slots
+between the unpadded and padded vocab sizes, while `n_special` counts
+every non-normal token actually present in the vocab -- so they were
+never expected to match.
 
 ## Inkling-specific metadata keys
 

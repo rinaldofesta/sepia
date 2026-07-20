@@ -8,7 +8,7 @@
 
 SEPIA is an inference engine that runs [Inkling](https://huggingface.co/thinkingmachines/Inkling) (Thinking Machines' 975B-parameter MoE, 41B active) on a Mac with 128GB of unified memory, by streaming experts from SSD. One model, one machine class, correctness proven before speed.
 
-Current state: the engine reproduces Inkling's forward pass token-exactly against the transformers reference, on CPU, gated in CI on every push. It does not generate tokens from the real 317GB weights yet; that is Phase 1, and the weight download is running.
+Current state: the engine reproduces Inkling's forward pass token-exactly against the transformers reference, on CPU, gated in CI on every push. P1 is done: it now generates real greedy tokens from the full 317GB weights, cross-checked against a llama.cpp build on the same GGUF (text-exact on both test prompts, id-exact on one). Correctness only, not speed yet — ~29-31s/token steady on the scalar CPU path; P2 is where speed is addressed. Full results: [docs/p1-first-tokens.md](docs/p1-first-tokens.md).
 
 ## Why this exists
 
@@ -68,7 +68,7 @@ The measurements have already overruled the plan twice. The repack died: a per-e
 
 Phase 0 (done): oracle, token-exact CPU engine, SSD ground truth, GGUF inventory, container tooling. Everything above.
 
-- P1: CPU dequant (IQ2_XS, IQ3_XXS, IQ4_XS), first real-weight tokens, cross-check vs a llama.cpp build on the same GGUF, C tokenizer
+- P1 (done): 7 dequant types bit-exact vs gguf-py fixtures (CI-gated); C tokenizer exact vs HF tokenizers (mini 9/9, real 25/25, ~8300-string stress sweep, zero mismatches) and vs llama-tokenize (7/7); first real greedy tokens deterministic on both test prompts, cross-checked against the pinned llama.cpp draft-PR build (text-exact both prompts, id-exact on prompt 1); ~29-31s/token steady on the scalar CPU path, correctness-only. Full results: [docs/p1-first-tokens.md](docs/p1-first-tokens.md)
 - P2: Metal kernels, expert LRU + pinned store, first real tok/s; the routing-predictability experiment (colibri measured 71.6% one-layer-ahead predictability on GLM-5.2; whether Inkling routes as predictably is open, and a negative result gets published too)
 - P3: learning cache: routing history persisted across sessions, confidence-ramped auto-pin, prefetch if P2 says yes
 - P4: MTP speculation from the dedicated 10.5GB `mtp.safetensors` shard, quantized in-house at 8-bit or better
@@ -88,7 +88,7 @@ Full design with the reasoning behind each phase: [docs/DESIGN.md](docs/DESIGN.m
 
 ## Known limits
 
-- No real-weight generation yet (P1); the 317GB download and its dependent validations are in progress
+- Real-weight decode is correctness-only and slow: ~29-31s/token on the scalar CPU path (P1, [docs/p1-first-tokens.md](docs/p1-first-tokens.md)); P2's Metal path is where speed gets addressed
 - Attention log-scaling past 128K positions is implemented per spec but untestable at oracle scale
 - The 15MiB unaligned-read margin (93.9% of aligned) gets a clean re-measurement once the disk is quiet
 - Multimodal input and MTP are out of scope until P4+; text in, text out

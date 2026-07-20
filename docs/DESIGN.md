@@ -149,9 +149,11 @@ Phase 0 checklist and docs/container.md section 6.
 
 ## Roadmap (each phase gets its own plan)
 
-- P1: CPU dequant for the container's quant types (ported from ds4),
-  first real tokens on the full model, cross-check against a llama.cpp
-  PR-branch build on the same GGUF, C tokenizer.
+- P1 (done): CPU dequant for the container's quant types, C tokenizer
+  exact vs HF `tokenizers` and `llama-tokenize`, first real greedy tokens
+  from the full model cross-checked against the pinned llama.cpp
+  PR-branch build on the same GGUF (text-exact both test prompts,
+  id-exact on one). Full results: docs/p1-first-tokens.md.
 - P2: Metal kernels (banded flash attention first), expert LRU plus
   pinned store, F_NOCACHE streaming. First tok/s number. Then the
   routing-predictability experiment: is Inkling's next-layer routing
