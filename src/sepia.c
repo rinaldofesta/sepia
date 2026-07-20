@@ -2251,14 +2251,25 @@ typedef struct {
      * to a single counter pair): gen_completed is bumped by real_gpu_end
      * every time the real-model GPU path's sepia_gpu_end() succeeds. A
      * slot's safe_gen records the generation its NEXT read will complete
-     * under (gen_completed+1 at install time) -- eviction skips any slot
-     * with safe_gen > gen_completed. Under Task 10's synchronous per-call
-     * design this can never actually block eviction (every routed-expert
-     * batch this function opens is fully synced before the function
-     * returns, so by the next cache-install pass gen_completed already
-     * reflects it) -- the mechanism is defensive groundwork for Task 11's
-     * async overlap, not exercised today, but implemented now so Task 11
-     * doesn't need a rewrite. */
+     * under (gen_completed+1 at the time of access) -- eviction skips any
+     * slot with safe_gen > gen_completed. Task 10 only stamped safe_gen on
+     * INSTALL (a miss); Task 11 review fix: expert_cache_get now stamps it
+     * on EVERY access, hit or miss. Under Task 10's fully-synchronous
+     * design a hit-only gap was inert (nothing was ever actually
+     * concurrent, so a hit's slot could never be evicted before its own
+     * dispatch completed regardless of the stamp). Task 11 introduces real
+     * overlap -- a slot that was a HIT this token can still be referenced
+     * by an in-flight GPU dispatch (or a still-in-flight loader-thread
+     * prefetch) when a LATER expert (same or next token) wants to evict it
+     * for a miss -- so every access, not just installs, must extend the
+     * slot's protection through at least the generation its own dispatch
+     * will complete under. See expert_cache_get and real_mlp_moe_forward_
+     * gpu's Task 11 comments for why a single "+1" (rather than tracking
+     * per-access generations) stays correct: expert_cache_get is only ever
+     * called again (possibly evicting this slot) after the CURRENT sparse
+     * layer's own real_gpu_end() (SYNC #2) has already run, so gen_completed
+     * has already advanced past whatever generation this access's stamp
+     * named. */
     uint64_t gen_completed;
 
     /* mlock failure degrades the cache (stop trying to pin further slots,
@@ -2298,11 +2309,17 @@ static void expert_cache_lru_push_head(ExpertGpuStore *st, int idx) {
  * slots ahead of it) are still in-flight (safe_gen > gen_completed), in
  * which case walks toward the head looking for one that's safe. Bounded to
  * n_slots steps -- never loops forever -- and falls back to the tail slot
- * outright if every slot in the list is (implausibly) unsafe, which is
- * always correct under Task 10's synchronous design (see the ExpertGpuStore
- * comment above): Gate 4's "first mlock/eviction failure must not hang or
- * crash" concern is satisfied by this bound plus expert_slot_mlock_once's
- * own degrade-not-abort policy below. */
+ * outright if every slot in the list is (implausibly) unsafe. That fallback
+ * stays correct under Task 11's real overlap too, not just Task 10's
+ * synchronous design: expert_cache_get is only ever called from within ONE
+ * sparse layer's expert-resolution loop at a time (never two layers/tokens
+ * interleaved on the host), and that loop always closes with its own
+ * real_gpu_end() (SYNC #2) before the next one can start -- so at most
+ * `topk` (<= SEPIA_MOE_MAX_TOPK, and n_slots >= topk is enforced at init)
+ * slots can ever be simultaneously unsafe, well short of "every slot in the
+ * list". Gate 4's "first mlock/eviction failure must not hang or crash"
+ * concern is satisfied by this bound plus expert_slot_mlock_once's own
+ * degrade-not-abort policy below. */
 static int expert_cache_evict_or_get_free(ExpertGpuStore *st) {
     int idx = st->lru_tail;
     for (int steps = 0; steps < st->n_slots && idx >= 0; steps++) {
@@ -2980,9 +2997,18 @@ static ExpertCacheSlot *expert_cache_get(ExpertGpuStore *st, const ExpertIndex *
     int slot_idx = st->table[table_idx];
     if (slot_idx >= 0) {
         st->hits++;
+        ExpertCacheSlot *sl = &st->slots[slot_idx];
+        /* Task 11 fix: bump safe_gen on a HIT too, not just an install --
+         * see the ExpertGpuStore comment above for why this was inert under
+         * Task 10's synchronous design but is load-bearing once callers
+         * genuinely overlap (this hit's data is about to be read by a
+         * dispatch the caller is about to encode; that dispatch completes
+         * by AT LEAST the layer's next real_gpu_end(), i.e. gen_completed+1
+         * at this exact moment). */
+        sl->safe_gen = st->gen_completed + 1;
         expert_cache_lru_unlink(st, slot_idx);
         expert_cache_lru_push_head(st, slot_idx);
-        return &st->slots[slot_idx];
+        return sl;
     }
     st->misses++;
 
