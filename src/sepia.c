@@ -734,7 +734,7 @@ static void qrow(const QTensor *w, int64_t r, float *dst) {
     dequantize_row(w->ggml_type, base, dst, w->in_dim);
 }
 
-static void __attribute__((unused)) qlinear(const QTensor *w, const float *x, float *y, float *row_scratch) {
+static void qlinear(const QTensor *w, const float *x, float *y, float *row_scratch) {
     for (int64_t o = 0; o < w->out_dim; o++) {
         qrow(w, o, row_scratch);
         y[o] = dotf(row_scratch, x, (int)w->in_dim);
@@ -1806,7 +1806,13 @@ static RealModel real_load(const char *config_path, const char *manifest_path,
 
     /* Bounds-check every streamed expert slot against its part's actual
      * size -- the streamed-tensor analogue of manifest_load's res_size
-     * check above. */
+     * check above -- and cross-check each slot's nbytes against the shape
+     * config.json implies (gate/up: hidden->moe_inter, down: moe_inter->
+     * hidden), the streamed-tensor analogue of resident_qtensor's shape
+     * check. Entries within one (layer, slot) share type+nbytes by
+     * construction, so checking expert 0 would suffice, but looping over
+     * every (layer, slot, expert) triple is simpler code and still cheap
+     * (~49k integer compares, load-time only). */
     for (int layer = 0; layer < m.idx.n_layers_alloc; layer++) {
         MoeLayerIndex *mli = &m.idx.by_layer[layer];
         if (!mli->gate) continue;
@@ -1820,6 +1826,12 @@ static RealModel real_load(const char *config_path, const char *manifest_path,
                     die("%s: layer %d slot '%s' expert %d: [%lld,%lld) exceeds part %d size %lld bytes",
                         index_path, layer, slot_names[s], e, (long long)sl->abs_offset,
                         (long long)(sl->abs_offset + sl->nbytes), sl->part_idx, (long long)psize);
+                size_t want = (s == 2)
+                    ? quants_row_bytes(sl->ggml_type, cfg->moe_intermediate_size) * (size_t)cfg->hidden_size
+                    : quants_row_bytes(sl->ggml_type, cfg->hidden_size) * (size_t)cfg->moe_intermediate_size;
+                if ((size_t)sl->nbytes != want)
+                    die("%s: layer %d slot '%s' expert %d: nbytes %lld disagrees with shape/type (want %zu)",
+                        index_path, layer, slot_names[s], e, (long long)sl->nbytes, want);
             }
         }
     }
