@@ -15,6 +15,12 @@ static void tdie(const char *fmt, ...) {
     va_end(ap); exit(1);
 }
 
+static void *tmalloc(size_t n) {
+    void *p = malloc(n);
+    if (!p) tdie("tokenizer: out of memory");
+    return p;
+}
+
 struct Tokenizer {
     uint32_t vocab, n_merges, bos, eos, n_special;
     char *regex;
@@ -47,20 +53,20 @@ Tokenizer *tokenizer_load(const char *path) {
     t->bos = rd_u32(d + 16); t->eos = rd_u32(d + 20); t->n_special = rd_u32(d + 24);
     size_t off = 28;
     uint32_t rlen = rd_u32(d + off); off += 4;
-    t->regex = malloc(rlen + 1);
+    t->regex = tmalloc(rlen + 1);
     memcpy(t->regex, d + off, rlen); t->regex[rlen] = 0; off += rlen;
     for (int i = 0; i < 256; i++) { t->byte_token_id[i] = rd_u32(d + off); off += 4; }
-    t->tok_off = malloc(((size_t)t->vocab + 1) * 4);
+    t->tok_off = tmalloc(((size_t)t->vocab + 1) * 4);
     for (uint32_t i = 0; i <= t->vocab; i++) { t->tok_off[i] = rd_u32(d + off); off += 4; }
     size_t blob = t->tok_off[t->vocab];
-    t->tok_blob = malloc(blob); memcpy(t->tok_blob, d + off, blob); off += blob;
-    t->token_type = malloc(t->vocab); memcpy(t->token_type, d + off, t->vocab); off += t->vocab;
+    t->tok_blob = tmalloc(blob); memcpy(t->tok_blob, d + off, blob); off += blob;
+    t->token_type = tmalloc(t->vocab); memcpy(t->token_type, d + off, t->vocab); off += t->vocab;
 
     t->pair_cap = 1;
     while (t->pair_cap < 2 * t->n_merges) t->pair_cap <<= 1;
-    t->pair_keys = malloc((size_t)t->pair_cap * 8);
-    t->pair_rank = malloc((size_t)t->pair_cap * 4);
-    t->pair_merged = malloc((size_t)t->pair_cap * 4);
+    t->pair_keys = tmalloc((size_t)t->pair_cap * 8);
+    t->pair_rank = tmalloc((size_t)t->pair_cap * 4);
+    t->pair_merged = tmalloc((size_t)t->pair_cap * 4);
     memset(t->pair_keys, 0xFF, (size_t)t->pair_cap * 8);
     for (uint32_t r = 0; r < t->n_merges; r++) {
         uint32_t l = rd_u32(d + off), rr = rd_u32(d + off + 4), m = rd_u32(d + off + 8);
