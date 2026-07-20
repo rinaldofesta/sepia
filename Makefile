@@ -123,10 +123,14 @@ configcheck:
 	python3 tools/check_inkling_config.py
 
 # local-only: needs a live Metal device (--gpu-selftest dies cleanly without
-# one); exercises the zero-copy buffer API end-to-end. Not in ci -- ci stays
-# weights-free and device-free per the Global Constraints.
+# one); exercises the zero-copy buffer API end-to-end, then (Task 8) runs the
+# plain tiny-oracle self-test through the full Metal forward path and
+# requires the same token-exact prefill 32/32 + decode 20/20 the CPU oracle
+# gates on. Not in ci -- ci stays weights-free and device-free per the
+# Global Constraints.
 gputest: sepia
 	./sepia --metal --gpu-selftest
+	./sepia --metal
 
 # local-only: needs a live Metal device and the committed tiny oracle fixture
 # (tools/oracle/tiny/, already required by the plain self-test) -- the Task 3

@@ -1312,26 +1312,26 @@ static void mlp_dense_forward(const LayerWeights *lw, int hidden, int dense_inte
     free(h);
 }
 
-/* Router (sec.6) + routed experts (sec.7) + shared experts (sec.7). The
- * single most error-prone part per architecture-notes.md: the aux-loss-free
- * bias (router_bias) selects experts (topk) but is NOT part of the mixing
- * weight, which comes from log_sigmoid/logsumexp over the RAW logits of the
- * selected routed experts plus the always-on shared-expert-sink logits. */
-static void mlp_moe_forward(const Config *cfg, const LayerWeights *lw, const float *x, float *out) {
-    int hidden = cfg->hidden_size;
+/* Router selection + mixing-weight computation (sec.6): given raw router
+ * logits (pre-sigmoid, pre-bias) for n_routed routed experts plus n_shared
+ * always-on shared "sink" experts, fills topk_idx[0..topk) with the selected
+ * routed expert indices and weights[0..topk+n_shared) with the final mixing
+ * weight for each (routed slots first, then shared slots) -- the aux-loss-
+ * free bias (router_bias) selects experts (topk) but is NOT part of the
+ * mixing weight, which comes from log_sigmoid/logsumexp over the RAW logits
+ * of the selected routed experts plus the shared-expert-sink logits.
+ * Extracted out of mlp_moe_forward (below) so the GPU forward path (Task 8)
+ * can reuse this EXACT, already-verified selection/weight math on GPU-
+ * readback router logits instead of reimplementing it -- see
+ * .superpowers/sdd/task-8-report.md's "MoE readback design" note. Caller-
+ * allocated: topk_idx[topk], weights[topk+n_shared]. */
+static void moe_route_select(const Config *cfg, const LayerWeights *lw, const float *router_logits,
+                              int *topk_idx, float *weights) {
     int n_routed = cfg->n_routed_experts, n_shared = cfg->n_shared_experts, topk = cfg->num_experts_per_tok;
-    int n_total = n_routed + n_shared;
-    int moe_inter = cfg->moe_intermediate_size;
-    int two_inter = 2 * moe_inter;
-
-    float *router_logits = xmalloc(sizeof(float) * (size_t)n_total);
-    for (int i = 0; i < n_total; i++) router_logits[i] = dotf(lw->router_w + (size_t)i * hidden, x, hidden);
-    if (g_opcap_selected_layer) cap_push_matvec(lw->router_w, x, n_total, hidden, router_logits);
 
     float *scores_for_choice = xmalloc(sizeof(float) * (size_t)n_routed);
     for (int i = 0; i < n_routed; i++) scores_for_choice[i] = sigmoid_f(router_logits[i]) + lw->router_bias[i];
 
-    int *topk_idx = xmalloc(sizeof(int) * (size_t)topk);
     {
         int *used = xcalloc((size_t)n_routed, sizeof(int));
         for (int j = 0; j < topk; j++) {
@@ -1345,6 +1345,7 @@ static void mlp_moe_forward(const Config *cfg, const LayerWeights *lw, const flo
         }
         free(used);
     }
+    free(scores_for_choice);
 
     int n_sel = topk + n_shared;
     float *topk_logits = xmalloc(sizeof(float) * (size_t)n_sel);
@@ -1361,13 +1362,32 @@ static void mlp_moe_forward(const Config *cfg, const LayerWeights *lw, const flo
     for (int j = 0; j < n_sel; j++) sumexp += exp((double)(log_probs[j] - lmax));
     double lse = lmax + log(sumexp);
 
-    float *weights = xmalloc(sizeof(float) * (size_t)n_sel);
     double gs = (double)lw->router_global_scale[0];
     for (int j = 0; j < n_sel; j++) {
         double w = exp((double)log_probs[j] - lse);
         w *= cfg->route_scale * gs; /* norm_after_topk's renormalization, then route_scale*global_scale (sec.6) */
         weights[j] = (float)w;
     }
+
+    free(topk_logits);
+    free(log_probs);
+}
+
+static void mlp_moe_forward(const Config *cfg, const LayerWeights *lw, const float *x, float *out) {
+    int hidden = cfg->hidden_size;
+    int n_routed = cfg->n_routed_experts, n_shared = cfg->n_shared_experts, topk = cfg->num_experts_per_tok;
+    int n_total = n_routed + n_shared;
+    int moe_inter = cfg->moe_intermediate_size;
+    int two_inter = 2 * moe_inter;
+
+    float *router_logits = xmalloc(sizeof(float) * (size_t)n_total);
+    for (int i = 0; i < n_total; i++) router_logits[i] = dotf(lw->router_w + (size_t)i * hidden, x, hidden);
+    if (g_opcap_selected_layer) cap_push_matvec(lw->router_w, x, n_total, hidden, router_logits);
+
+    int *topk_idx = xmalloc(sizeof(int) * (size_t)topk);
+    int n_sel = topk + n_shared;
+    float *weights = xmalloc(sizeof(float) * (size_t)n_sel);
+    moe_route_select(cfg, lw, router_logits, topk_idx, weights);
 
     for (int d = 0; d < hidden; d++) out[d] = 0.0f;
 
@@ -1444,10 +1464,7 @@ static void mlp_moe_forward(const Config *cfg, const LayerWeights *lw, const flo
 
     free(h);
     free(weights);
-    free(log_probs);
-    free(topk_logits);
     free(topk_idx);
-    free(scores_for_choice);
     free(router_logits);
 }
 
@@ -1618,6 +1635,20 @@ static void model_forward_chunk(const Model *m, Cache *cache, const int *token_i
     free(normed);
 }
 
+/* Task 8: GPU-mode twin of model_forward_chunk above -- identical per-layer
+ * math (attn_forward_chunk's / mlp_dense_forward's / mlp_moe_forward's own
+ * formulas, including moe_route_select's routing decision), computed via
+ * sepia_gpu_* dispatches instead of linear/dotf/rmsnorm. Defined near the
+ * other --gpu-compare-tiny/--gpu-compare-attn machinery below (it needs
+ * gpu_upload_f32 and the small dispatch-wrapper helpers introduced there);
+ * forward-declared here so run_self_test (which selects between the two
+ * paths on --metal) can call it before that point in the file. logits_out
+ * mirrors model_forward_chunk's own NULL-to-skip convention; there is no
+ * `dump` parameter -- --dump-acts stays CPU-path only (never combined with
+ * --metal in main()). */
+static void model_forward_chunk_gpu(const Model *m, Cache *cache, const int *token_ids, int T, int start_pos,
+                                     float *logits_out /*[T,unpadded_vocab] or NULL*/);
+
 /* ============================ oracle reference ============================ */
 
 typedef struct {
@@ -1681,8 +1712,14 @@ static void report_mismatch(const char *phase, int pos, int expected, int got, c
 /* Gate: prefill (cache-less teacher forcing over all full_ids, argmax at
  * every position) and decode (true autoregressive greedy generation from
  * prompt_ids, KV cache + sconv state updated incrementally) each reported
- * separately, per the brief. Returns 1 iff both hit a perfect score. */
-static int run_self_test(const Model *m, const char *ref_path) {
+ * separately, per the brief. Returns 1 iff both hit a perfect score.
+ *
+ * use_gpu (Task 8): routes every model_forward_chunk call through the GPU
+ * twin (model_forward_chunk_gpu) instead -- same Cache, same oracle ref,
+ * same prefill-then-decode shape; this is the ONLY thing --metal changes
+ * about the self-test (`./sepia` with no flag never sets this, so the plain
+ * CPU self-test stays byte-identical). */
+static int run_self_test(const Model *m, const char *ref_path, int use_gpu) {
     OracleRef ref = load_oracle_ref(ref_path);
     int unpadded = m->cfg.unpadded_vocab_size;
     int full_len = ref.full_ids.len;
@@ -1691,7 +1728,10 @@ static int run_self_test(const Model *m, const char *ref_path) {
     /* --- prefill / teacher forcing --- */
     Cache *tf_cache = cache_create(m, full_len);
     float *logits = xmalloc(sizeof(float) * (size_t)full_len * (size_t)unpadded);
-    model_forward_chunk(m, tf_cache, ref.full_ids.ids, full_len, 0, logits, NULL);
+    if (use_gpu)
+        model_forward_chunk_gpu(m, tf_cache, ref.full_ids.ids, full_len, 0, logits);
+    else
+        model_forward_chunk(m, tf_cache, ref.full_ids.ids, full_len, 0, logits, NULL);
     cache_free(tf_cache);
 
     int prefill_ok = 0;
@@ -1710,7 +1750,10 @@ static int run_self_test(const Model *m, const char *ref_path) {
     /* --- incremental decode --- */
     Cache *dc = cache_create(m, full_len);
     float *plogits = xmalloc(sizeof(float) * (size_t)prompt_len * (size_t)unpadded);
-    model_forward_chunk(m, dc, ref.prompt_ids.ids, prompt_len, 0, plogits, NULL);
+    if (use_gpu)
+        model_forward_chunk_gpu(m, dc, ref.prompt_ids.ids, prompt_len, 0, plogits);
+    else
+        model_forward_chunk(m, dc, ref.prompt_ids.ids, prompt_len, 0, plogits, NULL);
 
     float *cur_logits = xmalloc(sizeof(float) * (size_t)unpadded);
     memcpy(cur_logits, plogits + (size_t)(prompt_len - 1) * unpadded, sizeof(float) * (size_t)unpadded);
@@ -1727,7 +1770,10 @@ static int run_self_test(const Model *m, const char *ref_path) {
         else
             report_mismatch("decode", i, expected, got, cur_logits, unpadded);
         int next_id = got; /* true greedy generation: feed our own prediction forward */
-        model_forward_chunk(m, dc, &next_id, 1, cur_pos, cur_logits, NULL);
+        if (use_gpu)
+            model_forward_chunk_gpu(m, dc, &next_id, 1, cur_pos, cur_logits);
+        else
+            model_forward_chunk(m, dc, &next_id, 1, cur_pos, cur_logits, NULL);
         cur_pos++;
     }
     printf("decode %d/%d\n", decode_ok, n_decode);
@@ -3734,6 +3780,484 @@ static void run_gpu_compare_tiny(void) {
     printf("gpu compare ok\n");
 }
 
+/* ==================== Task 8: full tiny-model GPU forward ================= */
+/* The composition milestone: every kernel from Tasks 3-7 wired into a
+ * complete per-layer graph (model_forward_chunk_gpu, forward-declared above
+ * model_forward_chunk) that must reproduce the tiny CPU oracle EXACTLY
+ * (--metal's plain self-test path, token-exact prefill 32/32 + decode
+ * 20/20 -- see .superpowers/sdd/task-8-report.md for the bring-up notes and
+ * the sconv-history/MoE-readback/w13 design writeups summarized inline
+ * below). Every helper here is a thin, self-contained (own begin/flush/end)
+ * wrapper around one or two sepia_gpu_* dispatches plus the upload/readback
+ * around them -- "per-layer sync is acceptable at tiny scale" (the plan's
+ * own words) is taken literally: every op gets its own round trip, since
+ * correctness (not throughput) is this task's gate. Real-model performance
+ * (batched encoding across many dispatches per sepia_gpu_begin/end) is
+ * Task 9+'s concern. */
+
+static void gpu_matvec_one(const float *w, const float *x, float *y, int64_t out_dim, int64_t in_dim) {
+    SepiaGpuBuf *wb = gpu_upload_f32(w, out_dim * in_dim);
+    SepiaGpuBuf *xb = gpu_upload_f32(x, in_dim);
+    SepiaGpuBuf *yb = sepia_gpu_alloc(sizeof(float) * (size_t)out_dim, 0);
+    if (!yb) die("gpu-forward: matvec: alloc failed");
+    if (!sepia_gpu_begin()) die("gpu-forward: matvec: begin failed");
+    if (!sepia_gpu_matvec(wb, xb, yb, out_dim, in_dim)) die("gpu-forward: matvec: dispatch failed");
+    if (!sepia_gpu_end()) die("gpu-forward: matvec: end failed");
+    memcpy(y, sepia_gpu_host_ptr(yb), sizeof(float) * (size_t)out_dim);
+    sepia_gpu_free(wb);
+    sepia_gpu_free(xb);
+    sepia_gpu_free(yb);
+}
+
+/* w[n] is broadcast across every one of `rows` [rows,n] rows -- the same
+ * trick gpu_attn_verify already relies on for q_norm/k_norm (and here also
+ * for embed_norm/attn_norm/mlp_norm/final_norm's single-row-shape case,
+ * rows=T): one dispatch, not a per-row loop. */
+static void gpu_rmsnorm_rows(const float *w, const float *x, float *y, int64_t rows, int64_t n, float eps) {
+    SepiaGpuBuf *wb = gpu_upload_f32(w, n);
+    SepiaGpuBuf *xb = gpu_upload_f32(x, rows * n);
+    SepiaGpuBuf *yb = sepia_gpu_alloc(sizeof(float) * (size_t)(rows * n), 0);
+    if (!yb) die("gpu-forward: rmsnorm: alloc failed");
+    if (!sepia_gpu_begin()) die("gpu-forward: rmsnorm: begin failed");
+    if (!sepia_gpu_rmsnorm(wb, xb, yb, rows, n, eps)) die("gpu-forward: rmsnorm: dispatch failed");
+    if (!sepia_gpu_end()) die("gpu-forward: rmsnorm: end failed");
+    memcpy(y, sepia_gpu_host_ptr(yb), sizeof(float) * (size_t)(rows * n));
+    sepia_gpu_free(wb);
+    sepia_gpu_free(xb);
+    sepia_gpu_free(yb);
+}
+
+static void gpu_silu_mul_pair(const float *g, const float *u, float *z, int64_t n) {
+    SepiaGpuBuf *gb = gpu_upload_f32(g, n);
+    SepiaGpuBuf *ub = gpu_upload_f32(u, n);
+    SepiaGpuBuf *zb = sepia_gpu_alloc(sizeof(float) * (size_t)n, 0);
+    if (!zb) die("gpu-forward: silu_mul: alloc failed");
+    if (!sepia_gpu_begin()) die("gpu-forward: silu_mul: begin failed");
+    if (!sepia_gpu_silu_mul(gb, ub, zb, n)) die("gpu-forward: silu_mul: dispatch failed");
+    if (!sepia_gpu_end()) die("gpu-forward: silu_mul: end failed");
+    memcpy(z, sepia_gpu_host_ptr(zb), sizeof(float) * (size_t)n);
+    sepia_gpu_free(gb);
+    sepia_gpu_free(ub);
+    sepia_gpu_free(zb);
+}
+
+/* x[i] += b[i], via the GPU add kernel (x is both the source and the
+ * destination host array -- a fresh output buffer is read back into it,
+ * never aliased at the SepiaGpuBuf level). */
+static void gpu_add_into(float *x, const float *b, int64_t n) {
+    SepiaGpuBuf *ab = gpu_upload_f32(x, n);
+    SepiaGpuBuf *bb = gpu_upload_f32(b, n);
+    SepiaGpuBuf *ob = sepia_gpu_alloc(sizeof(float) * (size_t)n, 0);
+    if (!ob) die("gpu-forward: add: alloc failed");
+    if (!sepia_gpu_begin()) die("gpu-forward: add: begin failed");
+    if (!sepia_gpu_add(ab, bb, ob, n)) die("gpu-forward: add: dispatch failed");
+    if (!sepia_gpu_end()) die("gpu-forward: add: end failed");
+    memcpy(x, sepia_gpu_host_ptr(ob), sizeof(float) * (size_t)n);
+    sepia_gpu_free(ab);
+    sepia_gpu_free(bb);
+    sepia_gpu_free(ob);
+}
+
+/* ---- sconv, with the Task 3 tracked gap closed: design choice (b) ----
+ * The GPU sconv kernel (metal/ops.metal, Task 3) never writes an updated
+ * history buffer back -- by design, to avoid a read/write hazard within one
+ * dispatch (option (c) from the task brief). Task 8 needs decode (T=1 steps
+ * chaining) and prefill (T=32, history rolling across the whole chunk) to
+ * both keep `hist` correct across calls. Of the three options the plan
+ * offered, this picks (b), host-side history update between steps: `hist`
+ * (LayerCache's k_hist/v_hist/attn_hist/mlp_hist) is already a plain host
+ * float array (never itself a GPU buffer -- gpu_upload_f32 copies it INTO a
+ * transient one for the dispatch), and `in` is already host-resident too
+ * (every caller here builds it from a prior GPU readback or a host gather).
+ * The update itself is pure data movement with no floating-point operation
+ * at all (just picking which already-computed values become the next
+ * call's history), so it reproduces sconv_apply's own tail exactly (src/
+ * sepia.c): new hist = the last K-1 rows of concat(old hist, in). Options
+ * (a)/(c) (a GPU kernel doing the same roll) were rejected because they'd
+ * spend a whole extra dispatch (plus the buffer plumbing for a second
+ * output) on an operation that is provably not floating-point math -- at
+ * tiny scale the extra host-side memmove/memcpy is unmeasurable, and this
+ * keeps the GPU sconv kernel itself unchanged from Task 3. See
+ * task-8-report.md's "sconv-history design" section for the full writeup. */
+static void gpu_sconv_step(const float *w, float *hist /*[K-1,C] host, in/out*/,
+                            const float *in, float *out, int64_t C, int64_t K, int64_t T) {
+    int64_t Km1 = K - 1;
+    SepiaGpuBuf *wb = gpu_upload_f32(w, C * K);
+    SepiaGpuBuf *hb = gpu_upload_f32(hist, Km1 * C);
+    SepiaGpuBuf *ib = gpu_upload_f32(in, T * C);
+    SepiaGpuBuf *ob = sepia_gpu_alloc(sizeof(float) * (size_t)(T * C), 0);
+    if (!ob) die("gpu-forward: sconv: alloc failed");
+    if (!sepia_gpu_begin()) die("gpu-forward: sconv: begin failed");
+    if (!sepia_gpu_sconv(wb, hb, ib, ob, C, K, T)) die("gpu-forward: sconv: dispatch failed");
+    if (!sepia_gpu_end()) die("gpu-forward: sconv: end failed");
+    memcpy(out, sepia_gpu_host_ptr(ob), sizeof(float) * (size_t)(T * C));
+    sepia_gpu_free(wb);
+    sepia_gpu_free(hb);
+    sepia_gpu_free(ib);
+    sepia_gpu_free(ob);
+
+    if (Km1 > 0) {
+        if (T >= Km1) {
+            memcpy(hist, in + (size_t)(T - Km1) * (size_t)C, sizeof(float) * (size_t)Km1 * (size_t)C);
+        } else {
+            int64_t keep = Km1 - T;
+            memmove(hist, hist + (size_t)T * (size_t)C, sizeof(float) * (size_t)keep * (size_t)C);
+            memcpy(hist + (size_t)keep * (size_t)C, in, sizeof(float) * (size_t)T * (size_t)C);
+        }
+    }
+}
+
+static void gpu_rel_project_call(const float *r_vec, const float *rel_proj, float *rel_logits,
+                                  int64_t T, int64_t H, int64_t d_rel, int64_t rel_extent) {
+    SepiaGpuBuf *rv = gpu_upload_f32(r_vec, T * H * d_rel);
+    SepiaGpuBuf *rp = gpu_upload_f32(rel_proj, d_rel * rel_extent);
+    SepiaGpuBuf *rl = sepia_gpu_alloc(sizeof(float) * (size_t)(T * H * rel_extent), 0);
+    if (!rl) die("gpu-forward: rel_project: alloc failed");
+    if (!sepia_gpu_begin()) die("gpu-forward: rel_project: begin failed");
+    if (!sepia_gpu_rel_project(rv, rp, rl, T, H, d_rel, rel_extent)) die("gpu-forward: rel_project: dispatch failed");
+    if (!sepia_gpu_end()) die("gpu-forward: rel_project: end failed");
+    memcpy(rel_logits, sepia_gpu_host_ptr(rl), sizeof(float) * (size_t)(T * H * rel_extent));
+    sepia_gpu_free(rv);
+    sepia_gpu_free(rp);
+    sepia_gpu_free(rl);
+}
+
+static void gpu_banded_attn_call(const float *q, const float *k_full, const float *v_full,
+                                  const float *rel_logits, float *attn_out,
+                                  const int64_t *kv_lo, const int64_t *kv_hi, const float *tau,
+                                  int64_t T, int64_t H, int64_t Hkv, int64_t Dh, int64_t rel_extent,
+                                  int64_t q_pos_base, int64_t kv_dim, float inv_head_dim, int64_t cap) {
+    SepiaGpuBuf *qb = gpu_upload_f32(q, T * H * Dh);
+    SepiaGpuBuf *kb = gpu_upload_f32(k_full, cap * kv_dim);
+    SepiaGpuBuf *vb = gpu_upload_f32(v_full, cap * kv_dim);
+    SepiaGpuBuf *rl = gpu_upload_f32(rel_logits, T * H * rel_extent);
+    SepiaGpuBuf *ob = sepia_gpu_alloc(sizeof(float) * (size_t)(T * H * Dh), 0);
+    if (!ob) die("gpu-forward: banded_attn: alloc failed");
+    if (!sepia_gpu_begin()) die("gpu-forward: banded_attn: begin failed");
+    if (!sepia_gpu_banded_attn(qb, kb, vb, rl, ob, kv_lo, kv_hi, tau, T, H, Hkv, Dh, rel_extent,
+                                q_pos_base, kv_dim, inv_head_dim))
+        die("gpu-forward: banded_attn: dispatch failed");
+    if (!sepia_gpu_end()) die("gpu-forward: banded_attn: end failed");
+    memcpy(attn_out, sepia_gpu_host_ptr(ob), sizeof(float) * (size_t)(T * H * Dh));
+    sepia_gpu_free(qb);
+    sepia_gpu_free(kb);
+    sepia_gpu_free(vb);
+    sepia_gpu_free(rl);
+    sepia_gpu_free(ob);
+}
+
+/* GPU-mode twin of attn_forward_chunk (src/sepia.c) -- same nine stages,
+ * same cache-mutation semantics (writes lc->k/lc->v/lc->k_hist/lc->v_hist
+ * for real, not a snapshot-and-compare like gpu_attn_verify above), just
+ * every math step is a sepia_gpu_* dispatch instead of linear/dotf/rmsnorm.
+ * kv_lo/kv_hi/tau and the cache-write ordering (write BEFORE the attention
+ * loop reads, so self-attention includes the current position) mirror the
+ * CPU oracle exactly. */
+static void gpu_attn_forward_chunk(const Config *cfg, const LayerWeights *lw, LayerCache *lc,
+                                    const float *x_normed, int T, int start_pos, float *out) {
+    int hidden = cfg->hidden_size;
+    int H = lw->num_heads, Hkv = lw->num_kv_heads, Dh = lw->head_dim;
+    int q_dim = lw->q_dim, kv_dim = lw->kv_dim, r_dim = lw->r_dim;
+    int K = cfg->conv_kernel_size;
+    int d_rel = cfg->d_rel, rel_extent = lw->rel_extent;
+
+    /* 1. projections: wq/wk/wv/wr matvec, one dispatch per (weight, t). */
+    float *q_raw = xmalloc(sizeof(float) * (size_t)T * (size_t)q_dim);
+    float *k_raw = xmalloc(sizeof(float) * (size_t)T * (size_t)kv_dim);
+    float *v_raw = xmalloc(sizeof(float) * (size_t)T * (size_t)kv_dim);
+    float *r_raw = xmalloc(sizeof(float) * (size_t)T * (size_t)r_dim);
+    for (int t = 0; t < T; t++) {
+        const float *xt = x_normed + (size_t)t * hidden;
+        gpu_matvec_one(lw->wq, xt, q_raw + (size_t)t * q_dim, q_dim, hidden);
+        gpu_matvec_one(lw->wk, xt, k_raw + (size_t)t * kv_dim, kv_dim, hidden);
+        gpu_matvec_one(lw->wv, xt, v_raw + (size_t)t * kv_dim, kv_dim, hidden);
+        gpu_matvec_one(lw->wr, xt, r_raw + (size_t)t * r_dim, r_dim, hidden);
+    }
+
+    /* 2. k/v sconv against the layer's persistent history; gpu_sconv_step
+     * rolls lc->k_hist/lc->v_hist forward for the NEXT call as a side
+     * effect (design choice (b), above). */
+    float *k_sconv = xmalloc(sizeof(float) * (size_t)T * (size_t)kv_dim);
+    float *v_sconv = xmalloc(sizeof(float) * (size_t)T * (size_t)kv_dim);
+    gpu_sconv_step(lw->k_sconv_w, lc->k_hist, k_raw, k_sconv, kv_dim, K, T);
+    gpu_sconv_step(lw->v_sconv_w, lc->v_hist, v_raw, v_sconv, kv_dim, K, T);
+    free(k_raw);
+    free(v_raw);
+
+    /* 3. per-head RMSNorm: q_raw is [T,H,Dh] contiguous == [T*H,Dh] rows all
+     * sharing q_norm[Dh]; k_sconv is [T,Hkv,Dh] == [T*Hkv,Dh] rows sharing
+     * k_norm[Dh] -- the same one-dispatch-covers-every-(t,h)-slice trick
+     * gpu_attn_verify already relies on. No norm on v (sec.2). */
+    float *q_normed = xmalloc(sizeof(float) * (size_t)T * (size_t)q_dim);
+    float *k_normed = xmalloc(sizeof(float) * (size_t)T * (size_t)kv_dim);
+    gpu_rmsnorm_rows(lw->q_norm, q_raw, q_normed, (int64_t)T * H, Dh, (float)cfg->rms_norm_eps);
+    gpu_rmsnorm_rows(lw->k_norm, k_sconv, k_normed, (int64_t)T * Hkv, Dh, (float)cfg->rms_norm_eps);
+    free(q_raw);
+    free(k_sconv);
+
+    /* 4. cache write (normed K, raw-sconv'd V -- no V norm), BEFORE the
+     * attention loop below reads lc->k/lc->v, matching attn_forward_chunk's
+     * own ordering exactly (self-attention includes the just-written
+     * position). */
+    for (int t = 0; t < T; t++) {
+        memcpy(lc->k + (size_t)(start_pos + t) * kv_dim, k_normed + (size_t)t * kv_dim, sizeof(float) * (size_t)kv_dim);
+        memcpy(lc->v + (size_t)(start_pos + t) * kv_dim, v_sconv + (size_t)t * kv_dim, sizeof(float) * (size_t)kv_dim);
+    }
+    if (start_pos + T > lc->len) lc->len = start_pos + T;
+    free(k_normed);
+    free(v_sconv);
+
+    /* 5. tau / kv_lo / kv_hi -- host scalars, identical formula to
+     * attn_forward_chunk (src/sepia.c). */
+    int have_log_scaling = (!lw->is_sliding) && cfg->has_log_scaling_floor;
+    int64_t *kv_lo = xmalloc(sizeof(int64_t) * (size_t)T);
+    int64_t *kv_hi = xmalloc(sizeof(int64_t) * (size_t)T);
+    float *tau = xmalloc(sizeof(float) * (size_t)T);
+    for (int t = 0; t < T; t++) {
+        int q_pos = start_pos + t;
+        double tv = 1.0;
+        if (have_log_scaling) {
+            double effective_n = (double)(q_pos + 1);
+            double ratio = effective_n / (double)cfg->log_scaling_n_floor;
+            if (ratio < 1.0) ratio = 1.0;
+            tv = 1.0 + cfg->log_scaling_alpha * log(ratio);
+        }
+        tau[t] = (float)tv;
+        int64_t kvlo = lw->is_sliding ? (int64_t)q_pos - (int64_t)cfg->sliding_window_size + 1 : 0;
+        if (kvlo < 0) kvlo = 0;
+        kv_lo[t] = kvlo;
+        kv_hi[t] = q_pos;
+    }
+    float *q_scaled = xmalloc(sizeof(float) * (size_t)T * (size_t)q_dim);
+    for (int t = 0; t < T; t++)
+        for (int i = 0; i < q_dim; i++)
+            q_scaled[(size_t)t * q_dim + i] = q_normed[(size_t)t * q_dim + i] * tau[t];
+    free(q_normed);
+
+    /* 6. rel-project. */
+    float *rel_logits = xmalloc(sizeof(float) * (size_t)T * (size_t)H * (size_t)rel_extent);
+    gpu_rel_project_call(r_raw, lw->rel_proj, rel_logits, T, H, d_rel, rel_extent);
+    free(r_raw);
+
+    /* 7. banded attention over the full persistent cache [0, start_pos+T) --
+     * lc->k/lc->v already hold that whole range after step 4's write. */
+    int64_t cap = (int64_t)start_pos + (int64_t)T;
+    float *attn_concat = xmalloc(sizeof(float) * (size_t)T * (size_t)q_dim);
+    gpu_banded_attn_call(q_scaled, lc->k, lc->v, rel_logits, attn_concat, kv_lo, kv_hi, tau,
+                          T, H, Hkv, Dh, rel_extent, start_pos, kv_dim, 1.0f / (float)Dh, cap);
+    free(q_scaled);
+    free(rel_logits);
+    free(kv_lo);
+    free(kv_hi);
+    free(tau);
+
+    /* 8. wo matvec, one dispatch per t. */
+    for (int t = 0; t < T; t++)
+        gpu_matvec_one(lw->wo, attn_concat + (size_t)t * q_dim, out + (size_t)t * hidden, hidden, q_dim);
+    free(attn_concat);
+}
+
+/* GPU-mode twin of mlp_dense_forward. w13 handling (the design choice the
+ * task brief called out): dense_w13 is stored interleaved along the OUTPUT-
+ * channel axis (row 2i=gate_i, row 2i+1=up_i, sec.9) but is still a single
+ * physically contiguous [2*dense_inter,hidden] row-major matrix -- the
+ * interleave is a row-index LABELING, not a different memory layout. So the
+ * simplest-correct option (of the three the brief offered) is: one
+ * sepia_gpu_matvec dispatch over the WHOLE tensor (out_dim=2*dense_inter)
+ * produces gu[2*dense_inter] with gu[2i]=gate_i/gu[2i+1]=up_i already
+ * sitting at the right offsets (exactly w13_row's own indexing formula,
+ * src/sepia.c), then a trivial host gather splits it into g[]/u[] before
+ * the silu_mul dispatch. No extra floating-point operation is introduced by
+ * the interleave itself -- the gather only moves already-computed floats. */
+static void gpu_mlp_dense_forward(const LayerWeights *lw, int hidden, int dense_inter, const float *x, float *out) {
+    int two_inter = 2 * dense_inter;
+    float *gu = xmalloc(sizeof(float) * (size_t)two_inter);
+    gpu_matvec_one(lw->dense_w13, x, gu, two_inter, hidden);
+
+    float *g = xmalloc(sizeof(float) * (size_t)dense_inter);
+    float *u = xmalloc(sizeof(float) * (size_t)dense_inter);
+    for (int i = 0; i < dense_inter; i++) {
+        g[i] = gu[2 * i];
+        u[i] = gu[2 * i + 1];
+    }
+    free(gu);
+
+    float *h = xmalloc(sizeof(float) * (size_t)dense_inter);
+    gpu_silu_mul_pair(g, u, h, dense_inter);
+    free(g);
+    free(u);
+
+    float *y = xmalloc(sizeof(float) * (size_t)hidden);
+    gpu_matvec_one(lw->dense_w2, h, y, hidden, dense_inter);
+    free(h);
+
+    float gscale = lw->dense_global_scale[0];
+    for (int d = 0; d < hidden; d++) out[d] = y[d] * gscale;
+    free(y);
+}
+
+/* GPU-mode twin of mlp_moe_forward. MoE readback design (the task brief's
+ * other called-out choice): the router matvec runs on GPU, then its
+ * n_total-length logits are read back and handed to moe_route_select --
+ * THE SAME function mlp_moe_forward (CPU path) calls -- for selection and
+ * mixing-weight computation. That block is <=10 scalars of sigmoid/log/exp,
+ * never a matmul, so reusing the verified CPU routine (rather than
+ * reimplementing it against GPU logits) guarantees the GPU path picks
+ * IDENTICAL experts with IDENTICAL weights whenever its logits match the
+ * CPU's within the dispatch tolerance -- no separate routing logic to drift.
+ * Per-expert w13 handling is the same interleaved-matvec-then-gather trick
+ * as gpu_mlp_dense_forward, applied to each selected expert's [2*moe_inter,
+ * hidden] sub-block (a plain host pointer offset into lw->experts_w13/
+ * shared_w13 -- both are already contiguous per-expert blocks, sec.9). */
+static void gpu_mlp_moe_forward(const Config *cfg, const LayerWeights *lw, const float *x, float *out) {
+    int hidden = cfg->hidden_size;
+    int n_routed = cfg->n_routed_experts, n_shared = cfg->n_shared_experts, topk = cfg->num_experts_per_tok;
+    int n_total = n_routed + n_shared;
+    int moe_inter = cfg->moe_intermediate_size;
+    int two_inter = 2 * moe_inter;
+
+    float *router_logits = xmalloc(sizeof(float) * (size_t)n_total);
+    gpu_matvec_one(lw->router_w, x, router_logits, n_total, hidden);
+
+    int *topk_idx = xmalloc(sizeof(int) * (size_t)topk);
+    int n_sel = topk + n_shared;
+    float *weights = xmalloc(sizeof(float) * (size_t)n_sel);
+    moe_route_select(cfg, lw, router_logits, topk_idx, weights);
+    free(router_logits);
+
+    for (int d = 0; d < hidden; d++) out[d] = 0.0f;
+
+    float *gu = xmalloc(sizeof(float) * (size_t)two_inter);
+    float *g = xmalloc(sizeof(float) * (size_t)moe_inter);
+    float *u = xmalloc(sizeof(float) * (size_t)moe_inter);
+    float *h = xmalloc(sizeof(float) * (size_t)moe_inter);
+    float *expert_out = xmalloc(sizeof(float) * (size_t)hidden);
+
+    for (int j = 0; j < topk; j++) {
+        int e = topk_idx[j];
+        const float *w13_e = lw->experts_w13 + (size_t)e * (size_t)two_inter * (size_t)hidden;
+        const float *w2_e = lw->experts_w2 + (size_t)e * (size_t)hidden * (size_t)moe_inter;
+
+        gpu_matvec_one(w13_e, x, gu, two_inter, hidden);
+        for (int i = 0; i < moe_inter; i++) {
+            g[i] = gu[2 * i];
+            u[i] = gu[2 * i + 1];
+        }
+        gpu_silu_mul_pair(g, u, h, moe_inter);
+        gpu_matvec_one(w2_e, h, expert_out, hidden, moe_inter);
+
+        float wj = weights[j];
+        for (int d = 0; d < hidden; d++) out[d] += expert_out[d] * wj; /* routed: weight AFTER down_proj (sec.7) */
+    }
+
+    for (int s = 0; s < n_shared; s++) {
+        const float *w13_s = lw->shared_w13 + (size_t)s * (size_t)two_inter * (size_t)hidden;
+        const float *w2_s = lw->shared_w2 + (size_t)s * (size_t)hidden * (size_t)moe_inter;
+        float gamma = weights[topk + s];
+
+        gpu_matvec_one(w13_s, x, gu, two_inter, hidden);
+        for (int i = 0; i < moe_inter; i++) {
+            g[i] = gu[2 * i];
+            u[i] = gu[2 * i + 1];
+        }
+        gpu_silu_mul_pair(g, u, h, moe_inter);
+        for (int i = 0; i < moe_inter; i++) h[i] *= gamma; /* shared: gamma multiplies the activation
+                                                              * BEFORE down_proj, same order of operations
+                                                              * as mlp_moe_forward's own placement (sec.7) */
+        gpu_matvec_one(w2_s, h, expert_out, hidden, moe_inter);
+        for (int d = 0; d < hidden; d++) out[d] += expert_out[d];
+    }
+
+    free(gu);
+    free(g);
+    free(u);
+    free(h);
+    free(expert_out);
+    free(weights);
+    free(topk_idx);
+}
+
+/* GPU-mode twin of decoder_layer_forward: same pre-norm residual wiring
+ * (attn block -> attn-sconv -> outer residual add; mlp/moe block -> mlp-
+ * sconv -> outer residual add), same per-layer sconv history persisted in
+ * `lc` across calls. */
+static void gpu_decoder_layer_forward(const Config *cfg, const LayerWeights *lw, LayerCache *lc,
+                                       float *x /*[T,hidden], in/out*/, int T, int start_pos) {
+    int hidden = cfg->hidden_size;
+    int K = cfg->conv_kernel_size;
+
+    float *normed = xmalloc(sizeof(float) * (size_t)T * (size_t)hidden);
+    gpu_rmsnorm_rows(lw->attn_norm, x, normed, T, hidden, (float)cfg->rms_norm_eps);
+
+    float *attn_out = xmalloc(sizeof(float) * (size_t)T * (size_t)hidden);
+    gpu_attn_forward_chunk(cfg, lw, lc, normed, T, start_pos, attn_out);
+    free(normed);
+
+    float *attn_sconv_out = xmalloc(sizeof(float) * (size_t)T * (size_t)hidden);
+    gpu_sconv_step(lw->attn_sconv_w, lc->attn_hist, attn_out, attn_sconv_out, hidden, K, T);
+    gpu_add_into(x, attn_sconv_out, (int64_t)T * hidden);
+    free(attn_out);
+    free(attn_sconv_out);
+
+    float *normed2 = xmalloc(sizeof(float) * (size_t)T * (size_t)hidden);
+    gpu_rmsnorm_rows(lw->mlp_norm, x, normed2, T, hidden, (float)cfg->rms_norm_eps);
+
+    float *mlp_out = xmalloc(sizeof(float) * (size_t)T * (size_t)hidden);
+    for (int t = 0; t < T; t++) {
+        if (lw->is_sparse)
+            gpu_mlp_moe_forward(cfg, lw, normed2 + (size_t)t * hidden, mlp_out + (size_t)t * hidden);
+        else
+            gpu_mlp_dense_forward(lw, hidden, cfg->dense_intermediate_size, normed2 + (size_t)t * hidden,
+                                   mlp_out + (size_t)t * hidden);
+    }
+    free(normed2);
+
+    float *mlp_sconv_out = xmalloc(sizeof(float) * (size_t)T * (size_t)hidden);
+    gpu_sconv_step(lw->mlp_sconv_w, lc->mlp_hist, mlp_out, mlp_sconv_out, hidden, K, T);
+    gpu_add_into(x, mlp_sconv_out, (int64_t)T * hidden);
+    free(mlp_out);
+    free(mlp_sconv_out);
+}
+
+/* GPU-mode twin of model_forward_chunk (forward-declared above that
+ * function). Embed lookup is a plain host gather (pointer indexing into the
+ * mmap'd embedding table, no math) followed by ONE embed_norm rmsnorm
+ * dispatch covering all T rows; final_norm/unembed are the same one-
+ * dispatch-per-stage shape; mup-divide and argmax stay on the host per the
+ * task brief ("Embed/final-norm/unembed: GPU matvecs; argmax on CPU"). */
+static void model_forward_chunk_gpu(const Model *m, Cache *cache, const int *token_ids, int T, int start_pos,
+                                     float *logits_out /*[T,unpadded_vocab] or NULL*/) {
+    if (!sepia_gpu_available()) die("gpu-forward: requires --metal to have initialized the GPU runtime");
+    const Config *cfg = &m->cfg;
+    int hidden = cfg->hidden_size;
+
+    float *x_raw = xmalloc(sizeof(float) * (size_t)T * (size_t)hidden);
+    for (int t = 0; t < T; t++)
+        memcpy(x_raw + (size_t)t * hidden, m->embed + (size_t)token_ids[t] * hidden, sizeof(float) * (size_t)hidden);
+    float *x = xmalloc(sizeof(float) * (size_t)T * (size_t)hidden);
+    gpu_rmsnorm_rows(m->embed_norm, x_raw, x, T, hidden, (float)cfg->rms_norm_eps);
+    free(x_raw);
+
+    for (int l = 0; l < cfg->num_hidden_layers; l++)
+        gpu_decoder_layer_forward(cfg, &m->layers[l], &cache->layers[l], x, T, start_pos);
+
+    float *normed = xmalloc(sizeof(float) * (size_t)T * (size_t)hidden);
+    gpu_rmsnorm_rows(m->final_norm, x, normed, T, hidden, (float)cfg->rms_norm_eps);
+    free(x);
+
+    if (logits_out) {
+        int unpadded = cfg->unpadded_vocab_size;
+        float mup = (float)cfg->logits_mup_width_multiplier;
+        float *h = xmalloc(sizeof(float) * (size_t)hidden);
+        for (int t = 0; t < T; t++) {
+            for (int d = 0; d < hidden; d++) h[d] = normed[(size_t)t * hidden + d] / mup;
+            gpu_matvec_one(m->unembed, h, logits_out + (size_t)t * unpadded, unpadded, hidden);
+        }
+        free(h);
+    }
+    free(normed);
+}
+
 /* --gpu-quants (local-only, needs --metal): the Task 4/5/6 gate for the
  * dequant-fused Q8_0/Q4_K/Q5_K/Q6_K/IQ2_XS/IQ3_XXS/IQ4_XS Metal matvec
  * kernels. For each SQFX fixture (tools/fixtures/quants/, format documented
@@ -3948,9 +4472,11 @@ int main(int argc, char **argv) {
                 "SEPIA_REAL_TOKENIZER_PATH env vars.\n"
                 "--mlock only makes sense once `extract_resident.py --verify` has confirmed\n"
                 "resident.bin's bytes match its manifest -- not enforceable here, the loader trusts its caller.\n"
-                "--metal initializes the Metal GPU runtime (metal/*.metal); the forward pass itself\n"
-                "still runs on the CPU path in this build -- init failure is fatal since --metal was\n"
-                "explicitly requested.\n"
+                "--metal initializes the Metal GPU runtime (metal/*.metal); init failure is fatal since\n"
+                "--metal was explicitly requested. For the plain tiny-oracle self-test (no other mode\n"
+                "flag), --metal additionally routes the forward pass itself through the GPU kernels\n"
+                "(Task 8) instead of the CPU reference path -- --real's forward pass is unaffected (still\n"
+                "CPU-only; the real-model GPU path is Task 9).\n"
                 "--gpu-selftest exercises the zero-copy GPU buffer API (wrap_mmap/alloc/free/host_ptr)\n"
                 "end-to-end against a live device; requires --metal, local-only (needs a Metal GPU).\n"
                 "--gpu-compare-tiny runs a real tiny-oracle prefill on the CPU, replays each captured\n"
@@ -4052,6 +4578,6 @@ int main(int argc, char **argv) {
         return 0;
     }
 
-    int ok = run_self_test(&m, ref_path);
+    int ok = run_self_test(&m, ref_path, do_metal);
     return ok ? 0 : 1;
 }
