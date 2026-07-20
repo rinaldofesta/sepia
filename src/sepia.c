@@ -551,6 +551,16 @@ static void qlinear(const QTensor *w, const float *x, float *y, float *row_scrat
 /* Dequant row `r` of W into dst (used for embedding lookups). */
 static void qrow(const QTensor *w, int64_t r, float *dst);
 
+/* RealExperts: opaque here (defined in the real-model section, Task 14) --
+ * only a forward-declared pointer is needed above mlp_moe_forward, so the
+ * pluggable-expert seam can be declared before its real implementation
+ * exists. `real_expert_ffn` computes one selected expert's full FFN
+ * (silu(gate)*up, then down_proj) from streamed quantized weights, writing
+ * expert_out[hidden] -- the routing weight is applied by the caller
+ * (mlp_moe_forward), identically for both the in-memory and real paths. */
+struct RealExperts;
+static void real_expert_ffn(const struct RealExperts *re, int expert_idx, const float *x, float *expert_out);
+
 /* ================================ model ================================= */
 /* Per-layer weight pointers plus the resolved per-layer-type dims (sec.2's
  * local/global split). Dense layers leave the moe_* pointers NULL and vice
@@ -592,6 +602,14 @@ typedef struct {
     const float *experts_w2;          /* [n_routed, hidden, moe_inter] */
     const float *shared_w13;          /* [n_shared, 2*moe_inter, hidden], interleaved */
     const float *shared_w2;           /* [n_shared, hidden, moe_inter] */
+
+    /* Task 14: non-NULL in real mode only. When set, mlp_moe_forward routes
+     * each SELECTED ROUTED expert's FFN through real_expert_ffn (streamed
+     * quantized weights) instead of the experts_w13/experts_w2 in-memory
+     * path above -- shared experts and everything else are unaffected
+     * (shared_w13/shared_w2 stay resident and go through the unchanged
+     * in-memory math regardless of real_exps). */
+    const struct RealExperts *real_exps;
 } LayerWeights;
 
 typedef struct {
@@ -1055,19 +1073,28 @@ static void mlp_moe_forward(const Config *cfg, const LayerWeights *lw, const flo
     for (int d = 0; d < hidden; d++) out[d] = 0.0f;
 
     float *h = xmalloc(sizeof(float) * (size_t)moe_inter);
+    float *expert_out = xmalloc(sizeof(float) * (size_t)hidden);
     for (int j = 0; j < topk; j++) {
         int e = topk_idx[j];
-        for (int i = 0; i < moe_inter; i++) {
-            float g = dotf(w13_row(lw->experts_w13, e, two_inter, hidden, 0, i), x, hidden);
-            float u = dotf(w13_row(lw->experts_w13, e, two_inter, hidden, 1, i), x, hidden);
-            h[i] = silu_f(g) * u;
+        if (lw->real_exps) {
+            /* Task 14: streamed quantized weights (pread + qlinear), same
+             * silu/gating math as the in-memory branch below. */
+            real_expert_ffn(lw->real_exps, e, x, expert_out);
+        } else {
+            for (int i = 0; i < moe_inter; i++) {
+                float g = dotf(w13_row(lw->experts_w13, e, two_inter, hidden, 0, i), x, hidden);
+                float u = dotf(w13_row(lw->experts_w13, e, two_inter, hidden, 1, i), x, hidden);
+                h[i] = silu_f(g) * u;
+            }
+            for (int d = 0; d < hidden; d++) {
+                const float *row = lw->experts_w2 + ((size_t)e * hidden + (size_t)d) * moe_inter;
+                expert_out[d] = dotf(row, h, moe_inter);
+            }
         }
         float wj = weights[j];
-        for (int d = 0; d < hidden; d++) {
-            const float *row = lw->experts_w2 + ((size_t)e * hidden + (size_t)d) * moe_inter;
-            out[d] += dotf(row, h, moe_inter) * wj; /* routed: weight applied AFTER down_proj (sec.7) */
-        }
+        for (int d = 0; d < hidden; d++) out[d] += expert_out[d] * wj; /* routed: weight applied AFTER down_proj (sec.7) */
     }
+    free(expert_out);
 
     for (int s = 0; s < n_shared; s++) {
         float gamma = weights[topk + s];
@@ -1095,6 +1122,15 @@ static void mlp_moe_forward(const Config *cfg, const LayerWeights *lw, const flo
     free(topk_idx);
     free(scores_for_choice);
     free(router_logits);
+}
+
+/* Step 1 placeholder: real_exps is always NULL in oracle mode, so this body
+ * is dead code until Task 14 Steps 2-3 replace it with the full streamed
+ * (pread + qlinear) implementation, near real_load below. Kept here only so
+ * the seam link-completes for the Step 1 gate (`make ci`: oracle self-test). */
+static void real_expert_ffn(const struct RealExperts *re, int expert_idx, const float *x, float *expert_out) {
+    (void)re; (void)expert_idx; (void)x; (void)expert_out;
+    die("real_expert_ffn: not yet implemented (Task 14 Steps 2-3)");
 }
 
 /* ============================= decoder layer ============================= */
