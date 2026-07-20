@@ -22,8 +22,11 @@
 
 #include "sepia_gpu.h"
 
+#include <stdint.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
+#include <unistd.h>
 
 static id<MTLDevice> g_device;
 static id<MTLCommandQueue> g_queue;
@@ -138,4 +141,180 @@ void sepia_gpu_shutdown(void) {
 
 const char *sepia_gpu_device_name(void) {
     return g_available ? g_device_name : NULL;
+}
+
+/* --------------------------------- buffers -------------------------------- */
+
+/* SepiaGpuBuf is a one-object-per-allocation heap node holding a strong
+ * ARC reference to the id<MTLBuffer>. calloc (not malloc) is load-bearing:
+ * ARC treats every store to a __strong field as retain-new/release-old, so
+ * the field's initial value must be nil (calloc's zeroed memory) rather
+ * than malloc's garbage -- otherwise the very first assignment below would
+ * ask ARC to release an arbitrary bit pattern. sepia_gpu_free mirrors this
+ * by nil-ing the field (an ARC release) before the raw free(), rather than
+ * freeing out from under a live strong reference. */
+struct SepiaGpuBuf {
+    id<MTLBuffer> buffer;
+};
+
+static size_t sepia_gpu_round_up_page(size_t len, size_t page) {
+    return (len + page - 1) & ~(page - 1);
+}
+
+SepiaGpuBuf *sepia_gpu_wrap_mmap(void *base, size_t len) {
+    if (!g_available || !g_device) {
+        fprintf(stderr, "sepia: metal: wrap_mmap: GPU not initialized\n");
+        return NULL;
+    }
+    if (!base || len == 0) {
+        fprintf(stderr, "sepia: metal: wrap_mmap: invalid base/len\n");
+        return NULL;
+    }
+
+    const size_t page = (size_t)getpagesize();
+    if (((uintptr_t)base % page) != 0) {
+        fprintf(stderr, "sepia: metal: wrap_mmap: base %p is not page-aligned (page=%zu)\n",
+                base, page);
+        return NULL;
+    }
+
+    /* Metal requires a page-multiple length for bytesNoCopy. The tail
+     * bytes between len and the rounded length belong to the caller's
+     * mapping (a whole-page mmap, e.g. resident.bin, always has them) --
+     * see sepia_gpu.h's contract comment. */
+    size_t rounded_len = sepia_gpu_round_up_page(len, page);
+
+    @autoreleasepool {
+        uint64_t max_buffer = (uint64_t)[g_device maxBufferLength];
+        if ((uint64_t)rounded_len > max_buffer) {
+            fprintf(stderr,
+                    "sepia: metal: wrap_mmap: length %.2f GB exceeds this device's "
+                    "maxBufferLength (%.2f GB)\n",
+                    (double)rounded_len / 1e9, (double)max_buffer / 1e9);
+            return NULL;
+        }
+
+        id<MTLBuffer> mtl_buf = [g_device newBufferWithBytesNoCopy:base
+                                                             length:rounded_len
+                                                            options:MTLResourceStorageModeShared
+                                                        deallocator:nil];
+        if (!mtl_buf) {
+            fprintf(stderr, "sepia: metal: wrap_mmap: newBufferWithBytesNoCopy failed "
+                            "(base=%p, len=%zu)\n", base, rounded_len);
+            return NULL;
+        }
+
+        struct SepiaGpuBuf *b = calloc(1, sizeof(*b));
+        if (!b) {
+            fprintf(stderr, "sepia: metal: wrap_mmap: out of memory\n");
+            return NULL;
+        }
+        b->buffer = mtl_buf;
+        return b;
+    }
+}
+
+SepiaGpuBuf *sepia_gpu_alloc(size_t len, int gpu_private) {
+    if (!g_available || !g_device) {
+        fprintf(stderr, "sepia: metal: alloc: GPU not initialized\n");
+        return NULL;
+    }
+    if (len == 0) {
+        fprintf(stderr, "sepia: metal: alloc: zero length\n");
+        return NULL;
+    }
+
+    @autoreleasepool {
+        uint64_t max_buffer = (uint64_t)[g_device maxBufferLength];
+        if ((uint64_t)len > max_buffer) {
+            fprintf(stderr,
+                    "sepia: metal: alloc: length %.2f GB exceeds this device's "
+                    "maxBufferLength (%.2f GB)\n",
+                    (double)len / 1e9, (double)max_buffer / 1e9);
+            return NULL;
+        }
+
+        MTLResourceOptions opts = gpu_private ? MTLResourceStorageModePrivate
+                                               : MTLResourceStorageModeShared;
+        id<MTLBuffer> mtl_buf = [g_device newBufferWithLength:len options:opts];
+        if (!mtl_buf) {
+            fprintf(stderr, "sepia: metal: alloc: newBufferWithLength failed (len=%zu, %s)\n",
+                    len, gpu_private ? "private" : "shared");
+            return NULL;
+        }
+
+        struct SepiaGpuBuf *b = calloc(1, sizeof(*b));
+        if (!b) {
+            fprintf(stderr, "sepia: metal: alloc: out of memory\n");
+            return NULL;
+        }
+        b->buffer = mtl_buf;
+        return b;
+    }
+}
+
+void sepia_gpu_free(SepiaGpuBuf *b) {
+    if (!b) return;
+    b->buffer = nil; /* ARC release; the raw free() below can't do this itself */
+    free(b);
+}
+
+void *sepia_gpu_host_ptr(SepiaGpuBuf *b) {
+    if (!b || !b->buffer) return NULL;
+    return [b->buffer contents]; /* Metal returns nil here for Private storage */
+}
+
+uint64_t sepia_gpu_gpu_addr(SepiaGpuBuf *b) {
+    if (!b || !b->buffer) return 0;
+    return (uint64_t)[b->buffer gpuAddress];
+}
+
+int sepia_gpu_selftest_touch(SepiaGpuBuf *buf, size_t n_floats) {
+    if (!g_available || !g_device || !g_queue || !g_library) {
+        fprintf(stderr, "sepia: metal: selftest_touch: GPU not initialized\n");
+        return 0;
+    }
+    if (!buf || !buf->buffer || n_floats == 0) {
+        fprintf(stderr, "sepia: metal: selftest_touch: invalid buf/n_floats\n");
+        return 0;
+    }
+
+    @autoreleasepool {
+        id<MTLFunction> fn = [g_library newFunctionWithName:@"sepia_touch"];
+        if (!fn) {
+            fprintf(stderr, "sepia: metal: selftest_touch: sepia_touch function not found\n");
+            return 0;
+        }
+
+        NSError *error = nil;
+        id<MTLComputePipelineState> pso = [g_device newComputePipelineStateWithFunction:fn
+                                                                                   error:&error];
+        if (!pso) {
+            fprintf(stderr, "sepia: metal: selftest_touch: pipeline creation failed: %s\n",
+                    error.localizedDescription.UTF8String);
+            return 0;
+        }
+
+        id<MTLCommandBuffer> cmd = [g_queue commandBuffer];
+        id<MTLComputeCommandEncoder> enc = [cmd computeCommandEncoder];
+        [enc setComputePipelineState:pso];
+        [enc setBuffer:buf->buffer offset:0 atIndex:0];
+
+        NSUInteger width = pso.threadExecutionWidth;
+        if (width > (NSUInteger)n_floats) width = (NSUInteger)n_floats;
+        MTLSize grid = MTLSizeMake((NSUInteger)n_floats, 1, 1);
+        MTLSize tg = MTLSizeMake(width, 1, 1);
+        [enc dispatchThreads:grid threadsPerThreadgroup:tg];
+        [enc endEncoding];
+
+        [cmd commit];
+        [cmd waitUntilCompleted];
+
+        if (cmd.status != MTLCommandBufferStatusCompleted) {
+            fprintf(stderr, "sepia: metal: selftest_touch: command buffer failed: %s\n",
+                    cmd.error ? cmd.error.localizedDescription.UTF8String : "unknown error");
+            return 0;
+        }
+    }
+    return 1;
 }

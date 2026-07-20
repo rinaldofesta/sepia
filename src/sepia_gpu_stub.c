@@ -27,3 +27,38 @@ void sepia_gpu_shutdown(void) {
 const char *sepia_gpu_device_name(void) {
     return NULL;
 }
+
+SepiaGpuBuf *sepia_gpu_wrap_mmap(void *base, size_t len) {
+    (void)base;
+    (void)len;
+    fprintf(stderr, "sepia: metal: not supported on this platform\n");
+    return NULL;
+}
+
+SepiaGpuBuf *sepia_gpu_alloc(size_t len, int gpu_private) {
+    (void)len;
+    (void)gpu_private;
+    fprintf(stderr, "sepia: metal: not supported on this platform\n");
+    return NULL;
+}
+
+void sepia_gpu_free(SepiaGpuBuf *b) {
+    (void)b;
+}
+
+void *sepia_gpu_host_ptr(SepiaGpuBuf *b) {
+    (void)b;
+    return NULL;
+}
+
+uint64_t sepia_gpu_gpu_addr(SepiaGpuBuf *b) {
+    (void)b;
+    return 0;
+}
+
+int sepia_gpu_selftest_touch(SepiaGpuBuf *buf, size_t n_floats) {
+    (void)buf;
+    (void)n_floats;
+    fprintf(stderr, "sepia: metal: not supported on this platform\n");
+    return 0;
+}

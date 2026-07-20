@@ -108,4 +108,10 @@ tokreal: test_tokenizer
 configcheck:
 	python3 tools/check_inkling_config.py
 
-.PHONY: ci pycheck tooltests sepia test iobench test_quants test_tokenizer tokreal configcheck shadercheck
+# local-only: needs a live Metal device (--gpu-selftest dies cleanly without
+# one); exercises the zero-copy buffer API end-to-end. Not in ci -- ci stays
+# weights-free and device-free per the Global Constraints.
+gputest: sepia
+	./sepia --metal --gpu-selftest
+
+.PHONY: ci pycheck tooltests sepia test iobench test_quants test_tokenizer tokreal configcheck shadercheck gputest

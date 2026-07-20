@@ -1740,6 +1740,14 @@ typedef struct {
     void *res_base;
     size_t res_size;
 
+    /* Zero-copy Metal wrap of res_base/res_size (SepiaGpuBuf*, opaque),
+     * set only when --metal initialized the GPU runtime before real_load
+     * ran. void* rather than SepiaGpuBuf* keeps this struct's field types
+     * plain C regardless of what sepia_gpu.h's opaque type expands to;
+     * cast back to SepiaGpuBuf* at the sepia_gpu_* call sites. No
+     * functional use yet -- later P2 tasks read weights through it. */
+    void *gpu_res_buf;
+
     ExpertIndex idx;
     int part_fds[8];
     int64_t part_sizes[8];
@@ -1925,6 +1933,16 @@ static RealModel real_load(const char *config_path, const char *manifest_path,
     size_t row_scratch_floats = (size_t)cfg->hidden_size;
     if ((size_t)cfg->moe_intermediate_size > row_scratch_floats) row_scratch_floats = (size_t)cfg->moe_intermediate_size;
     m.real_exps.row_scratch = xmalloc(sizeof(float) * row_scratch_floats);
+
+    /* --metal already ran (main() initializes the GPU runtime before
+     * calling real_load): wrap resident.bin's existing mmap zero-copy.
+     * No functional use yet -- later tasks read weights through it. */
+    if (sepia_gpu_available()) {
+        SepiaGpuBuf *gbuf = sepia_gpu_wrap_mmap(m.res_base, m.res_size);
+        if (!gbuf) die("metal: failed to wrap resident.bin (%zu bytes) as a Metal buffer", m.res_size);
+        m.gpu_res_buf = gbuf;
+        fprintf(stderr, "sepia: metal: resident.bin wrapped (%.2f GB)\n", (double)m.res_size / 1e9);
+    }
 
     return m;
 }
@@ -2382,6 +2400,102 @@ static void run_smoke(const char *dir) {
     printf("smoke ok\n");
 }
 
+/* ------------------------------ gpu selftest -------------------------------- */
+
+/* --gpu-selftest (local-only, needs --metal to have already initialized a
+ * live device): exercises sepia_gpu_wrap_mmap/alloc/free/host_ptr/gpu_addr
+ * end-to-end, standing in for the fixture-style gates the CPU quant/tokenizer
+ * suites use since there is no committed "expected GPU buffer" fixture format.
+ *
+ * (1) wrap a 3-page mmap'd temp file filled with sequential float values
+ *     0..N (not an arbitrary byte pattern -- x += 0.0f is only an identity
+ *     for finite floats, and a reinterpreted-arbitrary-bits float can be a
+ *     signaling NaN on some hardware), dispatch sepia_touch over only the
+ *     first page's floats, and verify via host_ptr that every float in the
+ *     whole buffer still reads back exactly as written: the touched page
+ *     proves the dispatch really executed against the zero-copy memory
+ *     (host_ptr must equal the original base -- no copy happened), the
+ *     untouched pages prove the wrap+dispatch didn't corrupt neighboring
+ *     memory.
+ * (2) wrap_mmap(base+1, ...) (page-alignment violation) must return NULL,
+ *     not crash.
+ * (3) alloc Shared and Private buffers, check host_ptr NULL-ness, free both.
+ *
+ * Prints "gpu selftest ok" on success; dies loudly (via die()) otherwise. */
+static void run_gpu_selftest(void) {
+    if (!sepia_gpu_available()) die("gpu-selftest: requires --metal to have initialized the GPU runtime");
+
+    const size_t page = (size_t)getpagesize();
+    const size_t n_pages = 3;
+    const size_t total_len = n_pages * page;
+    const size_t floats_per_page = page / sizeof(float);
+    const size_t n_floats_total = total_len / sizeof(float);
+
+    const char *tmpdir = getenv("TMPDIR");
+    if (!tmpdir || !tmpdir[0]) tmpdir = "/tmp";
+    char path[1024];
+    int pn = snprintf(path, sizeof path, "%s/sepia-gpu-selftest-XXXXXX", tmpdir);
+    if (pn < 0 || (size_t)pn >= sizeof path) die("gpu-selftest: tmp path too long");
+    int fd = mkstemp(path);
+    if (fd < 0) die("gpu-selftest: mkstemp %s: %s", path, strerror(errno));
+    if (ftruncate(fd, (off_t)total_len) != 0) die("gpu-selftest: ftruncate: %s", strerror(errno));
+
+    void *base = mmap(NULL, total_len, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
+    if (base == MAP_FAILED) die("gpu-selftest: mmap: %s", strerror(errno));
+    close(fd);
+    unlink(path);
+
+    float *fbase = (float *)base;
+    for (size_t i = 0; i < n_floats_total; i++) fbase[i] = (float)i;
+
+    SepiaGpuBuf *gbuf = sepia_gpu_wrap_mmap(base, total_len);
+    if (!gbuf) die("gpu-selftest: wrap_mmap failed on a valid page-aligned mapping");
+
+    if (!sepia_gpu_selftest_touch(gbuf, floats_per_page))
+        die("gpu-selftest: sepia_touch dispatch failed");
+
+    float *readback = (float *)sepia_gpu_host_ptr(gbuf);
+    if (!readback) die("gpu-selftest: host_ptr returned NULL for a Shared wrap_mmap buffer");
+    if (readback != fbase)
+        die("gpu-selftest: host_ptr (%p) != wrapped base (%p) -- not zero-copy",
+            (void *)readback, (void *)fbase);
+
+    for (size_t i = 0; i < floats_per_page; i++) {
+        if (readback[i] != (float)i)
+            die("gpu-selftest: touched page mismatch at float %zu: got %g want %g",
+                i, (double)readback[i], (double)i);
+    }
+    for (size_t i = floats_per_page; i < n_floats_total; i++) {
+        if (readback[i] != (float)i)
+            die("gpu-selftest: untouched page corrupted at float %zu: got %g want %g",
+                i, (double)readback[i], (double)i);
+    }
+    fprintf(stderr, "gpu-selftest: wrap_mmap + sepia_touch dispatch verified (%zu pages)\n", n_pages);
+
+    /* Alignment violation, reusing the same live mapping -- must fail
+     * cleanly rather than crash. */
+    SepiaGpuBuf *bad = sepia_gpu_wrap_mmap((char *)base + 1, page);
+    if (bad) die("gpu-selftest: wrap_mmap(base+1) unexpectedly succeeded on a misaligned pointer");
+    fprintf(stderr, "gpu-selftest: misaligned wrap_mmap correctly rejected\n");
+
+    sepia_gpu_free(gbuf);
+    munmap(base, total_len);
+
+    /* alloc/free cycles: Shared vs Private, host_ptr NULL-ness. */
+    SepiaGpuBuf *shared_buf = sepia_gpu_alloc(page, 0);
+    if (!shared_buf) die("gpu-selftest: alloc(shared) failed");
+    if (!sepia_gpu_host_ptr(shared_buf)) die("gpu-selftest: host_ptr(shared) unexpectedly NULL");
+    sepia_gpu_free(shared_buf);
+
+    SepiaGpuBuf *private_buf = sepia_gpu_alloc(page, 1);
+    if (!private_buf) die("gpu-selftest: alloc(private) failed");
+    if (sepia_gpu_host_ptr(private_buf) != NULL) die("gpu-selftest: host_ptr(private) expected NULL");
+    sepia_gpu_free(private_buf);
+    fprintf(stderr, "gpu-selftest: alloc/free (Shared + Private) verified\n");
+
+    printf("gpu selftest ok\n");
+}
+
 /* ================================== main =================================== */
 
 int main(int argc, char **argv) {
@@ -2389,7 +2503,7 @@ int main(int argc, char **argv) {
     const char *smoke_dir = NULL;
     const char *prompt = "The capital of France is";
     int n_gen = 32;
-    int do_real = 0, do_mlock = 0, logits_only = 0, do_metal = 0;
+    int do_real = 0, do_mlock = 0, logits_only = 0, do_metal = 0, do_gpu_selftest = 0;
 
     for (int i = 1; i < argc; i++) {
         if (strcmp(argv[i], "--dump-acts") == 0 && i + 1 < argc) {
@@ -2408,11 +2522,14 @@ int main(int argc, char **argv) {
             logits_only = 1;
         } else if (strcmp(argv[i], "--metal") == 0) {
             do_metal = 1;
+        } else if (strcmp(argv[i], "--gpu-selftest") == 0) {
+            do_gpu_selftest = 1;
         } else {
             fprintf(stderr,
                 "usage: %s [--dump-acts FILE] [--metal]\n"
                 "       %s --smoke DIR\n"
                 "       %s --real [--prompt TEXT] [--n-gen N] [--mlock] [--logits-only] [--metal]\n"
+                "       %s --metal --gpu-selftest\n"
                 "\n"
                 "--real paths default to docs/inkling-config.json, weights/resident-manifest.json,\n"
                 "weights/inkling-ud-q2_k_xl.sepia-index.json, weights/tokenizer.bin -- override with\n"
@@ -2422,8 +2539,10 @@ int main(int argc, char **argv) {
                 "resident.bin's bytes match its manifest -- not enforceable here, the loader trusts its caller.\n"
                 "--metal initializes the Metal GPU runtime (metal/*.metal); the forward pass itself\n"
                 "still runs on the CPU path in this build -- init failure is fatal since --metal was\n"
-                "explicitly requested.\n",
-                argv[0], argv[0], argv[0]);
+                "explicitly requested.\n"
+                "--gpu-selftest exercises the zero-copy GPU buffer API (wrap_mmap/alloc/free/host_ptr)\n"
+                "end-to-end against a live device; requires --metal, local-only (needs a Metal GPU).\n",
+                argv[0], argv[0], argv[0], argv[0]);
             return 2;
         }
     }
@@ -2433,6 +2552,11 @@ int main(int argc, char **argv) {
             die("metal: initialization failed (see above)");
         }
         fprintf(stderr, "sepia: metal: initialized (%s)\n", sepia_gpu_device_name());
+    }
+
+    if (do_gpu_selftest) {
+        run_gpu_selftest();
+        return 0;
     }
 
     if (smoke_dir) {
