@@ -117,6 +117,14 @@ test_tokenizer: tools/test_tokenizer.c src/tokenizer.c src/tokenizer.h src/unico
 tokreal: test_tokenizer
 	./test_tokenizer weights/tokenizer.bin tools/fixtures/tokenizer/real_cases.json
 
+# local-only: the P2 close-out stress sweep (P1 deferral) -- needs
+# weights/tokenizer.bin and the `tokenizers` package (tools/stress_tokenizer.py,
+# same dev-venv prerequisite as tools/make_tokenizer_fixtures.py). Generates
+# ~8300 deterministic random strings across the scanner's branch classes and
+# asserts the C tokenizer matches the HF reference tokenizer on every one.
+stresstok: test_tokenizer
+	.venv/bin/python tools/stress_tokenizer.py
+
 # local-only: verifies docs/inkling-config.json against GGUF part 1 metadata
 # (needs weights/inkling-gguf/..., not fetched in ci)
 configcheck:
@@ -181,4 +189,4 @@ realmetal: sepia
 	./sepia --metal --real --prompt "The capital of France is" --n-gen 32 --repeat 2 --verbose-cache
 	./sepia --metal --real --prompt "def fibonacci(n):" --n-gen 32 --repeat 2 --verbose-cache
 
-.PHONY: ci pycheck tooltests sepia test iobench test_quants test_tokenizer tokreal configcheck shadercheck gputest gpucompare gpuquants gpuattn realmetal
+.PHONY: ci pycheck tooltests sepia test iobench test_quants test_tokenizer tokreal stresstok configcheck shadercheck gputest gpucompare gpuquants gpuattn realmetal

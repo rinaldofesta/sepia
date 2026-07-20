@@ -154,20 +154,30 @@ Phase 0 checklist and docs/container.md section 6.
   from the full model cross-checked against the pinned llama.cpp
   PR-branch build on the same GGUF (text-exact both test prompts,
   id-exact on one). Full results: docs/p1-first-tokens.md.
-- P2 (Metal path + first tok/s number: done): Metal kernels (banded flash
-  attention, dequant-fused matvec, MoE routing) replace the scalar CPU
-  path; routed experts served from an LRU-streamed, per-slot-mlocked GPU
-  cache with async prefetch overlap; both P1 prompts still exact-sequence
-  on the GPU path. Measured throughput ~1.39-1.57 tok/s steady-state
-  (cold and warm) — the floor of, not comfortably inside, the 1.5-3 tok/s
-  target below, and now compute-bound rather than I/O-bound (falls short
-  of even the cold pure-I/O ceiling despite good cache hit rates). Full
-  results: docs/p2-perf.md. Still open: the routing-predictability
-  experiment (is Inkling's next-layer routing predictable like GLM-5.2's
-  71.6%? published either way) and phase close-out (Tasks 13-14).
+- P2 (done): Metal kernels (banded flash attention, dequant-fused matvec,
+  MoE routing) replace the scalar CPU path; routed experts served from an
+  LRU-streamed, per-slot-mlocked GPU cache with async prefetch overlap;
+  both P1 prompts still exact-sequence on the GPU path. Measured
+  throughput ~1.39-1.57 tok/s steady-state (cold and warm) — the floor
+  of, not comfortably inside, the 1.5-3 tok/s target below, and now
+  compute-bound rather than I/O-bound (falls short of even the cold
+  pure-I/O ceiling despite good cache hit rates). Full results:
+  docs/p2-perf.md. The routing-predictability experiment (PILOT) is a
+  clean negative result: mean one-layer-ahead expert recall@6 is 2.34%,
+  indistinguishable from the 2.34% random-chance baseline and far below
+  both the ~60% P3-viability threshold and colibrì's 71.6% GLM-5.2
+  measurement — Inkling's router is not predictable one layer ahead. A
+  separate same-layer consecutive-token overlap measurement (38.2%, ~16x
+  chance) is real and explains this phase's own cache hit rates; it is a
+  different mechanism from the one PILOT prefetch would have exploited.
+  Full results: docs/pilot-routing.md.
 - P3: learning cache (`.sepia_usage`), confidence-ramped auto-pin (at
   most half the expert budget, colibri's rule), heat-based re-pin with
-  hysteresis, PILOT prefetch if P2 says yes.
+  hysteresis — all three exploit the temporal locality PILOT confirmed is
+  real, and stand independently of PILOT's own next-layer question. PILOT
+  *prefetch* is dropped from scope: the P2 measurement above (2.34% vs a
+  ~60% viability threshold) means predicting layer L+1's experts from
+  layer L's selection has no basis in this model.
 - P4: MTP speculation. MTP weights at 8-bit or better (colibri measured
   0-4% draft acceptance with a 4-bit MTP head), draft depth 1-2, and the
   draft/verify paths pinned to identical kernels (colibri's SPEC_PIN

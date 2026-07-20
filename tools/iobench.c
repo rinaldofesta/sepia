@@ -153,7 +153,17 @@ int main(int argc, char **argv) {
     }
 
     pthread_t *tids = malloc((size_t)threads * sizeof(pthread_t));
+    if (!tids) {
+        fprintf(stderr, "iobench: out of memory for %ld thread ids\n",
+                threads);
+        return 1;
+    }
     worker_arg *args = malloc((size_t)threads * sizeof(worker_arg));
+    if (!args) {
+        fprintf(stderr, "iobench: out of memory for %ld thread args\n",
+                threads);
+        return 1;
+    }
     long base = n_reads / threads, rem = n_reads % threads;
     long off = 0;
     for (long t = 0; t < threads; t++) {
@@ -171,6 +181,11 @@ int main(int argc, char **argv) {
     for (long t = 0; t < threads; t++) {
         if (pthread_create(&tids[t], NULL, worker, &args[t]) != 0) {
             fprintf(stderr, "iobench: pthread_create failed\n");
+            /* Join the threads already spawned before this one instead of
+             * returning with them still running -- don't leak threads on
+             * the partial-spawn error path. */
+            for (long j = 0; j < t; j++)
+                pthread_join(tids[j], NULL);
             return 1;
         }
     }
