@@ -216,8 +216,9 @@ Phase 0 checklist and docs/container.md section 6.
   13): measured mean one-layer-ahead recall@6 = **2.34%** across 708 token
   positions over 4 diverse prompts (708 * 63 layer-pairs = 44,604
   instances) -- indistinguishable from the 2.34% random-chance baseline
-  for uniform 6-of-256 expert selection, and roughly 30x below both the
-  ~60% P3-viability threshold and colibrì's 71.6% GLM-5.2 measurement.
+  for uniform 6-of-256 expert selection, and roughly 26x below the ~60%
+  P3-viability threshold and roughly 31x below colibrì's 71.6% GLM-5.2
+  measurement.
   Clean negative result: no one-layer-ahead structure at any of the 63
   measurable layers or in any of the 4 tested topics. A separate
   same-layer consecutive-token overlap measurement (38.2%, ~16x chance)

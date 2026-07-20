@@ -3404,10 +3404,17 @@ static void real_forward_chunk(RealModel *m, Cache *cache, const int *token_ids,
  *      logits (needed for moe_route_select, host-side) and the mlp-normed
  *      activation (needed as real_expert_ffn's `x`, still CPU-streamed this
  *      task) -- the "expert install boundary" from the plan's sync budget.
- * Dense layers therefore cost exactly 1 sync (tau); sparse layers cost 2
- * (tau + router/expert). Cache writes and sconv-history rolls are GPU-side
- * (sepia_gpu_copy / sepia_gpu_sconv_hist_roll) and need no sync at all --
- * see task-9-report.md for the measured per-token sync count. */
+ * Dense layers therefore cost exactly 1 sync (tau). Sparse layers cost 3,
+ * not 2 -- Task 10 split the single "router/expert-boundary" sync this
+ * comment originally described into two physical syncs (SYNC #1: router
+ * logits + shared outputs; SYNC #2: routed-expert down-projections -- see
+ * their inline comments a few hundred lines below, at real_mlp_moe_forward_
+ * gpu, for the exact boundaries and the current source of truth). Cache
+ * writes and sconv-history rolls are GPU-side (sepia_gpu_copy /
+ * sepia_gpu_sconv_hist_roll) and need no sync at all. Current total: 2
+ * dense layers x 1 + 64 sparse layers x 3 + 2 (final residual norm +
+ * logits) = 196 syncs/token (was 132 as originally measured in
+ * task-9-report.md, before Task 10's split). */
 
 static SepiaGpuBuf *real_gpu_scratch(size_t nfloats) {
     SepiaGpuBuf *b = sepia_gpu_alloc(sizeof(float) * (nfloats ? nfloats : 1), 0);
@@ -3448,9 +3455,13 @@ static void real_gpu_row_out(SepiaGpuBuf *srcrow, SepiaGpuBuf *multi, int64_t t,
  * instead of calling it directly, so the expert cache's in-flight
  * generation counter (m->expert_store.gen_completed) advances at exactly
  * the ds4-anchored point the design calls for ("incremented at
- * sepia_gpu_end()") -- see expert_cache_evict_or_get_free's header comment
- * for what this buys (defensive groundwork for Task 11, inert today under
- * the synchronous per-call design). */
+ * sepia_gpu_end()"). Task 11 made this load-bearing, not defensive: safe_gen
+ * (stamped on every cache access, hit or miss) plus this counter is what
+ * expert_cache_evict_or_get_free checks before reusing a slot, so a slot
+ * still referenced by an in-flight dispatch or loader-thread prefetch can't
+ * be evicted out from under it -- see expert_cache_evict_or_get_free's and
+ * ExpertCacheSlot's safe_gen header comments for the full eviction-safety
+ * argument. */
 static int real_gpu_end(RealModel *m) {
     int ok = sepia_gpu_end();
     if (ok) m->expert_store.gen_completed++;

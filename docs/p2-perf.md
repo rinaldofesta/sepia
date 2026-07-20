@@ -104,6 +104,11 @@ reinstalled repeatedly, as expected for a budget covering only 12.6% of
 all experts) which pushes touched memory higher. Still comfortably under
 the ~110GB Global Constraints ceiling.
 
+Note: the 64.31GB RSS figure excludes the 14.23GB `resident.bin` zero-copy
+mmap wrap -- a shared, file-backed MTLBuffer that macOS's RSS accounting
+doesn't attribute to the process the way touched anonymous memory is. True
+footprint is closer to ~78.5GB, still safely under the 110GB ceiling.
+
 ## What's measurable, and what isn't
 
 The plan's Task 12 text names a `--timing` per-stage breakdown (resident

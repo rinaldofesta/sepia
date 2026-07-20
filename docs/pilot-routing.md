@@ -355,7 +355,7 @@ each, combined across all four prompts):
   2.34% random-chance baseline for uniform 6-of-256 selection.
 
 **Inkling clears neither threshold, by a wide margin.** 2.34% is roughly
-30x below the ~60% P3-viability floor and roughly 31x below colibrì's
+26x below the ~60% P3-viability floor and roughly 31x below colibrì's
 71.6% GLM-5.2 measurement -- not a marginal miss, a complete absence of
 the effect. The per-layer curve (above) shows no layer, and the per-prompt
 breakdown shows no topic, coming anywhere close to either threshold; the
