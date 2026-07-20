@@ -28,3 +28,6 @@ __pycache__/
 # session scratch
 .superpowers/
 .DS_Store
+
+# reference checkout, pinned via vendor/PIN
+vendor/llama.cpp/

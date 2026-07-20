@@ -1,0 +1,8 @@
+llama.cpp Inkling draft PR #25731, pinned for P1.
+commit: ce16fff2ad1d1ddfb39365fedfb4fcfd6db178f1
+reproduce:
+  git clone https://github.com/ggml-org/llama.cpp vendor/llama.cpp
+  cd vendor/llama.cpp && git fetch origin pull/25731/head:inkling-pr && git checkout ce16fff2ad1d1ddfb39365fedfb4fcfd6db178f1
+Used for: IQ grid tables (src/quants_grids.h), the "inkling" pre-tokenizer regex
+(docs/tokenizer-pre-regex.txt), and the Task-17 cross-check build. Reference only —
+never compiled into sepia.
