@@ -1022,7 +1022,11 @@ static void cap_push_sconv(const float *w, const float *hist, const float *in, i
  * comparison pass -- they point into the still-live Model this call came
  * from), not duplicated: only the per-call activation/cache tensors need
  * their own copies since those are mutated or freed as the forward pass
- * continues. */
+ * continues. x_normed/out are copied here (fdup) since the caller keeps
+ * using/owning those buffers afterward; k_pre/v_pre/k_hist_pre/v_hist_pre
+ * arrive as throwaway snapshots the caller made solely for this call, so
+ * cap_push_attn takes ownership of those allocations directly instead of
+ * copying them a second time. */
 typedef struct {
     const Config *cfg;
     const LayerWeights *lw;
@@ -1038,22 +1042,24 @@ typedef struct { CapAttn *items; int count, cap; } CapAttnList;
 static CapAttnList g_cap_attn;
 
 static void cap_push_attn(const Config *cfg, const LayerWeights *lw, int T, int start_pos,
-                           const float *x_normed, const float *k_pre, const float *v_pre,
-                           const float *k_hist_pre, const float *v_hist_pre, const float *out) {
+                           const float *x_normed, float *k_pre, float *v_pre,
+                           float *k_hist_pre, float *v_hist_pre, const float *out) {
     opcap_ensure((void **)&g_cap_attn.items, &g_cap_attn.count, &g_cap_attn.cap, sizeof(CapAttn));
     CapAttn *it = &g_cap_attn.items[g_cap_attn.count++];
     int hidden = cfg->hidden_size;
-    int kv_dim = lw->kv_dim;
-    int K = cfg->conv_kernel_size;
     it->cfg = cfg;
     it->lw = lw;
     it->T = T;
     it->start_pos = start_pos;
     it->x_normed = fdup(x_normed, (size_t)T * (size_t)hidden);
-    it->k_pre = fdup(k_pre, (size_t)start_pos * (size_t)kv_dim);
-    it->v_pre = fdup(v_pre, (size_t)start_pos * (size_t)kv_dim);
-    it->k_hist_pre = fdup(k_hist_pre, (size_t)(K - 1) * (size_t)kv_dim);
-    it->v_hist_pre = fdup(v_hist_pre, (size_t)(K - 1) * (size_t)kv_dim);
+    /* k_pre/v_pre/k_hist_pre/v_hist_pre arrive already fdup'd by the caller
+     * (gpu_cap_k_pre etc. in attn_forward_chunk, made solely to survive to
+     * this call) -- take ownership of those allocations directly instead of
+     * fdup'ing them a second time; the caller no longer frees them. */
+    it->k_pre = k_pre;
+    it->v_pre = v_pre;
+    it->k_hist_pre = k_hist_pre;
+    it->v_hist_pre = v_hist_pre;
     it->out = fdup(out, (size_t)T * (size_t)hidden);
 }
 
@@ -1080,9 +1086,11 @@ static void attn_forward_chunk(const Config *cfg, const LayerWeights *lw, LayerC
     /* Task 7 Gate B capture only: snapshot the cache slice BEFORE this
      * call's writes (the memcpy below at start_pos..start_pos+T overwrites
      * lc->k/lc->v, so this must happen before that point) -- see CapAttn's
-     * doc comment, above. Pure side-effect capture, freed after
-     * cap_push_attn near the end of this function; no effect on the math
-     * below when g_opcap_selected_layer is 0. */
+     * doc comment, above. Pure side-effect capture; ownership passes to
+     * cap_push_attn near the end of this function (it stores these
+     * allocations directly, no re-copy), so nothing here is freed by this
+     * function. No effect on the math below when g_opcap_selected_layer is
+     * 0. */
     float *gpu_cap_k_pre = NULL, *gpu_cap_v_pre = NULL;
     float *gpu_cap_k_hist_pre = NULL, *gpu_cap_v_hist_pre = NULL;
     if (g_opcap_selected_layer) {
@@ -1112,9 +1120,9 @@ static void attn_forward_chunk(const Config *cfg, const LayerWeights *lw, LayerC
     float *v_sconv = xmalloc(sizeof(float) * (size_t)T * (size_t)kv_dim);
     if (g_opcap_selected_layer) {
         /* Task 7 Gate B: these survive to cap_push_attn near the end of this
-         * function (freed there, alongside gpu_cap_k_pre/v_pre above) rather
-         * than immediately here -- everything else about this branch is
-         * unchanged from before Task 7. */
+         * function, which takes ownership of them directly (alongside
+         * gpu_cap_k_pre/v_pre above) rather than freeing/re-copying them --
+         * everything else about this branch is unchanged from before Task 7. */
         gpu_cap_k_hist_pre = fdup(lc->k_hist, (size_t)(K - 1) * (size_t)kv_dim);
         gpu_cap_v_hist_pre = fdup(lc->v_hist, (size_t)(K - 1) * (size_t)kv_dim);
         sconv_apply(lw->k_sconv_w, kv_dim, K, lc->k_hist, k_raw, T, k_sconv);
@@ -1253,13 +1261,13 @@ static void attn_forward_chunk(const Config *cfg, const LayerWeights *lw, LayerC
     free(attn_concat);
 
     if (g_opcap_selected_layer) {
+        /* cap_push_attn takes ownership of gpu_cap_k_pre/v_pre/k_hist_pre/
+         * v_hist_pre (stores the allocations directly rather than
+         * re-copying them) -- they must NOT be freed here; they stay live
+         * inside the CapAttn record for Gate B's later replay pass. */
         cap_push_attn(cfg, lw, T, start_pos, x_normed, gpu_cap_k_pre, gpu_cap_v_pre,
                       gpu_cap_k_hist_pre, gpu_cap_v_hist_pre, out);
     }
-    free(gpu_cap_k_pre);
-    free(gpu_cap_v_pre);
-    free(gpu_cap_k_hist_pre);
-    free(gpu_cap_v_hist_pre);
 }
 
 /* ================================== MLP ================================= */
@@ -3547,7 +3555,14 @@ static void run_gpu_compare_attn(void) {
      * kv_lo grows with q_pos, so n_kv never exceeds window==rel_extent
      * there) -- so the ">" and "q_pos>log_floor" cases are global-only,
      * matching the plan's own parenthetical ("global long-context:
-     * positions beyond the band get content-only scores"). */
+     * positions beyond the band get content-only scores"). The multi-token
+     * case below is global for the same reason, and is placed so the SAME
+     * T=8 dispatch straddles the rel_extent=1024 boundary: with q_pos=1027
+     * (start_pos=1020), kv_lo=0 always, so per-token max distance is just
+     * q_pos itself -- tokens q_pos 1020..1023 (t=0..3) stay under 1024 and
+     * never hit the band cutoff, while q_pos 1024..1027 (t=4..7) do, so the
+     * cutoff toggles mid-chunk within one dispatch (unlike the single-token
+     * "> rel_extent" case above, which only ever exercises it in isolation). */
     AttnGateCase cases[] = {
         { "sliding n_kv < rel_extent",                  1, 100,               1 },
         { "sliding n_kv == rel_extent",                 1, WINDOW - 1,        1 },
@@ -3555,7 +3570,7 @@ static void run_gpu_compare_attn(void) {
         { "global  n_kv == rel_extent",                 0, REL_EXTENT_GLOBAL - 1, 1 },
         { "global  n_kv > rel_extent (band cutoff live)", 0, 5000,            1 },
         { "global  q_pos > log_scaling_n_floor (tau!=1)", 0, 130000,          1 },
-        { "global  multi-token chunk (band edge mid-chunk)", 0, 1020,         8 },
+        { "global  multi-token chunk (band edge mid-chunk)", 0, 1027,         8 },
     };
     int n_cases = (int)(sizeof(cases) / sizeof(cases[0]));
 
